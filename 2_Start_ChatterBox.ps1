@@ -101,7 +101,7 @@ if (Test-Path $venvPython) {
 }
 
 # Script to run (relative to repo root)
-$scriptToRun = Join-Path $scriptRoot 'skyrimnet-chatterbox.py'
+$scriptToRun = Join-Path $scriptRoot 'skyrimnet_chatterbox.py'
 if (-not (Test-Path $scriptToRun)) {
     Write-Host "Could not find script: $scriptToRun" -ForegroundColor Red
     Read-Host -Prompt "Press Enter to exit"

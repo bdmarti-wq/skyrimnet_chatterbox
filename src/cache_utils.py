@@ -1,4 +1,6 @@
 import threading
+import traceback
+
 import torch
 import datetime
 import functools
@@ -123,43 +125,64 @@ class ConditionalsCacheManager:
                 self._current_loaded_cache_key = cache_key
                 return True
         return False
-    
-    
+
     def _try_load_from_disk(self, cache_key, model, device, dtype, enable_memory_cache, quiet=False):
         """Try to load conditionals from disk cache"""
         cache_dir = get_cache_dir()
         cache_file = cache_dir.joinpath(cache_key + ".pt")
-        
-        if not cache_file.exists():
-            logger.info(f"No disk cache file found for key: {cache_key} in {cache_file}")
+
+        if not cache_dir.exists():
+            logger.error(f"Cache directory not found at {cache_dir}")
             return False
-        
-        with safe_globals([T3Cond]):
-            map_location = torch.device("cuda")
-            kwargs = torch.load(cache_file, map_location=map_location, weights_only=True)
-            cond_cls = Conditionals(T3Cond(**kwargs['t3']), kwargs['gen'])
-        
-        if not quiet:
-            logger.info(f"Loaded conditionals from disk cache: {cache_key}")
 
-        # Move to target device and ensure correct dtype
-        cond_cls = cond_cls.to(device)
-        if hasattr(cond_cls.t3, 'speaker_emb') and cond_cls.t3.speaker_emb is not None:
-            cond_cls.t3.speaker_emb = cond_cls.t3.speaker_emb.to(dtype=dtype)
+        # Support both device string and torch.device object
+        if isinstance(device, str):
+            map_location = torch.device(device)
+        elif isinstance(device, torch.device):
+            map_location = device
+        else:
+            logger.error(f"Expected device to be str or torch.device, got {type(device)}")
+            map_location = torch.device("cpu")  # Fallback
 
-        if hasattr(cond_cls, 't3'):
-            model.set_conditionals(cond_cls)
+        try:
+            with safe_globals([T3Cond]):
+                # Load with proper device mapping
+                kwargs = torch.load(
+                    cache_file,
+                    map_location=map_location
+                )
+                cond_cls = Conditionals(T3Cond(**kwargs['t3']), kwargs['gen'])
 
-        if enable_memory_cache:
+            if not quiet:
+                logger.info(f"Loaded conditionals from disk cache: {cache_key}")
+
+            # Move to target device and ensure correct dtype
+            cond_cls = cond_cls.to(map_location if isinstance(map_location, torch.device) else "cuda")
+            if hasattr(cond_cls.t3, 'speaker_emb') and cond_cls.t3.speaker_emb is not None:
+                cond_cls.t3.speaker_emb = cond_cls.t3.speaker_emb.to(dtype=dtype)
+
+            if hasattr(cond_cls, 't3'):
+                model.set_conditionals(cond_cls)
+
+            if enable_memory_cache:
+                with self._cache_lock:
+                    self._memory_cache[cache_key] = cond_cls
+                    if not quiet:
+                        logger.info(f"Cached conditionals in memory: {cache_key}")
+
             with self._cache_lock:
-                self._memory_cache[cache_key] = cond_cls
-                if not quiet:
-                    logger.info(f"Cached conditionals in memory: {cache_key}")
+                self._current_loaded_cache_key = cache_key
 
-        with self._cache_lock:
-            self._current_loaded_cache_key = cache_key
+            return True
 
-        return True
+        except Exception as e:
+            logger.error(f"Failed to load conditionals cache: {e}")
+            if not quiet:
+                import traceback
+                logger.error(traceback.format_exc())
+            return False
+
+
     
 
     def get_cache_stats(self):

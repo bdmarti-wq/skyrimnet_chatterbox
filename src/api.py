@@ -1,6 +1,8 @@
 import functools
+import gc
 import hashlib
 import re
+import textwrap
 import threading
 import time
 from contextlib import contextmanager
@@ -11,8 +13,10 @@ import gradio as gr
 import numpy as np
 import torch
 
+from skyrimnet_chatterbox import repetition_penalty, min_p, top_p
 from src.InterruptionFlag import interruptible, InterruptionFlag
 from src.chatterbox.models.t3.modules.cond_enc import T3Cond
+from src.chatterbox.shared_utils import validate_text_input, estimate_token_count, smart_text_splitter
 from src.chatterbox.tts import Conditionals
 from src.simple_model_state import simple_manage_model_state
 
@@ -141,11 +145,26 @@ def chatterbox_model(model_name, device="cuda", dtype=torch.float32):
 
 @contextmanager
 def cpu_offload_context(model, device, dtype, cpu_offload=False):
-    if cpu_offload:
-        chatterbox_tts_to(model, torch.device(device), dtype)
-    yield model
-    if cpu_offload:
-        chatterbox_tts_to(model, torch.device("cpu"), dtype)
+    """Context manager for CPU offloading with cleanup"""
+    gpu_model = None
+    if cpu_offload and device.type == "cuda":
+        # Keep only critical parts on GPU
+        gpu_model = ChatterboxTTS.from_pretrained(device="cuda")
+        # Move only necessary components to CPU
+        backup_state = {}
+        for name, module in model.named_children():
+            if not any(x in name for x in ["t3", "conds"]):
+                backup_state[name] = getattr(model, name)
+                delattr(model, name)
+        device = torch.device("cpu")
+
+    try:
+        yield model
+    finally:
+        if gpu_model is not None:
+            # Restore components from backup
+            for name, module in backup_state.items():
+                setattr(model, name, module) if name not in dir(model) else getattr(model, name).load_state_dict(module.state_dict())
 
 
 # Global in-memory cache for conditionals
@@ -279,6 +298,22 @@ def load_conditionals_cache(cache_key, model, device, dtype):
         print(f"Failed to load conditionals cache: {e}")
         return None
 
+def with_memory_optimization(func):
+    def wrapper(*args, **kwargs):
+        gc_old = gc.collect()
+        torch.cuda.empty_cache()
+        start_mem = torch.cuda.memory_allocated()
+
+        result = func(*args, **kwargs)
+
+        end_mem = torch.cuda.memory_allocated()
+        print(f"Memory used: {(end_mem - start_mem) / 1e9:.2f} GB")
+        gc.collect()
+        return result
+    return wrapper
+
+
+@with_memory_optimization
 @interruptible
 def _tts_generator(
     text,
@@ -477,3 +512,5 @@ def tts(*args, **kwargs):
         import traceback
         print(traceback.format_exc())
         raise gr.Error(f"Error: {e}")
+
+

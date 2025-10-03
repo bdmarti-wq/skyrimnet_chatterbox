@@ -521,8 +521,8 @@ if __name__ == "__main__":
     model = load_model()
     init_conditional_memory_cache(model, DEVICE, DTYPE)
     demo.queue(
-        max_size=50,
-        default_concurrency_limit=1,
+        max_size=12,
+        default_concurrency_limit=2,
     ).launch(
         server_name=args.server, 
         server_port=args.port, 
