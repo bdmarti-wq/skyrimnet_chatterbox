@@ -1,177 +1,20 @@
+# skyrimnet_chatterbox.py (Imports and generate shell)
 import functools
 import warnings
 
-# Suppress torchaudio deprecation warnings (broad: all backends/sub-modules)
-warnings.filterwarnings('ignore', message=r'.*torchaudio._backend.*', category=UserWarning)
-warnings.filterwarnings('ignore', message=r'.*deprecated.*torchaudio.*', category=UserWarning)
+from config import DEVICE, DTYPE, _USE_API_MODE, load_skyrimnet_config, get_config_value, ENABLE_MEMORY_CACHE, \
+    ENABLE_DISK_CACHE, MODEL, MULTILINGUAL
+# Lazy import inside generate (avoids global Gradio scan/inference)
+from src.audio_utils import set_torchaudio_backend
+backend = set_torchaudio_backend()
 
 import gradio as gr
 from argparse import ArgumentParser
-from pathlib import Path
-from time import perf_counter_ns
-
-from src.audio import set_torchaudio_backend
-backend = set_torchaudio_backend() # Add the code here (before cache imports or torchaudio usage)
-
 import torch
 from src.cache import (
-    load_conditionals_cache, save_conditionals_cache, init_conditional_memory_cache,
-    get_cache_key, try_audio_cache, check_and_update_ref, get_cache_stats, clear_cache_files,
-    clear_output_directories, save_torchaudio_wav, create_dummy_conds, set_audio_cache, get_or_queue_voice_process,
-    validate_voice_path, _fuzzy_queue, try_fuzzy_audio_cache
+    init_conditional_memory_cache, clear_cache_files, clear_output_directories
 )
-from src.cache import ConditionalsCacheManager as _cache_manager  # For global access if needed
 from loguru import logger
-
-
-
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-DTYPE = torch.bfloat16 if DEVICE == "cuda" else torch.float32
-MODEL = None
-MULTILINGUAL = False
-# Cache flags - defaults that can be overridden by skyrimnet_config.txt
-ENABLE_DISK_CACHE = True
-ENABLE_MEMORY_CACHE = True
-_CONFIG_CACHE = None
-_CONFIG_FILE_PATH = "skyrimnet_config.txt"
-# Testing flag - when True, bypasses config loading and uses all API values
-_USE_API_MODE = False
-
-
-def load_skyrimnet_config():
-    """Load configuration from skyrimnet_config.txt with error handling"""
-    global _CONFIG_CACHE, ENABLE_MEMORY_CACHE, ENABLE_DISK_CACHE
-
-    if _CONFIG_CACHE is not None:
-        return _CONFIG_CACHE
-
-    # Default configuration
-    default_config = {
-        'temperature': 0.8,
-        'min_p': 0.07,
-        'top_p': 1.0,
-        'repetition_penalty': 2.0,
-        'cfg_weight': 0.0,  # Speed optimized default
-        'exaggeration': 0.7
-    }
-
-    global_flags = {
-        'enable_memory_cache': ENABLE_MEMORY_CACHE,
-        'enable_disk_cache': ENABLE_DISK_CACHE
-    }
-
-    config_mode = {
-        'temperature': 'default',
-        'min_p': 'default',
-        'top_p': 'default',
-        'repetition_penalty': 'default',
-        'cfg_weight': 'default',
-        'exaggeration': 'default'
-    }
-
-    try:
-        config_path = Path(_CONFIG_FILE_PATH)
-        if not config_path.exists():
-            logger.warning(f"Config file {_CONFIG_FILE_PATH} not found, using hardcoded defaults")
-            _CONFIG_CACHE = (default_config, config_mode, global_flags)
-            return _CONFIG_CACHE
-
-        with open(config_path, 'r', encoding='utf-8') as f:
-            lines = f.readlines()
-
-        for line in lines:
-            line = line.strip()
-            # Skip comments and empty lines
-            if not line or line.startswith('#'):
-                continue
-
-            if '=' in line:
-                key, value = line.split('=', 1)
-                key = key.strip()
-                value = value.strip()
-
-                # Handle global boolean flags
-                if key in global_flags:
-                    if value.lower() in ['true', 'yes', '1', 'on']:
-                        global_flags[key] = True
-                        # Update global variables
-                        if key == 'enable_memory_cache':
-                            ENABLE_MEMORY_CACHE = True
-                        elif key == 'enable_disk_cache':
-                            ENABLE_DISK_CACHE = True
-                        logger.info(f"Setting {key} to True")
-                    elif value.lower() in ['false', 'no', '0', 'off']:
-                        global_flags[key] = False
-                        # Update global variables
-                        if key == 'enable_memory_cache':
-                            ENABLE_MEMORY_CACHE = False
-                        elif key == 'enable_disk_cache':
-                            ENABLE_DISK_CACHE = False
-                        logger.info(f"Setting {key} to False")
-                    else:
-                        logger.warning(f"Invalid boolean value '{value}' for {key}, using default")
-
-                # Handle parameter modes
-                elif key in config_mode:
-                    if value.lower() == 'default':
-                        config_mode[key] = 'default'
-                    elif value.lower() == 'api':
-                        config_mode[key] = 'api'
-                    else:
-                        try:
-                            custom_value = float(value)
-                            config_mode[key] = 'custom'
-                            default_config[key] = custom_value
-                            logger.info(f"Using custom {key} value: {custom_value}")
-                        except ValueError:
-                            logger.warning(f"Invalid value '{value}' for {key}, using default")
-
-        logger.info(f"Loaded config: {config_mode}")
-        logger.info(f"Global flags: {global_flags}")
-        _CONFIG_CACHE = (default_config, config_mode, global_flags)
-        return _CONFIG_CACHE
-
-    except Exception as e:
-        logger.error(f"Error reading config file {_CONFIG_FILE_PATH}: {e}, using hardcoded defaults")
-        _CONFIG_CACHE = (default_config, config_mode, global_flags)
-        return _CONFIG_CACHE
-
-
-def get_config_value(param_name, api_value, defaults, modes, bypass_config=False):
-    """Get the appropriate value based on configuration mode"""
-    if bypass_config:
-        # API mode: use API value with fallback to reasonable defaults
-        fallback_defaults = {
-            'temperature': 0.9,
-            'min_p': 0.05,
-            'top_p': 1.0,
-            'repetition_penalty': 2.0,
-            'cfg_weight': 0.0,
-            'exaggeration': 0.55
-        }
-        return api_value if api_value is not None else fallback_defaults.get(param_name, 0.0)
-
-    mode = modes.get(param_name, 'default')
-
-    if mode == 'api':
-        return api_value if api_value is not None else defaults[param_name]
-    else:  # 'default' or 'custom'
-        return defaults[param_name]
-
-
-def reload_config():
-    """Force reload of configuration file"""
-    global _CONFIG_CACHE
-    _CONFIG_CACHE = None
-    return load_skyrimnet_config()
-
-
-def set_seed(seed: int):
-    """
-    Set random seeds for reproducible generation.
-    """
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
 
 
 def load_model():
@@ -192,208 +35,30 @@ def load_model():
 
 def generate(model, text, language_id="en", audio_prompt_path=None, exaggeration=0.5, temperature=0.8, seed_num=0,
              cfgw=0, min_p=0.05, top_p=1.0, repetition_penalty=1.2, cache_uuid=0):
-    logger.info(
-        f"generate called for: \"{text}\", {Path(audio_prompt_path).stem if audio_prompt_path else "No ref audio"}, uuid: {cache_uuid}, exaggeration: {exaggeration}")
-    logger.info(
-        f"Parameters - temp: {temperature}, min_p: {min_p}, top_p: {top_p}, rep_penalty: {repetition_penalty}, cfg_weight: {cfgw}")
-
-    enable_memory_cache = ENABLE_MEMORY_CACHE
-    enable_disk_cache = ENABLE_DISK_CACHE
-    device = DEVICE
-    dtype = DTYPE
-
+    """
+    UI shell: Keeps server-compatible sig. Minimal setup, delegates to generate_audio.
+    """
     if model is None:
         model = load_model()
 
+    if not text:
+        logger.warning("No text provided – returning empty")
+        return ""  # Or dummy path
+
     if seed_num != 0:
+        from src.generate_audio import set_seed  # Lazy
         set_seed(int(seed_num))
 
-    exaggeration = float(exaggeration)
-    temperature = float(temperature)
-    cfgw = float(cfgw)
-    min_p = float(min_p)
-    top_p = float(top_p)
-    repetition_penalty = float(repetition_penalty)
-
-    func_start_time = perf_counter_ns()
-
-    # Audio reuse check (unchanged)
-    audio_reuse_path = None
-    if text and audio_prompt_path:
-        audio_reuse_path = try_audio_cache(audio_prompt_path, text, exaggeration, params={
-            'cfgw': cfgw, 'temperature': temperature, 'min_p': min_p, 'top_p': top_p,
-            'repetition_penalty': repetition_penalty, 'language_id': language_id
-        })
-        if audio_reuse_path:
-            logger.info(f"Full audio cache HIT: Returning cached WAV instead of generating (uuid={cache_uuid})")
-            # Return cached path directly (Gradio/API compatible; same type as original wave_file)
-            # Log stats for reused audio
-            import torchaudio
-            wav_cached, sr = torchaudio.load(audio_reuse_path)
-            wav_length = wav_cached.shape[-1] / sr
-            logger.info(f"Reused audio: {wav_length:.2f}s in ~0s (infinite speed!)")
-            # NEW: Enqueue for fuzzy index (even exact reuses; enriches dict if variants)
-            voice_stem = Path(audio_prompt_path).stem
-            _fuzzy_queue.put((text, audio_reuse_path, voice_stem))  # Background index
-            return audio_reuse_path
-
-    # ========== NEW: Fuzzy Audio Cache Check (Insert Here - After Exact, Before Voice Process) ==========
-    fuzzy_reuse_path = None
-    if text and audio_prompt_path and not audio_reuse_path:  # Only if exact MISS + has stem
-        voice_stem = Path(audio_prompt_path).stem
-        fuzzy_reuse_path = try_fuzzy_audio_cache(text, voice_stem)  # Optional threshold via kwarg if tuning
-        if fuzzy_reuse_path:
-            logger.info(f"Fuzzy audio cache HIT: \"{text}\" (near-match) for {voice_stem} – skipping gen (uuid={cache_uuid})")
-            # Log stats (mimic exact)
-            import torchaudio
-            wav_fuzzy, sr = torchaudio.load(fuzzy_reuse_path)
-            wav_length = wav_fuzzy.shape[-1] / sr
-            logger.info(f"Reused fuzzy audio: {wav_length:.2f}s in ~0s (infinite speed!)")
-            # NEW: Enqueue to refresh index (low-cost; ensures active)
-            _fuzzy_queue.put((text, fuzzy_reuse_path, voice_stem))
-            return fuzzy_reuse_path
-        else:
-            logger.debug(f"Fuzzy cache MISS for \"{text}\" on {voice_stem} – proceeding to full gen")
-    # ========== End Fuzzy Insertion ==========
-
-    audio_reuse = audio_reuse_path or fuzzy_reuse_path  # Combined reuse flag for post-gen enqueue
-
-    # Voice process (unchanged; only if no reuse)
-    original_path = audio_prompt_path
-    if audio_prompt_path is not None and not audio_reuse:  # Skip process on reuse (already valid WAV)
-        fixed_from_process = get_or_queue_voice_process(
-            audio_prompt_path, model, device, dtype, cache_uuid, exaggeration,
-            quiet=(not enable_memory_cache and not enable_disk_cache)
-        )
-        # Use process result (fixed if new/success)
-        audio_prompt_path = fixed_from_process
-        if not audio_prompt_path or not Path(audio_prompt_path).exists():
-            logger.warning(f"Process failed for {original_path} – using dummy")
-            create_dummy_conds(model, device, dtype, "process_fail")
-            audio_prompt_path = None
-    else:
-        # If reuse or no audio: Skip process (fuzzy reuse is already fixed WAV)
-        logger.debug("Skipping voice process: Reuse or no audio")
-
-    if audio_prompt_path and not audio_reuse:
-        # Single validate/fix (post-process only if invalid; process already fixed if new)
-        valid = validate_voice_path(audio_prompt_path)[0]
-        logger.debug(f"Path after process: {audio_prompt_path}, valid: {valid}")
-        if not valid:
-            logger.debug(f"Re-fix invalid path: {audio_prompt_path}")
-            audio_prompt_path = check_and_update_ref(audio_prompt_path, exaggeration)
-        else:
-            logger.debug(f"Valid path from process: {audio_prompt_path} - no resample")
-
-        # Conds prep (unchanged)
-        cache_params = {'language_id': language_id, 'cache_uuid': cache_uuid}
-        cache_key = get_cache_key(audio_prompt_path, cache_uuid, exaggeration, params=cache_params)
-        conditionals_loaded = False
-        if cache_key and (enable_memory_cache or enable_disk_cache):
-            if load_conditionals_cache(cache_key, model, device, dtype, enable_memory_cache, enable_disk_cache):
-                conditionals_loaded = True
-                logger.info(f"Conditionals cache HIT: {cache_key[:8]}... (uuid={cache_uuid})")
-        if not conditionals_loaded:
-            model.prepare_conditionals(audio_prompt_path, exaggeration=exaggeration)
-            if dtype != torch.float32:
-                model.conds.t3.to(dtype=dtype)
-            if cache_key and (enable_memory_cache or enable_disk_cache):
-                save_conditionals_cache(cache_key, model.conds, model=model, device=device, dtype=dtype,
-                                        enable_memory_cache=enable_memory_cache, enable_disk_cache=enable_disk_cache)
-                logger.info(f"Prepared and cached conditionals: {cache_key[:8]}... (uuid={cache_uuid})")
-
-    else:
-        # No audio prompt or reuse: Use dummy (graceful fallback; doesn't break API)
-        if not audio_reuse:
-            create_dummy_conds(model, device, dtype, "no_audio")
-            logger.info("No audio prompt – using dummy conditionals")
-
-    conditional_start_time = perf_counter_ns()
-    logger.info(f"Conditionals prepared. Time: {(conditional_start_time - func_start_time) / 1_000_000:.4f}ms")
-
-    t3_params = {
-        # "initial_forward_pass_backend": "eager", # slower - default
-        # "initial_forward_pass_backend": "cudagraphs", # speeds up set up
-        "generate_token_backend": "cudagraphs-manual",  # fastest - default
-        # "generate_token_backend": "cudagraphs",
-        # "generate_token_backend": "eager",
-        # "generate_token_backend": "inductor",
-        # "generate_token_backend": "inductor-strided",
-        # "generate_token_backend": "cudagraphs-strided",
-        "stride_length": 4,
-        # "strided" options compile <1-2-3-4> iteration steps together, which improves performance by reducing memory copying issues in torch.compile
-        "skip_when_1": True,  # skips Top P when it's set to 1.0
-        # "benchmark_t3": True, # Synchronizes CUDA to get the real it/s
-    }
-    generate_args = {
-        "text": text,
-        "exaggeration": exaggeration,
-        "temperature": temperature,
-        "cfg_weight": cfgw,
-        "min_p": min_p,
-        "top_p": top_p,
-        "repetition_penalty": repetition_penalty,
-        "t3_params": t3_params,
-    }
-    if MULTILINGUAL:
-        generate_args["language_id"] = language_id
-
-    wav = None
-    try:
-        wav = model.generate(
-            **generate_args
-        )
-    except RuntimeError as graph_e:
-        if "graph" in str(graph_e).lower() or "capture" in str(graph_e).lower():
-            logger.warning(f"Graph corrupt: {graph_e} – resetting t3 graphs and retrying")
-            if hasattr(model, 't3') and hasattr(model.t3, '_bucket_graphs'):
-                model.t3._bucket_graphs.clear()  # Reset corrupt graphs
-                torch.cuda.empty_cache()
-            # Retry without graphs (eager fallback)
-            t3_params_temp = t3_params.copy()
-            t3_params_temp['generate_token_backend'] = 'eager'
-            generate_args_temp = generate_args.copy()
-            generate_args_temp['t3_params'] = t3_params_temp
-            wav = model.generate(**generate_args_temp)
-        else:
-            raise  # Re-raise non-graph errors
-
-    # Log execution time
-    func_end_time = perf_counter_ns()
-
-    total_duration_s = (func_end_time - func_start_time) / 1_000_000_000  # Convert nanoseconds to seconds
-    wav_length = wav.shape[-1] / model.sr
-
-    logger.info(
-        f"Generated audio: {wav_length:.2f}s {model.sr / 1000:.2f}kHz in {total_duration_s:.2f}s. Speed: {wav_length / total_duration_s:.2f}x")
-
-    # NEW: Cache full audio output for future API reuses (dedup uuid in params)
-    if audio_prompt_path and not audio_reuse:  # Only cache new gens (skip if reused)
-        full_cache_key = get_cache_key(audio_prompt_path, cache_uuid, exaggeration, params={
-            'text': text, 'cfgw': cfgw, 'temperature': temperature, 'min_p': min_p, 'top_p': top_p,
-            'repetition_penalty': repetition_penalty, 'language_id': language_id  # Dedup uuid
-        })
-        # Save first, then cache the new path
-        wave_file = str(save_torchaudio_wav(wav.cpu(), model.sr, audio_path=audio_prompt_path, uuid=cache_uuid))
-        set_audio_cache(full_cache_key, wave_file)
-    else:
-        wave_file = str(save_torchaudio_wav(wav.cpu(), model.sr, audio_path=None, uuid=cache_uuid))
-
-    # ========== NEW: Enqueue for Fuzzy Index (Post-Gen, Only on True MISS) ==========
-    if not audio_reuse and wave_file and audio_prompt_path:  # Index new audio only
-        voice_stem = Path(audio_prompt_path).stem
-        _fuzzy_queue.put((text, wave_file, voice_stem))  # Async background
-        logger.debug(f"Enqueued for fuzzy index: \"{text[:20]}\" (stem={voice_stem})")
-    # ========== End Enqueue ==========
-
-    # NEW: Log cache stats post-generation (for monitoring; doesn't affect return)
-    stats = get_cache_stats()
-    logger.info(
-        f"Cache stats post-gen: {stats['memory_cache_size']} mem, {stats['disk_files']} disk, {stats['audio_cache_size']} audio")
-
-    del wav
-    torch.cuda.empty_cache()
-    return wave_file
+    # Lazy import + call (no global exposure)
+    from src.generate_audio import generate_audio
+    result = generate_audio(
+        model, text, audio_prompt_path,  # None as-is (no "" coercion)
+        float(exaggeration), int(cache_uuid),
+        float(temperature), float(cfgw), float(min_p), float(top_p), float(repetition_penalty),
+        language_id, int(seed_num),
+        ENABLE_MEMORY_CACHE, ENABLE_DISK_CACHE
+    )
+    return result
 
 
 
@@ -407,7 +72,7 @@ def cpp_uuid_to_seed(uuid_64: int) -> int:
     return abs(hash(uuid_64)) % (2 ** 32)
 
 
-def generate_audio(
+def generate_audio_ui(
         model_choice=None,
         text="On that first day from Saturalia, My missus gave for me, A big bowl of moon sugar!",
         language="en",
@@ -440,14 +105,11 @@ def generate_audio(
 ):
     """Generate audio using configurable parameter system"""
 
-    # Load config (or use empty values for API mode)
     if _USE_API_MODE:
         defaults, modes = {}, {}
     else:
         defaults, modes, flags = load_skyrimnet_config()
 
-    # Map API parameters to our config system
-    # Note: confidence maps to repetition_penalty in SkyrimNet UI
     api_temperature = linear if linear is not None else None
     api_min_p = min_p if min_p is not None else None
     api_top_p = top_p if top_p is not None else None
@@ -455,7 +117,6 @@ def generate_audio(
     api_cfg_weight = cfg_scale if cfg_scale is not None else None
     api_exaggeration = quadratic if quadratic is not None else None
 
-    # Get final values using unified config system
     final_temperature = get_config_value('temperature', api_temperature, defaults, modes, _USE_API_MODE)
     final_min_p = get_config_value('min_p', api_min_p, defaults, modes, _USE_API_MODE)
     final_top_p = get_config_value('top_p', api_top_p, defaults, modes, _USE_API_MODE)
@@ -469,11 +130,12 @@ def generate_audio(
 
     seed_num = cpp_uuid_to_seed(uuid)
 
-    return generate(
+    # Lazy import + call (via kwargs for sig safety; model=MODEL from global)
+    from src.generate_audio import generate_audio
+    result = generate_audio(
         model=MODEL,
         text=text,
-        language_id=language,
-        audio_prompt_path=speaker_audio,
+        audio_prompt_path=speaker_audio,  # None ok
         seed_num=seed_num,
         cache_uuid=uuid,
         exaggeration=final_exaggeration,
@@ -481,8 +143,11 @@ def generate_audio(
         cfgw=final_cfg_weight,
         min_p=final_min_p,
         top_p=final_top_p,
-        repetition_penalty=final_repetition_penalty
-    ), uuid
+        repetition_penalty=final_repetition_penalty,
+        language_id=language  # kwarg-safe
+    )
+    return result, uuid  # Matches outputs
+
 
 
 with gr.Blocks() as demo:
@@ -546,20 +211,12 @@ with gr.Blocks() as demo:
     run_btn.click(
         fn=generate,
         inputs=[
-            model_state,
-            text,
-            language_id,
-            ref_wav,
-            exaggeration,
-            temp,
-            seed_num,
-            cfg_weight,
-            min_p,
-            top_p,
-            repetition_penalty,
+            model_state, text, language_id, ref_wav, exaggeration, temp, seed_num,
+            cfg_weight, min_p, top_p, repetition_penalty,
         ],
         outputs=audio_output,
     )
+
     model_choice = gr.Textbox(visible=False)
     language = gr.Textbox(visible=False)
     speaker_audio = gr.Audio(sources=["upload", "microphone"], type="filepath", label="Reference Audio File",
@@ -590,39 +247,19 @@ with gr.Blocks() as demo:
     randomize_seed_toggle = gr.Checkbox(visible=False)
     unconditional_keys = gr.Textbox(visible=False)
     hidden_btn = gr.Button(visible=False)
-    hidden_btn.click(fn=generate_audio, api_name="generate_audio", inputs=[
-        model_choice,
-        text,
-        language,
-        speaker_audio,
-        prefix_audio,
-        emotion1,
-        emotion2,
-        emotion3,
-        emotion4,
-        emotion5,
-        emotion6,
-        emotion7,
-        emotion8,
-        vq_single,
-        fmax,
-        pitch_std,
-        speaking_rate,
-        dnsmos,
-        speaker_noised_checkbox,
-        cfg_scale,
-        top_p,
-        min_k,
-        min_p,
-        linear,
-        confidence,
-        quadratic,
-        seed_num,
-        randomize_seed_toggle,
-        unconditional_keys,
-    ],
-                     outputs=[audio_output, seed_num],
-                     )
+    hidden_btn.click(
+        fn=generate_audio_ui,
+        api_name="generate_audio",
+        inputs=[
+            model_choice, text, language, speaker_audio, prefix_audio,
+            emotion1, emotion2, emotion3, emotion4, emotion5, emotion6, emotion7, emotion8,
+            vq_single, fmax, pitch_std, speaking_rate, dnsmos,
+            speaker_noised_checkbox, cfg_scale, top_p, min_k, min_p,
+            linear, confidence, quadratic, seed_num,
+            randomize_seed_toggle, unconditional_keys,
+        ],
+        outputs=[audio_output, seed_num],
+    )
 
 
 def parse_arguments():

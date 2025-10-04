@@ -465,7 +465,8 @@ def validate_voice_path(audio_path: str) -> Tuple[Optional[str], Optional[Path]]
     if not audio_path or not Path(audio_path).exists():
         return None, None
     try:
-        info = torchaudio.info(audio_path)
+        from torchaudio.io import info as torchaudio_info
+        info = torchaudio_info(audio_path)
         if info.sample_rate != MODEL_SR:  # Focus on SR; dur=0 often metadata quirk
             logger.warning(f"SR mismatch: {audio_path} ({info.sample_rate}Hz != {MODEL_SR})")
             return None, None
