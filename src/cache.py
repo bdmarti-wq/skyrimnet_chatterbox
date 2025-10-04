@@ -987,17 +987,22 @@ def string_similarity(s1: str, s2: str, threshold=0.75) -> float:
 def _background_index_worker():
     while True:
         try:
-            text, wav_path, voice_stem = _fuzzy_queue.get(timeout=1)  # Unpack as tuple
-            orig_text = text  # For sim
+            text, wav_path, voice_stem = _fuzzy_queue.get(timeout=1)
+            orig_text = text
             norm_key = normalize_text(text)
             with _fuzzy_lock:
-                if norm_key in _fuzzy_audio_dict:  # Simple dedup (skip enqueue dups)
+                if norm_key in _fuzzy_audio_dict:  # Dedup
                     logger.debug(f"Skipped dup fuzzy index: {norm_key[:30]}")
                 else:
                     if len(_fuzzy_audio_dict) >= MAX_INDEX_SIZE:
-                        _fuzzy_audio_dict.pop(next(iter(_fuzzy_audio_dict)))  # Oldest key (FIFO)
+                        _fuzzy_audio_dict.pop(next(iter(_fuzzy_audio_dict)))
                         logger.debug(f"Fuzzy cache full ({MAX_INDEX_SIZE}) – evicted oldest")
-                    _fuzzy_audio_dict[norm_key] = {'wav_path': wav_path, 'orig_text': orig_text}
+                    # Add stem for exact filter
+                    _fuzzy_audio_dict[norm_key] = {
+                        'wav_path': wav_path,
+                        'orig_text': orig_text,
+                        'stem': voice_stem  # New: Exact stem match
+                    }
                     logger.debug(f"Indexed fuzzy audio: {norm_key} -> {wav_path} (stem: {voice_stem})")
         except:
             pass
@@ -1032,17 +1037,16 @@ def try_fuzzy_audio_cache(input_text: str, voice_stem: str, threshold: float = 0
     best_entry = None
     with _fuzzy_lock:
         for stored_key, data in _fuzzy_audio_dict.items():
-            if voice_stem in stored_key:  # Voice filter (stem in key ensures match)
+            # Exact stem match (faster, no substring)
+            if data.get('stem') == voice_stem:  # From data, not key
                 candidate_count += 1
-                sim_ratio = string_similarity(norm_query_text, data['orig_text'], threshold)  # Get float
+                sim_ratio = string_similarity(norm_query_text, data['orig_text'])
                 if sim_ratio > max_sim:
                     max_sim = sim_ratio
                     best_entry = data
                 if sim_ratio >= threshold:
                     logger.info(
-                        f"Fuzzy cache HIT: '{norm_query_text[:20]}...' ≈ '{data['orig_text'][:20]}...' "
-                        f"(sim={sim_ratio:.3f} >= {threshold}) for stem '{voice_stem}' -> {data['wav_path']}"
-                    )
+                        f"Fuzzy cache HIT: '{norm_query_text[:20]}...' ≈ '{data['orig_text'][:20]}...' (sim={sim_ratio:.3f} >= {threshold}) for stem '{voice_stem}' -> {data['wav_path']}")
                     return data['wav_path']
 
     # Log MISS with stats (best sim, candidates) for tuning

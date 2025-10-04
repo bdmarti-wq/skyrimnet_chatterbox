@@ -169,7 +169,8 @@ def generate_audio(model, text: str, audio_prompt_path: Optional[str], exaggerat
         logger.info(f"Reused {hit_type.lower()} audio: {wav_length:.2f}s in ~0s (infinite speed!)")
         # Enqueue fuzzy (low-priority enrichment on HIT)
         if audio_prompt_path:
-            voice_stem = Path(audio_prompt_path).stem
+            voice_stem = Path(audio_prompt_path).stem.replace('_fixed', '')  # Patch: Normalize base stem (no '_fixed')
+            logger.debug(f"Enqueued for fuzzy enrich (HIT): \"{text[:20]}\" (norm stem={voice_stem})")
             _fuzzy_queue.put((text, audio_reuse_path, voice_stem))
         return audio_reuse_path
 
@@ -220,9 +221,9 @@ def generate_audio(model, text: str, audio_prompt_path: Optional[str], exaggerat
 
     # Enqueue fuzzy (only on true MISS)
     if not reuse_result and (valid_path or audio_prompt_path):
-        voice_stem = Path(valid_path or audio_prompt_path).stem
+        voice_stem = Path(valid_path or audio_prompt_path).stem.replace('_fixed', '')  # Patch: Normalize base stem (no '_fixed')
+        logger.debug(f"Enqueued for fuzzy index (MISS): \"{text[:20]}\" (norm stem={voice_stem})")
         _fuzzy_queue.put((text, wave_file, voice_stem))
-        logger.debug(f"Enqueued for fuzzy index: \"{text[:20]}\" (stem={voice_stem})")
 
     # Stats
     stats = get_cache_stats()
