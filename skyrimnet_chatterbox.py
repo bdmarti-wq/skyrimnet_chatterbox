@@ -16,6 +16,9 @@ from src.cache import (
 )
 from loguru import logger
 
+import warnings
+warnings.filterwarnings('ignore', message=r'.*torchaudio._backend.utils.info.*')
+warnings.filterwarnings('ignore', message=r'.*deprecated.*torchaudio.*')
 
 def load_model():
     global MODEL, MULTILINGUAL

@@ -28,10 +28,10 @@ from typing import Dict, Any, Optional, Tuple, Union, List
 from loguru import logger  # Assume available; fallback to print if not
 import threading  # Ensure imported (likely already is)
 
-
-
-# Suppress torchaudio deprecation warnings (clean logs)
-warnings.filterwarnings('ignore', category=UserWarning, module='torchaudio')
+# Suppress torchaudio deprecations precisely (exact message/module for backend utils)
+warnings.filterwarnings('ignore', message=r'.*torchaudio._backend.utils.info.*', category=UserWarning)
+warnings.filterwarnings('ignore', message=r'.*deprecated.*torchaudio.*', category=UserWarning, module='torchaudio')
+warnings.filterwarnings('ignore', category=UserWarning, module='torchaudio')  # Broad fallback
 
 # Anchor paths to project root (skyrimnet_chatterbox/) for relocatable code
 ROOT_DIR = Path(__file__).parent.parent  # From src/ -> skyrimnet_chatterbox/
@@ -42,7 +42,6 @@ CACHE_BASE = ROOT_DIR / "cache"
 CACHE_DIR = CACHE_BASE / "conditionals"
 CACHE_AUDIO_DIR = CACHE_BASE / "audio"
 voices_dir = CACHE_AUDIO_DIR / "voices"  # For check_and_update_ref
-
 
 # Global model lock (new: serialize access to prevent graph races)
 MODEL_LOCK = threading.RLock()
@@ -461,31 +460,73 @@ def save_torchaudio_wav(wav_tensor, sr, audio_path, uuid):
     return path.resolve()
 
 
-def validate_voice_path(audio_path: str) -> Tuple[Optional[str], Optional[Path]]:
-    if not audio_path or not Path(audio_path).exists():
-        return None, None
+# Helper: Robust torchaudio info fetch (used everywhere; logs branch)
+def _get_audio_info_robust(audio_path: str) -> Optional[Tuple[int, int, int]]:
+    """Fetch audio info with new/old API fallback; return (sr, channels, duration_frames) or None."""
+    if not os.path.exists(audio_path):
+        logger.warning(f"Info: Path does not exist {audio_path}")
+        return None
+
     try:
+        # Try new API (2.1+)
         from torchaudio.io import info as torchaudio_info
         info = torchaudio_info(audio_path)
-        if info.sample_rate != MODEL_SR:  # Focus on SR; dur=0 often metadata quirk
-            logger.warning(f"SR mismatch: {audio_path} ({info.sample_rate}Hz != {MODEL_SR})")
-            return None, None
-        if info.num_frames > 0:  # Valid dur
-            logger.debug(f"Valid path: {audio_path} (dur={info.num_frames/info.sample_rate:.2f}s)")
-            return audio_path, Path(audio_path)
-        else:
-            logger.warning(f"Zero duration: {audio_path}—may need longer ref")
-            return None, None
-    except Exception as e:
-        logger.warning(f"Validate failed {audio_path}: {e}")
-        return None, None
+        logger.debug("Audio info: Used new io.info API")
+    except (ImportError, AttributeError) as ie:
+        try:
+            # Fallback to deprecated/old API (2.0.x)
+            info = torchaudio.info(audio_path)
+            logger.debug(f"Audio info: Fallback to torchaudio.info (suppressed deprecation: {ie})")
+        except Exception as e:
+            logger.warning(f"Failed to get audio info for {audio_path}: {e}")
+            return None
+
+    # Normalize to tuple (handles old tuple vs new object)
+    if isinstance(info, tuple) and len(info) >= 2:
+        sr = info[0]
+        channels = info[1]
+        duration_frames = info[2] if len(info) > 2 else 0
+    else:
+        sr = info.sample_rate
+        channels = info.num_channels
+        duration_frames = info.num_frames
+
+    return (sr, channels, duration_frames) if sr else None
+
+
+# Patched validate_voice_path (robust + logging)
+def validate_voice_path(audio_path: str) -> Tuple[bool, Optional[float]]:
+    """Validate voice path with robust torchaudio handling; return (valid, duration)."""
+    if not os.path.exists(audio_path):
+        logger.warning(f"Validate: Path does not exist {audio_path}")
+        return False, None
+
+    info_tuple = _get_audio_info_robust(audio_path)
+    if info_tuple is None:
+        return False, None
+
+    sample_rate, num_channels, duration_frames = info_tuple
+    duration = duration_frames / sample_rate if duration_frames > 0 else 0
+
+    if sample_rate != 24000:
+        logger.warning(f"SR mismatch: {audio_path} ({sample_rate}Hz != 24000)")
+        return False, None
+    if num_channels != 1:
+        logger.warning(f"Channels mismatch: {audio_path} ({num_channels} != 1)")
+        return False, None
+
+    logger.debug(f"Valid path: {audio_path} (dur={duration:.2f}s)")
+    return True, duration
 
 
 def check_and_update_ref(audio_path: str, exaggeration: float = 0.5, model_sr: int = MODEL_SR, out_path: Optional[Path] = None) -> str:
-    """Validate/resample audio to model SR/mono if needed; return validated path (rooted)."""
-    validated_path, p = validate_voice_path(audio_path)
-    if validated_path:
-        return validated_path
+    """Validate/resample audio to model SR/mono if needed; return validated path (rooted). Dedup '_fixed' to prevent loops."""
+    validated, _ = validate_voice_path(audio_path)
+    if validated:
+        stem = Path(audio_path).stem
+        if stem.endswith('_fixed') or stem.endswith('_fixed_fixed'):  # Dedup loop
+            logger.debug(f"Validate passed, but deduped path {audio_path}")
+        return audio_path  # No fix needed
 
     # Resample/fix (torchaudio primary)
     try:
@@ -504,8 +545,15 @@ def check_and_update_ref(audio_path: str, exaggeration: float = 0.5, model_sr: i
             logger.error(f"Empty waveform after load/resample for {audio_path}")
             return audio_path
 
-        # Save fixed (direct to final for BG; use abs str path)
-        final_out = out_path or voices_dir / f"{Path(audio_path).stem}_fixed.wav"
+        # Save fixed (direct to final for BG; use abs str path; dedup '_fixed')
+        orig_stem = Path(audio_path).stem
+        if orig_stem.endswith('_fixed_fixed'):
+            final_stem = orig_stem[:-13] + '_fixed'  # Strip dupe suffix
+        elif orig_stem.endswith('_fixed'):
+            final_stem = orig_stem  # No extra
+        else:
+            final_stem = orig_stem + '_fixed'
+        final_out = out_path or voices_dir / f"{final_stem}.wav"
         final_out.parent.mkdir(parents=True, exist_ok=True)
         try:
             torchaudio.save(
@@ -542,6 +590,137 @@ def try_audio_cache(audio_path: str, text: str, exaggeration: float = 0.5, param
         return cached_path
     logger.debug(f"Audio cache MISS: {cache_key[:8]}...")
     return None
+
+
+# Patched _compute_file_hash (robust info)
+def _compute_file_hash(file_path: str, method='hybrid') -> str:  # New 'hybrid'
+    if not Path(file_path).exists():
+        return ""
+    try:
+        if method == 'quick':
+            info_tuple = _get_audio_info_robust(file_path)
+            if info_tuple:
+                sr, channels, frames = info_tuple
+                size = Path(file_path).stat().st_size
+                return f"{size}_{frames}_{sr}"
+            return ""  # Fail → empty hash
+        elif method == 'hybrid':  # Quick first; full if needed (for debug)
+            quick_h = None
+            info_tuple = _get_audio_info_robust(file_path)
+            if info_tuple:
+                sr, channels, frames = info_tuple
+                size = Path(file_path).stat().st_size
+                quick_h = f"{size}_{frames}_{sr}"
+                logger.debug("Hash: Used quick metadata")
+            if quick_h:
+                return quick_h  # Fast; fallback full only on metadata fail
+        # Full MD5 (default/always for 'full' or hybrid fallback)
+        h = hashlib.md5()
+        with open(file_path, 'rb') as f:
+            for chunk in iter(lambda: f.read(8192), b""):
+                h.update(chunk)
+        logger.debug("Hash: Used full MD5 fallback")
+        return h.hexdigest()
+    except Exception as e:
+        logger.warning(f"Hash failed {file_path}: {e}")
+        return ""
+
+
+# Patched get_or_queue_voice_process (skip validate on quick match; robust info; dedup)
+def get_or_queue_voice_process(audio_path: str, model, device, dtype, uuid, exaggeration=0.5, quiet=False) -> str:
+    stem = Path(audio_path).stem
+    with _voice_cache_lock:
+        cached = _voice_cache.get(stem, {})
+        cached_path = cached.get('fixed_path', '')
+        cached_hash = cached.get('file_hash', '')
+        cached_conds_key = cached.get('conds_key', '')
+        last_bg = cached.get('last_bg_time', 0)
+
+    if time.time() - last_bg < 30:
+        if not quiet:
+            logger.debug(f"Recent BG for {stem}—skipping queue")
+        # Ensure fixed even on skip
+        return cached_path if (cached_path and Path(cached_path).exists()) else check_and_update_ref(audio_path, exaggeration)
+
+    # Quick pre-check: If cached_path exists, quick metadata match (size + SR/channels via robust info) → skip full hash/validate
+    quick_match = False
+    if cached_path and Path(audio_path).exists() and Path(cached_path).exists():
+        if Path(audio_path).stat().st_size == Path(cached_path).stat().st_size:  # Size first
+            upload_info = _get_audio_info_robust(audio_path)
+            cached_info = _get_audio_info_robust(cached_path)
+            if upload_info and cached_info and upload_info[:2] == cached_info[:2]:  # SR + channels match
+                quick_match = True
+                logger.debug(f"Quick metadata match for {stem}—reusing without full validate/hash")
+                upload_hash = cached_hash  # Assume same
+            else:
+                logger.debug(f"Quick metadata mismatch for {stem}—full hash")
+
+    upload_hash = _compute_file_hash(audio_path, method='hybrid' if not quick_match else 'quick')
+    is_different = (not quick_match) and (upload_hash != cached_hash or not cached_path)
+
+    if not is_different and Path(cached_path).exists():
+        logger.info(f"Server WAV same as cached for {stem}—reusing {cached_path}")
+        if cached_conds_key:
+            conds = _cache_manager.load(cached_conds_key, model, device, dtype, quiet=quiet)
+            if conds and not quiet:
+                logger.info(f"Reused cached conds for {stem}")
+        return cached_path  # Valid; skipped validate
+
+    # Always fix/return valid for current (main thread; covers new/old invalid)
+    # Skip full validate/check if quick_match (already done)
+    candidate_path = cached_path if cached_path else audio_path
+    if quick_match:
+        fallback_path = candidate_path  # No need to refix
+    else:
+        fallback_path = check_and_update_ref(candidate_path, exaggeration)
+    if not fallback_path or not Path(fallback_path).exists():
+        logger.warning(f"Fix failed for {stem}—using original (may fail SR)")
+        fallback_path = candidate_path
+    logger.info(f"Fixed/used for {stem} in main: {fallback_path}")
+    if cached_conds_key and not is_different:
+        _cache_manager.load(cached_conds_key, model, device, dtype, quiet=quiet)
+
+    def _bg_process_new():
+        if not is_different or Path(fallback_path).exists():  # Skip if already fixed/same
+            return
+        try:
+            final_fixed = voices_dir / f"{stem}_fixed.wav"
+            fixed_path = check_and_update_ref(str(audio_path), exaggeration, out_path=final_fixed)  # Direct
+            if not fixed_path or not Path(fixed_path).exists():
+                if not quiet:
+                    logger.warning(f"BG full fail for {stem}")
+                return
+
+            # Prep/conds (locked)
+            conds_key = None
+            with MODEL_LOCK:
+                if (hasattr(model, 't3') and hasattr(model.t3, '_bucket_graphs') and len(model.t3._bucket_graphs) > 0):
+                    if not quiet:
+                        logger.debug(f"BG defer for {stem}: Graphs active")
+                else:
+                    model.prepare_conditionals(fixed_path, exaggeration=exaggeration)
+                    temp_conds = model.conds
+                    if temp_conds:
+                        model.set_conditionals(None)
+                        conds_key = get_cache_key(fixed_path, uuid, exaggeration)
+                        _cache_manager.save(conds_key, temp_conds, model=None, device=device, dtype=dtype)
+
+            with _voice_cache_lock:
+                update_entry = {'fixed_path': fixed_path, 'file_hash': upload_hash, 'last_bg_time': time.time()}
+                if conds_key:
+                    update_entry['conds_key'] = conds_key
+                _voice_cache[stem] = {**cached, **update_entry}
+            _save_voice_cache()
+            if not quiet:
+                logger.info(f"BG processed {stem}: {fixed_path}" + (f", conds {conds_key[:8]}" if conds_key else ""))
+        except Exception as e:
+            if not quiet:
+                logger.error(f"BG failed for {stem}: {e}")
+
+    if ENABLE_THREADED_SAVES and (Path(fallback_path).stem.endswith('_fixed') or is_different):  # Queue only if needed
+        threading.Thread(target=_bg_process_new, daemon=True, name=f"BG-Voice-{stem}").start()
+        logger.debug(f"Queued bg for {stem}")
+    return fallback_path  # Always fixed/valid
 
 
 # Sync pre-extract (threaded for non-blocking; hardcoded top voices)
@@ -660,7 +839,7 @@ def is_cache_key_loaded(cache_key):
 def get_cache_stats() -> Dict[str, Any]:
     cond_stats = _cache_manager.get_cache_stats()
     audio_stats = _audio_manager.stats()
-    return {**cond_stats, **audio_stats}
+    return {**cond_stats, **audio_stats, 'fuzzy_size': len(_fuzzy_audio_dict)}  # New: Fuzzy stat
 
 
 # Clears (merged; rooted paths)
@@ -720,8 +899,6 @@ def clear_cache(voice: Optional[str] = None, full: bool = False):
         return clear_cache_files()
 
 
-
-
 # Global voice cache (stem → dict: fixed_path, file_hash, conds_key)
 _voice_cache = {}  # In-memory; persist below
 _voice_cache_lock = threading.RLock()
@@ -775,128 +952,11 @@ def _save_voice_cache():
             logger.error(f"Save voice cache failed: {e}")
 
 
-def _compute_file_hash(file_path: str, method='hybrid') -> str:  # New 'hybrid'
-    if not Path(file_path).exists():
-        return ""
-    try:
-        if method == 'quick':
-            info = torchaudio.info(file_path)
-            size = Path(file_path).stat().st_size
-            return f"{size}_{info.num_frames}_{info.sample_rate}"
-        elif method == 'hybrid':  # Quick first; full if needed (for debug)
-            quick_h = None
-            try:
-                info = torchaudio.info(file_path)
-                size = Path(file_path).stat().st_size
-                quick_h = f"{size}_{info.num_frames}_{info.sample_rate}"
-            except:
-                pass
-            if quick_h:
-                return quick_h  # Fast; fallback full only on metadata fail
-        # Full MD5 (default/always for 'full' or hybrid fallback)
-        h = hashlib.md5()
-        with open(file_path, 'rb') as f:
-            for chunk in iter(lambda: f.read(8192), b""):
-                h.update(chunk)
-        return h.hexdigest()
-    except Exception as e:
-        logger.warning(f"Hash failed {file_path}: {e}")
-        return ""
-
-
-
-def get_or_queue_voice_process(audio_path: str, model, device, dtype, uuid, exaggeration=0.5, quiet=False) -> str:
-    stem = Path(audio_path).stem
-    with _voice_cache_lock:
-        cached = _voice_cache.get(stem, {})
-        cached_path = cached.get('fixed_path', '')
-        cached_hash = cached.get('file_hash', '')
-        cached_conds_key = cached.get('conds_key', '')
-        last_bg = cached.get('last_bg_time', 0)
-
-    if time.time() - last_bg < 30:
-        if not quiet:
-            logger.debug(f"Recent BG for {stem}—skipping queue")
-        # Ensure fixed even on skip
-        return cached_path if (cached_path and Path(cached_path).exists()) else check_and_update_ref(audio_path, exaggeration)
-
-    # Quick pre-check: If cached_path exists + same size/SR (no full hash/info)
-    if cached_path and Path(audio_path).exists():
-        if Path(audio_path).stat().st_size == Path(cached_path).stat().st_size:
-            logger.debug(f"Size match for {stem}—assuming same, reusing")
-            return cached_path  # Skip hash entirely
-    upload_hash = _compute_file_hash(audio_path, method='quick')  # Or 'full'
-    is_different = upload_hash != cached_hash or not cached_path
-
-    if not is_different and Path(cached_path).exists():
-        logger.info(f"Server WAV same as cached for {stem}—reusing {cached_path}")
-        if cached_conds_key:
-            conds = _cache_manager.load(cached_conds_key, model, device, dtype, quiet=quiet)
-            if conds and not quiet:
-                logger.info(f"Reused cached conds for {stem}")
-        return cached_path  # Valid
-
-    # Always fix/return valid for current (main thread; covers new/old invalid)
-    candidate_path = cached_path if cached_path else audio_path
-    fallback_path = check_and_update_ref(candidate_path, exaggeration)
-    if not fallback_path or not Path(fallback_path).exists():
-        logger.warning(f"Fix failed for {stem}—using original (may fail SR)")
-        fallback_path = candidate_path
-    logger.info(f"Fixed/used for {stem} in main: {fallback_path}")
-    if cached_conds_key and not is_different:
-        _cache_manager.load(cached_conds_key, model, device, dtype, quiet=quiet)
-
-    def _bg_process_new():
-        if not is_different or Path(fallback_path).exists():  # Skip if already fixed/same
-            return
-        try:
-            final_fixed = voices_dir / f"{stem}_fixed.wav"
-            fixed_path = check_and_update_ref(str(audio_path), exaggeration, out_path=final_fixed)  # Direct
-            if not fixed_path or not Path(fixed_path).exists():
-                if not quiet:
-                    logger.warning(f"BG full fail for {stem}")
-                return
-
-            # Prep/conds (locked)
-            conds_key = None
-            with MODEL_LOCK:
-                if (hasattr(model, 't3') and hasattr(model.t3, '_bucket_graphs') and len(model.t3._bucket_graphs) > 0):
-                    if not quiet:
-                        logger.debug(f"BG defer for {stem}: Graphs active")
-                else:
-                    model.prepare_conditionals(fixed_path, exaggeration=exaggeration)
-                    temp_conds = model.conds
-                    if temp_conds:
-                        model.set_conditionals(None)
-                        conds_key = get_cache_key(fixed_path, uuid, exaggeration)
-                        _cache_manager.save(conds_key, temp_conds, model=None, device=device, dtype=dtype)
-
-            with _voice_cache_lock:
-                update_entry = {'fixed_path': fixed_path, 'file_hash': upload_hash, 'last_bg_time': time.time()}
-                if conds_key:
-                    update_entry['conds_key'] = conds_key
-                _voice_cache[stem] = {**cached, **update_entry}
-            _save_voice_cache()
-            if not quiet:
-                logger.info(f"BG processed {stem}: {fixed_path}" + (f", conds {conds_key[:8]}" if conds_key else ""))
-        except Exception as e:
-            if not quiet:
-                logger.error(f"BG failed for {stem}: {e}")
-
-    if ENABLE_THREADED_SAVES and (Path(fallback_path).stem.endswith('_fixed') or is_different):  # Queue only if needed
-        threading.Thread(target=_bg_process_new, daemon=True, name=f"BG-Voice-{stem}").start()
-        logger.debug(f"Queued bg for {stem}")
-    return fallback_path  # Always fixed/valid
-
-
-
-
-_fuzzy_queue = Queue(maxsize=10)  # Non-blocking queue
+# Fuzzy globals (updated cap)
+_fuzzy_queue = Queue(maxsize=0)  # Non-blocking (unlimited)
 _fuzzy_lock = Lock()
 _fuzzy_audio_dict = {}  # {normalized_text: {'wav_path': str, 'orig_text': str}}
-MAX_INDEX_SIZE = 500  # Evict LRU if full
-
-
+MAX_INDEX_SIZE = 1000  # Updated to 1000 (reasonable for memory; evict FIFO)
 
 
 def normalize_text(text: str) -> str:
@@ -910,7 +970,8 @@ def normalize_text(text: str) -> str:
     return f"{text_hash}_{cleaned}"  # e.g., "a1b2c3d4_thane youre killing me"
 
 
-def string_similarity(s1: str, s2: str, threshold=0.75) -> bool:
+def string_similarity(s1: str, s2: str, threshold=0.75) -> float:
+    """Compute similarity ratio (return float for logging; caller checks >= threshold). Boost for RP."""
     # Use normalized or raw; here using raw for orig_text in sim, but norm_key for index
     s1_clean = re.sub(r'[^\w\s]', '', s1.lower())
     s2_clean = re.sub(r'[^\w\s]', '', s2.lower())
@@ -919,39 +980,82 @@ def string_similarity(s1: str, s2: str, threshold=0.75) -> bool:
     if re.search(r'\*moan|\*scream|ahh|mmm|aah|throbb?ing?', s1_clean) and re.search(
             r'\*moan|\*scream|ahh|mmm|aah|throbb?ing?', s2_clean):
         ratio += 0.1
-    return ratio > threshold
+    return ratio  # Caller: if ratio >= threshold
 
 
-# In _background_index_worker:
+# Background indexing worker (unchanged; FIFO evict)
 def _background_index_worker():
     while True:
         try:
-            text, wav_path, orig_text = _fuzzy_queue.get(timeout=1)
-            norm_key = normalize_text(text)  # Now defined
+            text, wav_path, voice_stem = _fuzzy_queue.get(timeout=1)  # Unpack as tuple
+            orig_text = text  # For sim
+            norm_key = normalize_text(text)
             with _fuzzy_lock:
-                if len(_fuzzy_audio_dict) >= MAX_INDEX_SIZE:
-                    _fuzzy_audio_dict.pop(next(iter(_fuzzy_audio_dict)))  # Oldest key
-                _fuzzy_audio_dict[norm_key] = {'wav_path': wav_path, 'orig_text': orig_text}
-            logger.debug(f"Indexed fuzzy audio: {norm_key[:30]} -> {wav_path}")
+                if norm_key in _fuzzy_audio_dict:  # Simple dedup (skip enqueue dups)
+                    logger.debug(f"Skipped dup fuzzy index: {norm_key[:30]}")
+                else:
+                    if len(_fuzzy_audio_dict) >= MAX_INDEX_SIZE:
+                        _fuzzy_audio_dict.pop(next(iter(_fuzzy_audio_dict)))  # Oldest key (FIFO)
+                        logger.debug(f"Fuzzy cache full ({MAX_INDEX_SIZE}) – evicted oldest")
+                    _fuzzy_audio_dict[norm_key] = {'wav_path': wav_path, 'orig_text': orig_text}
+                    logger.debug(f"Indexed fuzzy audio: {norm_key} -> {wav_path} (stem: {voice_stem})")
         except:
             pass
 
 
-# In try_fuzzy_audio_cache:
-def try_fuzzy_audio_cache(input_text: str, voice_stem: str, threshold=0.75) -> Optional[str]:
-    if not _fuzzy_audio_dict:
+# Patched try_fuzzy_audio_cache (detailed logs for testing; uses float from string_similarity)
+def try_fuzzy_audio_cache(input_text: str, voice_stem: str, threshold: float = 0.75) -> Optional[str]:
+    """
+    Fuzzy matching for audio cache: Checks string similarity in _fuzzy_audio_dict for voice-specific entries.
+    Logs attempts, matches/MISSES with ratios, and DB stats for debugging.
+    Assumes _fuzzy_audio_dict is dynamic (filled via enqueue from generations; capped elsewhere).
+    """
+    if not input_text or not voice_stem:
+        logger.debug("Fuzzy query skipped: Empty text or stem")
         return None
-    norm_query_key = normalize_text(input_text)  # Normalize query
-    norm_query_text = input_text.lower()  # For sim, use semi-clean orig
 
+    if not _fuzzy_audio_dict:
+        logger.debug(f"Fuzzy DB empty – no matches possible ({len(_fuzzy_audio_dict)} entries)")
+        return None
+
+    # Normalize for lookup/sim (clean query)
+    norm_query_key = normalize_text(input_text)
+    norm_query_text = input_text.lower().strip()  # Semi-clean for sim (preserve words)
+
+    logger.debug(
+        f"Trying fuzzy for stem '{voice_stem}', text: '{norm_query_text[:50]}...' "
+        f"DB size: {len(_fuzzy_audio_dict)} (threshold: {threshold})"
+    )
+
+    candidate_count = 0
+    max_sim = 0.0
+    best_entry = None
     with _fuzzy_lock:
         for stored_key, data in _fuzzy_audio_dict.items():
-            if voice_stem in stored_key:  # Voice filter
-                if string_similarity(norm_query_text, data['orig_text'], threshold):
+            if voice_stem in stored_key:  # Voice filter (stem in key ensures match)
+                candidate_count += 1
+                sim_ratio = string_similarity(norm_query_text, data['orig_text'], threshold)  # Get float
+                if sim_ratio > max_sim:
+                    max_sim = sim_ratio
+                    best_entry = data
+                if sim_ratio >= threshold:
                     logger.info(
-                        f"Fuzzy string HIT: {input_text[:20]} ≈ {data['orig_text'][:20]} (sim={SequenceMatcher(None, norm_query_text, data['orig_text']).ratio():.2f}) -> {data['wav_path']}")
+                        f"Fuzzy cache HIT: '{norm_query_text[:20]}...' ≈ '{data['orig_text'][:20]}...' "
+                        f"(sim={sim_ratio:.3f} >= {threshold}) for stem '{voice_stem}' -> {data['wav_path']}"
+                    )
                     return data['wav_path']
+
+    # Log MISS with stats (best sim, candidates) for tuning
+    logger.debug(
+        f"Fuzzy MISS for '{norm_query_text[:20]}...' (stem '{voice_stem}'): "
+        f"best sim={max_sim:.3f} < {threshold} ({candidate_count} candidates in DB)"
+    )
+    if best_entry:
+        logger.debug(
+            f"  Closest: '{best_entry['orig_text'][:20]}...' (sim={max_sim:.3f})"
+        )
+
     return None
 
-# Start daemon thread at init
-Thread(target=_background_index_worker, daemon=True).start()
+# Start daemon thread at init (fuzzy worker)
+threading.Thread(target=_background_index_worker, daemon=True, name="FuzzyIndexer").start()

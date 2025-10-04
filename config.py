@@ -17,6 +17,7 @@ _CONFIG_FILE = "skyrimnet_config.txt"
 # Testing flag - when True, bypasses config loading and uses all API values
 _USE_API_MODE = False
 
+FUZZY_CACHE_LIMIT = 1000
 
 def load_skyrimnet_config():
     """Load configuration from skyrimnet_config.txt with error handling"""
