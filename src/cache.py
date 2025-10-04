@@ -22,6 +22,9 @@ from pathlib import Path
 from collections import OrderedDict
 from typing import Dict, Any, Optional, Tuple, Union, List
 from loguru import logger  # Assume available; fallback to print if not
+import threading  # Ensure imported (likely already is)
+
+
 
 # Suppress torchaudio deprecation warnings (clean logs)
 warnings.filterwarnings('ignore', category=UserWarning, module='torchaudio')
@@ -35,6 +38,10 @@ CACHE_BASE = ROOT_DIR / "cache"
 CACHE_DIR = CACHE_BASE / "conditionals"
 CACHE_AUDIO_DIR = CACHE_BASE / "audio"
 voices_dir = CACHE_AUDIO_DIR / "voices"  # For check_and_update_ref
+
+
+# Global model lock (new: serialize access to prevent graph races)
+MODEL_LOCK = threading.RLock()
 
 # Tunable constants (hardcoded; override via env vars if needed)
 MAX_MEMORY_ENTRIES = int(os.getenv('COND_CACHE_MAX_ENTRIES', 50))
@@ -166,10 +173,17 @@ class ConditionalsCacheManager:
                         logger.info(f"Sync saved to disk: {disk_path}")
                     saved = True
 
-            # Set to model if available
-            if model and hasattr(model, 'set_conditionals'):
-                model.set_conditionals(conds)
-                logger.debug("Set conds via model.set_conditionals")
+            # Set to model if available (locked to prevent race)
+            if model:
+                with MODEL_LOCK:  # Serialize model access
+                    try:
+                        if hasattr(model, 'set_conditionals'):
+                            model.set_conditionals(conds)
+                            logger.debug("Set conds via model.set_conditionals")
+                        elif hasattr(model, 'conds'):
+                            model.conds = conds
+                    except Exception as set_e:
+                        logger.error(f"Model set failed: {set_e} – conds saved but not applied")
 
             return saved
 
@@ -444,22 +458,25 @@ def save_torchaudio_wav(wav_tensor, sr, audio_path, uuid):
 
 
 def validate_voice_path(audio_path: str) -> Tuple[Optional[str], Optional[Path]]:
-    """Validate audio path (exists, dur>0, SR match)."""
     if not audio_path or not Path(audio_path).exists():
         return None, None
     try:
         info = torchaudio.info(audio_path)
-        if info.num_frames == 0 or info.sample_rate != MODEL_SR:
-            logger.warning(f"Invalid path: {audio_path} (dur=0 or SR={info.sample_rate} != {MODEL_SR})")
+        if info.sample_rate != MODEL_SR:  # Focus on SR; dur=0 often metadata quirk
+            logger.warning(f"SR mismatch: {audio_path} ({info.sample_rate}Hz != {MODEL_SR})")
             return None, None
-        logger.debug(f"Valid path: {audio_path} (dur={info.num_frames/info.sample_rate:.2f}s)")
-        return audio_path, Path(audio_path)
+        if info.num_frames > 0:  # Valid dur
+            logger.debug(f"Valid path: {audio_path} (dur={info.num_frames/info.sample_rate:.2f}s)")
+            return audio_path, Path(audio_path)
+        else:
+            logger.warning(f"Zero duration: {audio_path}—may need longer ref")
+            return None, None
     except Exception as e:
         logger.warning(f"Validate failed {audio_path}: {e}")
         return None, None
 
 
-def check_and_update_ref(audio_path: str, exaggeration: float = 0.5, model_sr: int = MODEL_SR) -> str:
+def check_and_update_ref(audio_path: str, exaggeration: float = 0.5, model_sr: int = MODEL_SR, out_path: Optional[Path] = None) -> str:
     """Validate/resample audio to model SR/mono if needed; return validated path (rooted)."""
     validated_path, p = validate_voice_path(audio_path)
     if validated_path:
@@ -477,15 +494,31 @@ def check_and_update_ref(audio_path: str, exaggeration: float = 0.5, model_sr: i
         else:
             logger.debug(f"No resample needed for {audio_path}")
 
-        # Save fixed to voices_dir
-        voices_dir.mkdir(parents=True, exist_ok=True)
-        fixed_path = voices_dir / f"{Path(audio_path).stem}_fixed.wav"
-        torchaudio.save(fixed_path, waveform, model_sr)
-        logger.info(f"Fixed audio ref: {fixed_path}")
-        return str(fixed_path)
-    except ImportError:
-        logger.error("torchaudio unavailable for fix – return original (may fail)")
-        return audio_path
+        # Validate waveform (non-empty)
+        if waveform.numel() == 0:
+            logger.error(f"Empty waveform after load/resample for {audio_path}")
+            return audio_path
+
+        # Save fixed (direct to final for BG; use abs str path)
+        final_out = out_path or voices_dir / f"{Path(audio_path).stem}_fixed.wav"
+        final_out.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            torchaudio.save(
+                str(final_out.absolute()),  # Abs path for Windows
+                waveform,
+                model_sr,
+                format="wav",
+                encoding="PCM_S",
+                bits_per_sample=16
+            )
+        except Exception as save_e:
+            logger.warning(f"Save failed: {save_e}—retrying raw")
+            torchaudio.save(str(final_out.absolute()), waveform, model_sr)  # No extras
+        if not final_out.exists() or final_out.stat().st_size == 0:
+            logger.error(f"Save produced empty file: {final_out}")
+            return audio_path
+        logger.info(f"Fixed audio ref: {final_out}")
+        return str(final_out)
     except Exception as e:
         logger.error(f"Audio ref fix failed: {e}")
         return audio_path
@@ -541,10 +574,11 @@ def pre_extract_fixed_voices(model, device, dtype, top_voices: List[str] = ['nws
 # Init (merged: preload + optional pre-extract)
 def init_conditional_memory_cache(model=None, device=None, dtype=None, quiet: bool = False,
                                   pre_extract: bool = True) -> Tuple[bool, bool]:
+    _load_voice_cache()
     device = device or DEFAULT_DEVICE
     dtype = dtype or DEFAULT_DTYPE
 
-    # NEW: Verify voices dir (log available for debugging)
+    # Verify voices dir (log available for debugging)
     available_voices = [f.stem for f in voices_dir.glob("*.wav") if not f.stem.endswith('_fixed')]
     missing_voices = []
     if pre_extract:
@@ -554,8 +588,9 @@ def init_conditional_memory_cache(model=None, device=None, dtype=None, quiet: bo
                 missing_voices.append(v)
         if missing_voices:
             logger.warning(f"Pre-extract: Missing voices in {voices_dir}: {missing_voices}. Add WAV files for faster hits.")
-        if available_voices:
+        if not quiet and available_voices:
             logger.info(f"Found {len(available_voices)} voices in {voices_dir}: {available_voices[:5]}...")  # First 5
+
     if quiet:
         logger.debug(f"Voices dir {voices_dir} has {len(available_voices)} files")
 
@@ -678,3 +713,159 @@ def clear_cache(voice: Optional[str] = None, full: bool = False):
         logger.info(f"Cleared {len(keys_to_clear)} for voice: {voice}")
     elif full:
         return clear_cache_files()
+
+
+
+
+# Global voice cache (stem → dict: fixed_path, file_hash, conds_key)
+_voice_cache = {}  # In-memory; persist below
+_voice_cache_lock = threading.RLock()
+
+def _load_voice_cache():
+    """Load _voice_cache from JSON on init."""
+    global _voice_cache
+    cache_json = CACHE_AUDIO_DIR / "voice_cache.json"
+    if cache_json.exists():
+        try:
+            with open(cache_json, 'r') as f:
+                data = json.load(f)
+            _voice_cache = {}
+            for stem, info in data.items():
+                rel_path = info.get('fixed_path', '')
+                if rel_path:
+                    full_path = ROOT_DIR / rel_path  # Relative to absolute
+                    if full_path.exists():
+                        info['fixed_path'] = str(full_path)
+                    else:
+                        logger.warning(f"Voice cache path invalid: {full_path}—skipping")
+                        info['fixed_path'] = ''  # Invalidate
+                _voice_cache[stem] = info
+            logger.info(f"Loaded voice cache: {len(_voice_cache)} entries (paths rooted)")
+        except Exception as e:
+            logger.warning(f"Load voice cache failed: {e}—starting fresh")
+            _voice_cache = {}
+
+
+def _save_voice_cache():
+    """Save _voice_cache to JSON."""
+    with _voice_cache_lock:
+        temp_cache = {}
+        for stem, info in _voice_cache.items():
+            if 'fixed_path' in info:
+                abs_path = Path(info['fixed_path'])
+                if abs_path.exists():
+                    rel_path = abs_path.relative_to(ROOT_DIR)
+                    temp_cache[stem] = info.copy()
+                    temp_cache[stem]['fixed_path'] = str(rel_path)  # Absolute to relative
+                else:
+                    logger.warning(f"Save: Invalid path for {stem}—skipping")
+            else:
+                temp_cache[stem] = info
+        cache_json = CACHE_AUDIO_DIR / "voice_cache.json"
+        try:
+            with open(cache_json, 'w') as f:
+                json.dump(temp_cache, f, indent=2)  # Indent for readability
+            logger.debug(f"Saved voice cache: {len(temp_cache)} entries (paths relative)")
+        except Exception as e:
+            logger.error(f"Save voice cache failed: {e}")
+
+
+def _compute_file_hash(file_path: str, method='quick') -> str:  # Changed default
+    if not Path(file_path).exists():
+        return ""
+    try:
+        if method == 'quick':
+            try:
+                info = torchaudio.info(file_path)
+                size = Path(file_path).stat().st_size
+                return f"{size}_{info.num_frames}_{info.sample_rate}"
+            except:
+                return ""  # Fallback if info fails
+        else:  # MD5
+            h = hashlib.md5()
+            with open(file_path, 'rb') as f:
+                for chunk in iter(lambda: f.read(4096), b""):
+                    h.update(chunk)
+            return h.hexdigest()
+    except Exception as e:
+        logger.warning(f"Hash failed {file_path}: {e}")
+        return ""
+
+
+def get_or_queue_voice_process(audio_path: str, model, device, dtype, uuid, exaggeration=0.5, quiet=False) -> str:
+    stem = Path(audio_path).stem
+    with _voice_cache_lock:
+        cached = _voice_cache.get(stem, {})
+        cached_path = cached.get('fixed_path', '')
+        cached_hash = cached.get('file_hash', '')
+        cached_conds_key = cached.get('conds_key', '')
+        last_bg = cached.get('last_bg_time', 0)
+
+    if time.time() - last_bg < 30:
+        if not quiet:
+            logger.debug(f"Recent BG for {stem}—skipping queue")
+        # Ensure fixed even on skip
+        return cached_path if (cached_path and Path(cached_path).exists()) else check_and_update_ref(audio_path, exaggeration)
+
+    upload_hash = _compute_file_hash(audio_path)
+    is_different = upload_hash != cached_hash or not cached_path
+
+    if not is_different and Path(cached_path).exists():
+        logger.info(f"Server WAV same as cached for {stem}—reusing {cached_path}")
+        if cached_conds_key:
+            conds = _cache_manager.load(cached_conds_key, model, device, dtype, quiet=quiet)
+            if conds and not quiet:
+                logger.info(f"Reused cached conds for {stem}")
+        return cached_path  # Valid
+
+    # Always fix/return valid for current (main thread; covers new/old invalid)
+    candidate_path = cached_path if cached_path else audio_path
+    fallback_path = check_and_update_ref(candidate_path, exaggeration)
+    if not fallback_path or not Path(fallback_path).exists():
+        logger.warning(f"Fix failed for {stem}—using original (may fail SR)")
+        fallback_path = candidate_path
+    logger.info(f"Fixed/used for {stem} in main: {fallback_path}")
+    if cached_conds_key and not is_different:
+        _cache_manager.load(cached_conds_key, model, device, dtype, quiet=quiet)
+
+    def _bg_process_new():
+        if not is_different or Path(fallback_path).exists():  # Skip if already fixed/same
+            return
+        try:
+            final_fixed = voices_dir / f"{stem}_fixed.wav"
+            fixed_path = check_and_update_ref(str(audio_path), exaggeration, out_path=final_fixed)  # Direct
+            if not fixed_path or not Path(fixed_path).exists():
+                if not quiet:
+                    logger.warning(f"BG full fail for {stem}")
+                return
+
+            # Prep/conds (locked)
+            conds_key = None
+            with MODEL_LOCK:
+                if (hasattr(model, 't3') and hasattr(model.t3, '_bucket_graphs') and len(model.t3._bucket_graphs) > 0):
+                    if not quiet:
+                        logger.debug(f"BG defer for {stem}: Graphs active")
+                else:
+                    model.prepare_conditionals(fixed_path, exaggeration=exaggeration)
+                    temp_conds = model.conds
+                    if temp_conds:
+                        model.set_conditionals(None)
+                        conds_key = get_cache_key(fixed_path, uuid, exaggeration)
+                        _cache_manager.save(conds_key, temp_conds, model=None, device=device, dtype=dtype)
+
+            with _voice_cache_lock:
+                update_entry = {'fixed_path': fixed_path, 'file_hash': upload_hash, 'last_bg_time': time.time()}
+                if conds_key:
+                    update_entry['conds_key'] = conds_key
+                _voice_cache[stem] = {**cached, **update_entry}
+            _save_voice_cache()
+            if not quiet:
+                logger.info(f"BG processed {stem}: {fixed_path}" + (f", conds {conds_key[:8]}" if conds_key else ""))
+        except Exception as e:
+            if not quiet:
+                logger.error(f"BG failed for {stem}: {e}")
+
+    if ENABLE_THREADED_SAVES and (Path(fallback_path).stem.endswith('_fixed') or is_different):  # Queue only if needed
+        threading.Thread(target=_bg_process_new, daemon=True, name=f"BG-Voice-{stem}").start()
+        logger.debug(f"Queued bg for {stem}")
+    return fallback_path  # Always fixed/valid

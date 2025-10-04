@@ -35,7 +35,7 @@ repetition_penalty = default
 # Lower = slower/deliberate pacing, Higher = faster/guided speech
 # Range: 0.00 to 1.00, Recommended: 0.35, Speed optimized: 0.0
 # Note: This uses the "cfg_scale" slider in SkyrimNet UI when set to "api"
-cfg_weight = default
+cfg_weight = 0.45
 
 # EXAGGERATION: Controls emotion intensity and expression
 # Lower = neutral/calm, Higher = dramatic/expressive

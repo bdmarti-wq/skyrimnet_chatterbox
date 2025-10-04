@@ -1,17 +1,29 @@
 import functools
-import gradio as gr
-import torch
+import warnings
 
+# Suppress torchaudio deprecation warnings (broad: all backends/sub-modules)
+warnings.filterwarnings('ignore', message=r'.*torchaudio._backend.*', category=UserWarning)
+warnings.filterwarnings('ignore', message=r'.*deprecated.*torchaudio.*', category=UserWarning)
+
+import gradio as gr
 from argparse import ArgumentParser
 from pathlib import Path
 from time import perf_counter_ns
+
+from src.audio import set_torchaudio_backend
+backend = set_torchaudio_backend() # Add the code here (before cache imports or torchaudio usage)
+
+import torch
 from src.cache import (
     load_conditionals_cache, save_conditionals_cache, init_conditional_memory_cache,
     get_cache_key, try_audio_cache, check_and_update_ref, get_cache_stats, clear_cache_files,
-    clear_output_directories, save_torchaudio_wav, create_dummy_conds, set_audio_cache
+    clear_output_directories, save_torchaudio_wav, create_dummy_conds, set_audio_cache, get_or_queue_voice_process,
+    validate_voice_path
 )
 from src.cache import ConditionalsCacheManager as _cache_manager  # For global access if needed
 from loguru import logger
+
+
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DTYPE = torch.bfloat16 if DEVICE == "cuda" else torch.float32
@@ -205,12 +217,12 @@ def generate(model, text, language_id="en", audio_prompt_path=None, exaggeration
 
     func_start_time = perf_counter_ns()
 
-    # NEW: Check for full audio reuse first (major speedup for repeats; uses cache_uuid for consistency)
+    # Audio reuse check (unchanged)
     audio_reuse_path = None
     if text and audio_prompt_path:
         audio_reuse_path = try_audio_cache(audio_prompt_path, text, exaggeration, params={
             'cfgw': cfgw, 'temperature': temperature, 'min_p': min_p, 'top_p': top_p,
-            'repetition_penalty': repetition_penalty, 'language_id': language_id, 'cache_uuid': cache_uuid
+            'repetition_penalty': repetition_penalty, 'language_id': language_id
         })
         if audio_reuse_path:
             logger.info(f"Full audio cache HIT: Returning cached WAV instead of generating (uuid={cache_uuid})")
@@ -222,16 +234,35 @@ def generate(model, text, language_id="en", audio_prompt_path=None, exaggeration
             logger.info(f"Reused audio: {wav_length:.2f}s in ~0s (infinite speed!)")
             return audio_reuse_path
 
-    # NEW: Validate/fix audio path (resample if needed; transparent for API)
+    # Voice process
+    original_path = audio_prompt_path
     if audio_prompt_path is not None:
-        audio_prompt_path = check_and_update_ref(audio_prompt_path, exaggeration=exaggeration)
+        fixed_from_process = get_or_queue_voice_process(
+            audio_prompt_path, model, device, dtype, cache_uuid, exaggeration,
+            quiet=(not enable_memory_cache and not enable_disk_cache)
+        )
+        # Use process result (fixed if new/success)
+        audio_prompt_path = fixed_from_process
         if not audio_prompt_path or not Path(audio_prompt_path).exists():
-            logger.warning("Invalid audio prompt after fix – skipping conditionals and using dummy")
-            create_dummy_conds(model, device, dtype, "invalid_audio")
+            logger.warning(f"Process failed for {original_path} – using dummy")
+            create_dummy_conds(model, device, dtype, "process_fail")
             audio_prompt_path = None
+    else:
+        create_dummy_conds(model, device, dtype, "no_audio")
+        logger.info("No audio prompt – using dummy conditionals")
 
-    if audio_prompt_path is not None:
-        # Add language_id and cache_uuid to params for consistent multilingual/API keys
+    if audio_prompt_path:
+        # Single validate/fix (post-process only if invalid; process already fixed if new)
+        valid = validate_voice_path(audio_prompt_path)[0]
+        logger.debug(f"Path after process: {audio_prompt_path}, valid: {valid}")
+        if not valid:
+            logger.debug(f"Re-fix invalid path: {audio_prompt_path}")
+            audio_prompt_path = check_and_update_ref(audio_prompt_path, exaggeration)
+        else:
+            logger.debug(f"Valid path from process: {audio_prompt_path} - no resample")
+
+
+        # Conds prep (unchanged)
         cache_params = {'language_id': language_id, 'cache_uuid': cache_uuid}
         cache_key = get_cache_key(audio_prompt_path, cache_uuid, exaggeration, params=cache_params)
         conditionals_loaded = False
@@ -244,10 +275,10 @@ def generate(model, text, language_id="en", audio_prompt_path=None, exaggeration
             if dtype != torch.float32:
                 model.conds.t3.to(dtype=dtype)
             if cache_key and (enable_memory_cache or enable_disk_cache):
-                # FIXED: Pass all required args (model, device, dtype) for proper serialization
                 save_conditionals_cache(cache_key, model.conds, model=model, device=device, dtype=dtype,
                                         enable_memory_cache=enable_memory_cache, enable_disk_cache=enable_disk_cache)
                 logger.info(f"Prepared and cached conditionals: {cache_key[:8]}... (uuid={cache_uuid})")
+
     else:
         # No audio prompt: Use dummy (graceful fallback; doesn't break API)
         create_dummy_conds(model, device, dtype, "no_audio")
@@ -283,9 +314,25 @@ def generate(model, text, language_id="en", audio_prompt_path=None, exaggeration
     if MULTILINGUAL:
         generate_args["language_id"] = language_id
 
-    wav = model.generate(
-        **generate_args
-    )
+    wav = None
+    try:
+        wav = model.generate(
+            **generate_args
+        )
+    except RuntimeError as graph_e:
+        if "graph" in str(graph_e).lower() or "capture" in str(graph_e).lower():
+            logger.warning(f"Graph corrupt: {graph_e} – resetting t3 graphs and retrying")
+            if hasattr(model, 't3') and hasattr(model.t3, '_bucket_graphs'):
+                model.t3._bucket_graphs.clear()  # Reset corrupt graphs
+                torch.cuda.empty_cache()
+            # Retry without graphs (eager fallback)
+            t3_params_temp = t3_params.copy()
+            t3_params_temp['generate_token_backend'] = 'eager'
+            generate_args_temp = generate_args.copy()
+            generate_args_temp['t3_params'] = t3_params_temp
+            wav = model.generate(**generate_args_temp)
+        else:
+            raise  # Re-raise non-graph errors
 
     # Log execution time
     func_end_time = perf_counter_ns()
@@ -296,23 +343,11 @@ def generate(model, text, language_id="en", audio_prompt_path=None, exaggeration
     logger.info(
         f"Generated audio: {wav_length:.2f}s {model.sr / 1000:.2f}kHz in {total_duration_s:.2f}s. Speed: {wav_length / total_duration_s:.2f}x")
 
-    # Cache fixed path per stem/uuid (simple dict, session-scoped)
-    fixed_cache = getattr(model, '_fixed_audio_cache', {})
-    stem = Path(audio_prompt_path).stem if audio_prompt_path else None
-    if stem and (stem, cache_uuid) in fixed_cache:
-        audio_prompt_path = fixed_cache[(stem, cache_uuid)]
-        logger.debug(f"Reused fixed path for {stem}")
-    else:
-        audio_prompt_path = check_and_update_ref(audio_prompt_path, exaggeration)
-        if stem and audio_prompt_path:
-            fixed_cache[(stem, cache_uuid)] = audio_prompt_path
-            setattr(model, '_fixed_audio_cache', fixed_cache)
-
-    # NEW: Cache full audio output for future API reuses (uses cache_uuid for consistency)
+    # NEW: Cache full audio output for future API reuses (dedup uuid in params)
     if audio_prompt_path:
         full_cache_key = get_cache_key(audio_prompt_path, cache_uuid, exaggeration, params={
             'text': text, 'cfgw': cfgw, 'temperature': temperature, 'min_p': min_p, 'top_p': top_p,
-            'repetition_penalty': repetition_penalty, 'language_id': language_id
+            'repetition_penalty': repetition_penalty, 'language_id': language_id  # Dedup uuid
         })
         # Save first, then cache the new path
         wave_file = str(save_torchaudio_wav(wav.cpu(), model.sr, audio_path=audio_prompt_path, uuid=cache_uuid))
@@ -329,7 +364,6 @@ def generate(model, text, language_id="en", audio_prompt_path=None, exaggeration
     torch.cuda.empty_cache()
     return wave_file
 
-    # return (model.sr, wav.squeeze(0).cpu().numpy())
 
 
 ### SkyrimNet Zonos Emulated
@@ -600,7 +634,7 @@ if __name__ == "__main__":
     load_skyrimnet_config()
 
     model = load_model()
-    init_conditional_memory_cache(model, DEVICE, DTYPE, pre_extract=True)
+    init_conditional_memory_cache(model, DEVICE, DTYPE, quiet=True, pre_extract=True)  # Quiet for prod
     demo.queue(
         max_size=12,
         default_concurrency_limit=2,
