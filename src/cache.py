@@ -23,9 +23,15 @@ from collections import OrderedDict
 from typing import Dict, Any, Optional, Tuple, Union, List
 from loguru import logger  # Assume available; fallback to print if not
 
-# Original globals
-WAV_OUTPUT_DIR = Path("output_temp")
-CACHE_BASE = Path("cache")
+# Suppress torchaudio deprecation warnings (clean logs)
+warnings.filterwarnings('ignore', category=UserWarning, module='torchaudio')
+
+# Anchor paths to project root (skyrimnet_chatterbox/) for relocatable code
+ROOT_DIR = Path(__file__).parent.parent  # From src/ -> skyrimnet_chatterbox/
+
+# Original globals (now rooted)
+WAV_OUTPUT_DIR = ROOT_DIR / "output_temp"
+CACHE_BASE = ROOT_DIR / "cache"
 CACHE_DIR = CACHE_BASE / "conditionals"
 CACHE_AUDIO_DIR = CACHE_BASE / "audio"
 voices_dir = CACHE_AUDIO_DIR / "voices"  # For check_and_update_ref
@@ -42,8 +48,8 @@ DEFAULT_DEVICE = "cuda"  # Fallback
 DEFAULT_DTYPE = torch.float32
 MODEL_SR = 24000  # Assume standard for TTS
 
-# Create dirs
-for d in [CACHE_BASE, CACHE_DIR, CACHE_AUDIO_DIR, voices_dir]:
+# Create dirs (rooted)
+for d in [WAV_OUTPUT_DIR, CACHE_BASE, CACHE_DIR, CACHE_AUDIO_DIR, voices_dir]:
     d.mkdir(parents=True, exist_ok=True)
 
 # Import fallbacks
@@ -424,7 +430,7 @@ def get_cache_key(audio_path: str = None, uuid: Any = None, exaggeration: float 
 
 
 def save_torchaudio_wav(wav_tensor, sr, audio_path, uuid):
-    """Original: Save WAV with timestamp."""
+    """Original: Save WAV with timestamp (rooted paths)."""
     formatted_now_time = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     cache_key = get_cache_key(audio_path, uuid)
     filename = f"{formatted_now_time}_{cache_key}"
@@ -454,7 +460,7 @@ def validate_voice_path(audio_path: str) -> Tuple[Optional[str], Optional[Path]]
 
 
 def check_and_update_ref(audio_path: str, exaggeration: float = 0.5, model_sr: int = MODEL_SR) -> str:
-    """Validate/resample audio to model SR/mono if needed; return validated path."""
+    """Validate/resample audio to model SR/mono if needed; return validated path (rooted)."""
     validated_path, p = validate_voice_path(audio_path)
     if validated_path:
         return validated_path
@@ -502,19 +508,20 @@ def try_audio_cache(audio_path: str, text: str, exaggeration: float = 0.5, param
 
 # Sync pre-extract (threaded for non-blocking; hardcoded top voices)
 def pre_extract_fixed_voices(model, device, dtype, top_voices: List[str] = ['nwskatyavoice', 'vp_11_lilia', 'nwsjennavoice', 'ba_ahnivoice']):
-    """Pre-extract conds for top voices (sync with threading)."""
+    """Pre-extract conds for top voices (sync with threading; rooted paths)."""
     def _extract_worker(voice):
         if not T3_AVAILABLE:
             return
-        ref_path = check_and_update_ref(f"voices/{voice}.wav")  # Assume path
-        if not ref_path:
+        ref_path = voices_dir / f"{voice}.wav"  # Rooted to cache/audio/voices/
+        if not ref_path.exists():
+            logger.warning(f"Skipping pre-extract {voice}: No {ref_path}")
             return
-        cache_key = get_cache_key(ref_path, uuid=voice, exaggeration=0.5)
+        cache_key = get_cache_key(str(ref_path), uuid=voice, exaggeration=0.5)
         if _cache_manager.load(cache_key, model, device, dtype, quiet=True):
             logger.info(f"Pre-extract HIT: {voice}")
             return
         try:
-            model.prepare_conditionals(ref_path, exaggeration=0.5)
+            model.prepare_conditionals(str(ref_path), exaggeration=0.5)
             _cache_manager.save(cache_key, model.conds, model, device, dtype)
             logger.info(f"Pre-extracted: {voice} (key={cache_key[:8]})")
         except Exception as e:
@@ -536,6 +543,21 @@ def init_conditional_memory_cache(model=None, device=None, dtype=None, quiet: bo
                                   pre_extract: bool = True) -> Tuple[bool, bool]:
     device = device or DEFAULT_DEVICE
     dtype = dtype or DEFAULT_DTYPE
+
+    # NEW: Verify voices dir (log available for debugging)
+    available_voices = [f.stem for f in voices_dir.glob("*.wav") if not f.stem.endswith('_fixed')]
+    missing_voices = []
+    if pre_extract:
+        top_voices = ['nwskatyavoice', 'vp_11_lilia', 'nwsjennavoice', 'ba_ahnivoice']
+        for v in top_voices:
+            if v not in available_voices:
+                missing_voices.append(v)
+        if missing_voices:
+            logger.warning(f"Pre-extract: Missing voices in {voices_dir}: {missing_voices}. Add WAV files for faster hits.")
+        if available_voices:
+            logger.info(f"Found {len(available_voices)} voices in {voices_dir}: {available_voices[:5]}...")  # First 5
+    if quiet:
+        logger.debug(f"Voices dir {voices_dir} has {len(available_voices)} files")
 
     # Preload all .pt
     loaded = 0
@@ -574,7 +596,7 @@ def init_conditional_memory_cache(model=None, device=None, dtype=None, quiet: bo
     return ENABLE_MEMORY, ENABLE_DISK
 
 
-# Facades
+# Facades (unchanged)
 def save_conditionals_cache(cache_key: str, cond_cls=None, model=None, device=None, dtype=None,
                             enable_memory_cache: bool = True, enable_disk_cache: bool = True) -> bool:
     return _cache_manager.save(cache_key, cond_cls, model, device, dtype, enable_memory_cache, enable_disk_cache)
@@ -601,7 +623,7 @@ def get_cache_stats() -> Dict[str, Any]:
     return {**cond_stats, **audio_stats}
 
 
-# Clears (merged)
+# Clears (merged; rooted paths)
 def clear_output_directories():
     if not WAV_OUTPUT_DIR.exists():
         logger.info(f"Output dir {WAV_OUTPUT_DIR} does not exist")

@@ -1,6 +1,8 @@
 import functools
 from typing import Dict, Any, Optional
 
+from src.cache import clear_cache_files
+
 
 class SimpleModelState:
     def __init__(self):
@@ -18,6 +20,7 @@ class SimpleModelState:
         return self.model is not None and self.model_name == model_name
 
     def clear(self):
+        clear_cache_files()  # Clear conds/audio on model clear
         self.model = None
         self.model_name = None
 

@@ -23,6 +23,12 @@ from src.simple_model_state import simple_manage_model_state
 if TYPE_CHECKING:
     from src.chatterbox.tts import ChatterboxTTS
 
+from cache import (
+    load_conditionals_cache, save_conditionals_cache, init_conditional_memory_cache,
+    get_cache_key, try_audio_cache, check_and_update_ref, get_cache_stats, clear_cache_files
+)
+from cache import ConditionalsCacheManager as _cache_manager  # For global access if needed
+import threading  # Already there, but ensure
 
 def split_by_lines(prompt: str):
     prompts = re.split(r'(?<=[.?!])\s*(?![.\w"\'\d]|[,!]|\*)', prompt)
@@ -111,12 +117,14 @@ def remove_t3_compilation(model: "ChatterboxTTS"):
 
 @simple_manage_model_state("chatterbox")
 def get_model(model_name="just_a_placeholder",
-    device=torch.device("cuda"), dtype=torch.float32
+    device=torch.device("cuda"), dtype=torch.float32 #TODO review this
 ):
     from src.chatterbox.tts import ChatterboxTTS
 
     model = ChatterboxTTS.from_pretrained(device=device)
-    # having everything on float32 increases performance
+    init_conditional_memory_cache(model, device, dtype, quiet=False, pre_extract=True)
+
+    # having everything on float32 increases performance TODO review this
     return chatterbox_tts_to(model, device, dtype)
 
 
@@ -171,132 +179,6 @@ def cpu_offload_context(model, device, dtype, cpu_offload=False):
 _conditionals_memory_cache = {}
 _cache_lock = threading.Lock()
 
-def get_cache_dir():
-    """Get or create the conditionals cache directory"""
-    cache_dir = Path("cache/conditionals")
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    return cache_dir
-
-def get_cache_key(audio_path, uuid, exaggeration):
-    """Generate a cache key based on audio file, UUID, and exaggeration"""
-    if audio_path is None:
-        return None
-
-    # Extract just the filename without extension as prefix
-    try:
-        filename = Path(audio_path).stem  # Gets filename without extension
-        # Remove any temp directory prefixes, just keep the actual filename
-        cache_prefix = filename
-    except Exception:
-        cache_prefix = "unknown"
-
-    # Convert UUID to hex string for readability
-    try:
-        uuid_hex = hex(uuid)[2:]  # Remove '0x' prefix
-    except (TypeError, ValueError):
-        uuid_hex = str(uuid)
-
-    # Create cache key: prefix_uuid_exaggeration
-    cache_key = f"{cache_prefix}_{uuid_hex}_{exaggeration}"
-
-    # Use MD5 hash if the key gets too long (over 100 chars)
-    if len(cache_key) > 100:
-        cache_hash = hashlib.md5(cache_key.encode()).hexdigest()
-        return f"{cache_prefix}_{cache_hash}"
-
-    return cache_key
-
-def _save_conditionals_to_disk(cache_key, cond_cls):
-    """Non-blocking worker function to save conditionals to disk"""
-    try:
-        cache_dir = get_cache_dir()
-        cache_file = cache_dir.joinpath(cache_key + ".pt")
-        arg_dict = dict(
-            t3=cond_cls.t3.__dict__,
-            gen=cond_cls.gen
-        )
-        torch.save(arg_dict, cache_file)
-
-        print(f"Saved conditionals cache: {cache_key}")
-
-    except Exception as e:
-        print(f"Failed to save conditionals cache: {e}")
-
-def save_conditionals_cache(cache_key, cond_cls):
-    """Save prepared conditionals to disk (non-blocking) and memory"""
-    if cache_key is None:
-        return
-
-    # TODO Disk cache possibly broken, not used
-    #try:
-    #    # Save to memory cache (blocking, but fast)
-    #    with _cache_lock:
-    #        _conditionals_memory_cache[cache_key] = {'t3':cond_cls.t3, 'gen':cond_cls.gen}
-    #        print(f"Saved conditionals to memory cache: {cache_key}")
-
-    #    # Save to disk (non-blocking)
-    #    threading.Thread(
-    #        target=_save_conditionals_to_disk,
-    #        args=(cache_key, cond_cls),
-    #        daemon=True
-    #    ).start()
-
-    #except Exception as e:
-    #    print(f"Failed to prepare conditionals cache: {e}")
-
-def load_conditionals_cache(cache_key, model, device, dtype):
-    """Load prepared conditionals from memory or disk with optional GDS acceleration"""
-    if cache_key is None:
-        return None
-
-    try:
-        # Try memory cache first (fastest)
-        with _cache_lock:
-            if cache_key in _conditionals_memory_cache:
-                cache_data = _conditionals_memory_cache[cache_key]
-
-                # Restore conditionals to model
-                if 't3' in cache_data and cache_data['t3'] is not None:
-                    model.set_conditionals(Conditionals(T3Cond(cache_data['t3']), cache_data['gen']))
-
-                print(f"Loaded conditionals from memory cache: {cache_key}")
-                return True
-
-        # TODO Disk cache possibly broken, not used
-        ## Try disk cache with GDS
-        #cache_dir = get_cache_dir()
-        #cache_file = cache_dir.joinpath(cache_key + ".pt")
-#
-        #if not cache_file.exists():
-        #    return None
-#
-        #with safe_globals([T3Cond]):
-        #    #cond_cls = Conditionals.load(cls=Conditionals,fpath=cache_file)
-        #    map_location = torch.device("cpu")
-        #    kwargs = torch.load(cache_file, map_location=map_location, weights_only=True)
-        #    cond_cls =  Conditionals(T3Cond(**kwargs['t3']), kwargs['gen'])
-        #print(f"loaded cond {cond_cls.__sizeof__()}")
-        ## Restore conditionals to model
-        #if hasattr(cond_cls, 't3'):
-        #   model.set_conditionals(cond_cls)
-        #   print(f"set conditionals")
-#
-        ## Store in memory cache for next time
-        #cache_dict = dict(
-        #    t3=cond_cls.__dict__,
-        #    gen=cond_cls.gen
-        #)
-        #with _cache_lock:
-        #    _conditionals_memory_cache[cache_key] = cache_dict
-#
-        #print(f"Loaded conditionals cache: {cache_key}")
-        #return True
-
-    except Exception as e:
-        import traceback
-        print(traceback.format_exc())
-        print(f"Failed to load conditionals cache: {e}")
-        return None
 
 def with_memory_optimization(func):
     def wrapper(*args, **kwargs):
@@ -380,31 +262,40 @@ def _tts_generator(
                 remove_t3_compilation(model)
 
             # Enhanced conditional preparation with disk caching
+            # Validate and fix audio path
             if audio_prompt_path is not None:
-                # Generate cache key
-                cache_key = get_cache_key(audio_prompt_path, cache_uuid, exaggeration)
-                conditionals_loaded = False
+                audio_prompt_path = check_and_update_ref(audio_prompt_path, exaggeration=exaggeration)
 
-                # Try to load from disk cache first
-                if cache_key and load_conditionals_cache(cache_key, model, device, dtype):
-                    conditionals_loaded = True
+            # Check audio cache for full reuse (skip TTS if hit)
+            full_cache_key = try_audio_cache(audio_prompt_path, text, exaggeration=exaggeration,
+                                             params={'cfgw': cfgw, 'temp': temperature})
+            if full_cache_key:
+                # Yield cached audio (assume single chunk for simplicity; extend for multi)
+                cached_path = get_audio_cache(full_cache_key)
+                wav, sr = torchaudio.load(cached_path)
+                yield {"audio_out": (model.sr, wav.squeeze().numpy()), "wav_tensor": wav.squeeze()}
+                yield {"device": device, "sr": sr}
+                return  # Early exit
+
+            # Generate cache key for conditionals
+            cache_key = get_cache_key(audio_prompt_path, cache_uuid, exaggeration)
+
+            conditionals_loaded = False
+            if cache_key:
+                conditionals_loaded = load_conditionals_cache(cache_key, model, device, dtype)
+                if conditionals_loaded:
                     progress(0.3, desc="Loaded cached conditionals...")
 
-                # If not loaded from cache, prepare and optionally cache
-                if not conditionals_loaded:
-                    progress(0.2, desc="Preparing conditionals...")
-                    model.prepare_conditionals(audio_prompt_path, exaggeration=exaggeration)
+            if not conditionals_loaded:
+                progress(0.2, desc="Preparing conditionals...")
+                model.prepare_conditionals(audio_prompt_path, exaggeration=exaggeration)
+                if dtype != torch.float32:
+                    model.conds.t3.to(dtype=dtype)
+                if cache_key:
+                    save_conditionals_cache(cache_key, model.conds, model, device, dtype)
 
-                    if dtype != torch.float32:
-                        model.conds.t3.to(dtype=dtype)
-
-                    # Save to disk cache if we have a cache key
-                    if cache_key:
-                        save_conditionals_cache(cache_key, model.conds)
-
-                # Update in-memory cache tracking
-                if cache_voice:
-                    model._cached_prompt_path = audio_prompt_path
+            if cache_voice:
+                model._cached_prompt_path = audio_prompt_path
 
             def generate_chunk(text):
                 print(f"Generating chunk: {text}")
@@ -516,6 +407,9 @@ def tts(*args, **kwargs):
         execution_time = end_time - start_time
         audio_length_seconds = len(full_wav) / sr
         speed_ratio = audio_length_seconds / execution_time
+
+        cache_stats = get_cache_stats()
+        print(f"Cache stats: {cache_stats['memory_cache_size']} memory, {cache_stats['disk_files']} disk")
 
         print(f"  Execution time: {execution_time:.2f}s  Audio length: {audio_length_seconds:.2f}s")
         print(f"  Speed ratio: {speed_ratio:.2f}x (audio_length/execution_time)")
