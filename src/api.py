@@ -353,94 +353,111 @@ def _tts_generator(
     do_progress=True,
     **kwargs,
 ):
-    device = resolve_device(device)
-    dtype = resolve_dtype(dtype)
+    # Add early garbage collection
+    gc.collect()
+    torch.cuda.empty_cache()
+    initial_mem = torch.cuda.memory_allocated()
 
-    print(f"Using device: {device}")
+    try:
+        device = resolve_device(device)
+        dtype = resolve_dtype(dtype)
+        gc.collect()
+        torch.cuda.empty_cache()
 
-    progress(0.0, desc="Retrieving model...")
-    with (chatterbox_model(
-        model_name=model_name,
-        device=device,
-        dtype=dtype,
-    ) as model, cpu_offload_context(model, device, dtype, cpu_offload)):
-        progress(0.1, desc="Generating audio...")
+        print(f"Using device: {device}")
 
-        if use_compilation:
-            _set_t3_compilation(model)
-        else:
-            remove_t3_compilation(model)
+        progress(0.0, desc="Retrieving model...")
+        with (chatterbox_model(
+            model_name=model_name,
+            device=device,
+            dtype=dtype,
+        ) as model, cpu_offload_context(model, device, dtype, cpu_offload)):
+            progress(0.1, desc="Generating audio...")
 
-        # Enhanced conditional preparation with disk caching
-        if audio_prompt_path is not None:
-            # Generate cache key
-            cache_key = get_cache_key(audio_prompt_path, cache_uuid, exaggeration)
-            conditionals_loaded = False
+            if use_compilation:
+                _set_t3_compilation(model)
+            else:
+                remove_t3_compilation(model)
 
-            # Try to load from disk cache first
-            if cache_key and load_conditionals_cache(cache_key, model, device, dtype):
-                conditionals_loaded = True
-                progress(0.3, desc="Loaded cached conditionals...")
+            # Enhanced conditional preparation with disk caching
+            if audio_prompt_path is not None:
+                # Generate cache key
+                cache_key = get_cache_key(audio_prompt_path, cache_uuid, exaggeration)
+                conditionals_loaded = False
 
-            # If not loaded from cache, prepare and optionally cache
-            if not conditionals_loaded:
-                progress(0.2, desc="Preparing conditionals...")
-                model.prepare_conditionals(audio_prompt_path, exaggeration=exaggeration)
+                # Try to load from disk cache first
+                if cache_key and load_conditionals_cache(cache_key, model, device, dtype):
+                    conditionals_loaded = True
+                    progress(0.3, desc="Loaded cached conditionals...")
 
-                if dtype != torch.float32:
-                    model.conds.t3.to(dtype=dtype)
+                # If not loaded from cache, prepare and optionally cache
+                if not conditionals_loaded:
+                    progress(0.2, desc="Preparing conditionals...")
+                    model.prepare_conditionals(audio_prompt_path, exaggeration=exaggeration)
 
-                # Save to disk cache if we have a cache key
-                if cache_key:
-                    save_conditionals_cache(cache_key, model.conds)
+                    if dtype != torch.float32:
+                        model.conds.t3.to(dtype=dtype)
 
-            # Update in-memory cache tracking
-            if cache_voice:
-                model._cached_prompt_path = audio_prompt_path
+                    # Save to disk cache if we have a cache key
+                    if cache_key:
+                        save_conditionals_cache(cache_key, model.conds)
 
-        def generate_chunk(text):
-            print(f"Generating chunk: {text}")
-            yield from model.generate(
-                text,
-                exaggeration=exaggeration,
-                cfg_weight=cfgw,
-                temperature=temperature,
-                max_new_tokens=max_new_tokens,
-                max_cache_len=max_cache_len,
-                repetition_penalty=repetition_penalty,
-                min_p=min_p,
-                top_p=top_p,
+                # Update in-memory cache tracking
+                if cache_voice:
+                    model._cached_prompt_path = audio_prompt_path
+
+            def generate_chunk(text):
+                print(f"Generating chunk: {text}")
+                yield from model.generate(
+                    text,
+                    exaggeration=exaggeration,
+                    cfg_weight=cfgw,
+                    temperature=temperature,
+                    max_new_tokens=max_new_tokens,
+                    max_cache_len=max_cache_len,
+                    repetition_penalty=repetition_penalty,
+                    min_p=min_p,
+                    top_p=top_p,
+                )
+
+            texts = (
+                split_by_lines(text)
+                if chunked
+                else [text]
             )
 
-        texts = (
-            split_by_lines(text)
-            if chunked
-            else [text]
-        )
+            for i, chunk in enumerate(texts):
+                if not streaming:
+                   progress(i / len(texts), desc=f"Generating chunk: {chunk}")
 
-        for i, chunk in enumerate(texts):
-            if not streaming:
-               progress(i / len(texts), desc=f"Generating chunk: {chunk}")
+                chunk_wavs = list(generate_chunk(chunk))
 
-            chunk_wavs = list(generate_chunk(chunk))
+                if chunk_wavs:
+                    # Clean up before generating next part
+                    torch.cuda.empty_cache()
+                    gc.collect()
 
-            if chunk_wavs:
-                with torch.no_grad():
-                    if len(chunk_wavs) == 1:
-                        wav_tensor = chunk_wavs[0].squeeze()
-                        # Yield both for streaming and for final concatenation
-                        yield {"audio_out": (model.sr, wav_tensor.cpu().numpy()), "wav_tensor": wav_tensor}
-                    else:
-                        stacked_wavs = torch.stack(chunk_wavs).squeeze()
-
-                        if stacked_wavs.ndim == 1:
-                            yield {"audio_out": (model.sr, stacked_wavs.cpu().numpy()), "wav_tensor": stacked_wavs}
+                    with torch.no_grad():
+                        if len(chunk_wavs) == 1:
+                            wav_tensor = chunk_wavs[0].squeeze()
+                            yield {"audio_out": (model.sr, wav_tensor.cpu().numpy()), "wav_tensor": wav_tensor}
                         else:
-                            for wav_tensor in stacked_wavs:
-                                yield {"audio_out": (model.sr, wav_tensor.cpu().numpy()), "wav_tensor": wav_tensor}
+                            stacked_wavs = torch.stack(chunk_wavs).squeeze()
 
-        # Signal completion with device info for GPU optimization
-        yield {"device": device, "sr": model.sr}
+                            if stacked_wavs.ndim == 1:
+                                yield {"audio_out": (model.sr, stacked_wavs.cpu().numpy()), "wav_tensor": stacked_wavs}
+                            else:
+                                for wav_tensor in stacked_wavs:
+                                    # Process here might needs cleaning up after each tensor
+                                    yield {"audio_out": (model.sr, wav_tensor.cpu().numpy()), "wav_tensor": wav_tensor}
+
+            yield {"device": device, "sr": model.sr}
+    finally:
+        # Clean up unused memory in final
+        torch.cuda.empty_cache()
+        gc.collect()
+        final_mem = torch.cuda.memory_allocated()
+        print(f"Memory freed: {(initial_mem - final_mem) / 1e9:.2f} GB")
 
 
 global_interrupt_flag = InterruptionFlag()

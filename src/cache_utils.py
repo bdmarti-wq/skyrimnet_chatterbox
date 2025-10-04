@@ -1,5 +1,6 @@
 import threading
 import traceback
+from concurrent.futures import ThreadPoolExecutor
 
 import torch
 import datetime
@@ -102,9 +103,10 @@ class ConditionalsCacheManager:
         try:
             if enable_memory_cache and self._try_load_from_memory(cache_key, model, device, dtype):
                 return True
-            
-            if enable_disk_cache and self._try_load_from_disk(cache_key, model, device, dtype, enable_memory_cache):
-                return True
+
+            with ThreadPoolExecutor(max_workers=4) as executor:
+                future = executor.submit(self._try_load_from_disk, cache_key, model, device, dtype, enable_memory_cache)
+                return future.result()
             logger.info(f"No cached conditionals found for key: {cache_key}")    
             return False
             
