@@ -14,6 +14,10 @@ import time
 import warnings
 import hashlib
 import threading
+import re
+from difflib import SequenceMatcher
+from threading import Lock, Thread
+from queue import Queue
 import torch
 import torchaudio
 from torch.serialization import safe_globals  # For whitelisting in load
@@ -770,26 +774,34 @@ def _save_voice_cache():
             logger.error(f"Save voice cache failed: {e}")
 
 
-def _compute_file_hash(file_path: str, method='quick') -> str:  # Changed default
+def _compute_file_hash(file_path: str, method='hybrid') -> str:  # New 'hybrid'
     if not Path(file_path).exists():
         return ""
     try:
         if method == 'quick':
+            info = torchaudio.info(file_path)
+            size = Path(file_path).stat().st_size
+            return f"{size}_{info.num_frames}_{info.sample_rate}"
+        elif method == 'hybrid':  # Quick first; full if needed (for debug)
+            quick_h = None
             try:
                 info = torchaudio.info(file_path)
                 size = Path(file_path).stat().st_size
-                return f"{size}_{info.num_frames}_{info.sample_rate}"
+                quick_h = f"{size}_{info.num_frames}_{info.sample_rate}"
             except:
-                return ""  # Fallback if info fails
-        else:  # MD5
-            h = hashlib.md5()
-            with open(file_path, 'rb') as f:
-                for chunk in iter(lambda: f.read(4096), b""):
-                    h.update(chunk)
-            return h.hexdigest()
+                pass
+            if quick_h:
+                return quick_h  # Fast; fallback full only on metadata fail
+        # Full MD5 (default/always for 'full' or hybrid fallback)
+        h = hashlib.md5()
+        with open(file_path, 'rb') as f:
+            for chunk in iter(lambda: f.read(8192), b""):
+                h.update(chunk)
+        return h.hexdigest()
     except Exception as e:
         logger.warning(f"Hash failed {file_path}: {e}")
         return ""
+
 
 
 def get_or_queue_voice_process(audio_path: str, model, device, dtype, uuid, exaggeration=0.5, quiet=False) -> str:
@@ -807,7 +819,12 @@ def get_or_queue_voice_process(audio_path: str, model, device, dtype, uuid, exag
         # Ensure fixed even on skip
         return cached_path if (cached_path and Path(cached_path).exists()) else check_and_update_ref(audio_path, exaggeration)
 
-    upload_hash = _compute_file_hash(audio_path)
+    # Quick pre-check: If cached_path exists + same size/SR (no full hash/info)
+    if cached_path and Path(audio_path).exists():
+        if Path(audio_path).stat().st_size == Path(cached_path).stat().st_size:
+            logger.debug(f"Size match for {stem}—assuming same, reusing")
+            return cached_path  # Skip hash entirely
+    upload_hash = _compute_file_hash(audio_path, method='quick')  # Or 'full'
     is_different = upload_hash != cached_hash or not cached_path
 
     if not is_different and Path(cached_path).exists():
@@ -869,3 +886,71 @@ def get_or_queue_voice_process(audio_path: str, model, device, dtype, uuid, exag
         threading.Thread(target=_bg_process_new, daemon=True, name=f"BG-Voice-{stem}").start()
         logger.debug(f"Queued bg for {stem}")
     return fallback_path  # Always fixed/valid
+
+
+
+
+_fuzzy_queue = Queue(maxsize=10)  # Non-blocking queue
+_fuzzy_lock = Lock()
+_fuzzy_audio_dict = {}  # {normalized_text: {'wav_path': str, 'orig_text': str}}
+MAX_INDEX_SIZE = 500  # Evict LRU if full
+
+
+
+
+def normalize_text(text: str) -> str:
+    """Normalize text for fuzzy indexing: Lowercase, strip punctuation/whitespace, collapse multiples."""
+    # Lowercase and remove non-alphanumeric (keep spaces)
+    cleaned = re.sub(r'[^\w\s]', '', text.lower())
+    # Collapse multiple spaces, strip
+    cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+    # Optional: Hash prefix for unique keys (e.g., first 8 chars hash + clean)
+    text_hash = hashlib.md5(cleaned.encode()).hexdigest()[:8]  # Need import hashlib
+    return f"{text_hash}_{cleaned}"  # e.g., "a1b2c3d4_thane youre killing me"
+
+
+def string_similarity(s1: str, s2: str, threshold=0.75) -> bool:
+    # Use normalized or raw; here using raw for orig_text in sim, but norm_key for index
+    s1_clean = re.sub(r'[^\w\s]', '', s1.lower())
+    s2_clean = re.sub(r'[^\w\s]', '', s2.lower())
+    ratio = SequenceMatcher(None, s1_clean, s2_clean).ratio()
+    # Boost for RP patterns (tune as needed)
+    if re.search(r'\*moan|\*scream|ahh|mmm|aah|throbb?ing?', s1_clean) and re.search(
+            r'\*moan|\*scream|ahh|mmm|aah|throbb?ing?', s2_clean):
+        ratio += 0.1
+    return ratio > threshold
+
+
+# In _background_index_worker:
+def _background_index_worker():
+    while True:
+        try:
+            text, wav_path, orig_text = _fuzzy_queue.get(timeout=1)
+            norm_key = normalize_text(text)  # Now defined
+            with _fuzzy_lock:
+                if len(_fuzzy_audio_dict) >= MAX_INDEX_SIZE:
+                    _fuzzy_audio_dict.pop(next(iter(_fuzzy_audio_dict)))  # Oldest key
+                _fuzzy_audio_dict[norm_key] = {'wav_path': wav_path, 'orig_text': orig_text}
+            logger.debug(f"Indexed fuzzy audio: {norm_key[:30]} -> {wav_path}")
+        except:
+            pass
+
+
+# In try_fuzzy_audio_cache:
+def try_fuzzy_audio_cache(input_text: str, voice_stem: str, threshold=0.75) -> Optional[str]:
+    if not _fuzzy_audio_dict:
+        return None
+    norm_query_key = normalize_text(input_text)  # Normalize query
+    norm_query_text = input_text.lower()  # For sim, use semi-clean orig
+
+    with _fuzzy_lock:
+        for stored_key, data in _fuzzy_audio_dict.items():
+            if voice_stem in stored_key:  # Voice filter
+                if string_similarity(norm_query_text, data['orig_text'], threshold):
+                    logger.info(
+                        f"Fuzzy string HIT: {input_text[:20]} ≈ {data['orig_text'][:20]} (sim={SequenceMatcher(None, norm_query_text, data['orig_text']).ratio():.2f}) -> {data['wav_path']}")
+                    return data['wav_path']
+    return None
+
+# Start daemon thread at init
+Thread(target=_background_index_worker, daemon=True).start()

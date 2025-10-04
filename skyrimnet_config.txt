@@ -41,7 +41,7 @@ cfg_weight = 0.45
 # Lower = neutral/calm, Higher = dramatic/expressive
 # Range: 0.00 to 2.00, Recommended: 0.7, Dramatic: 0.7+
 # Note: This uses the "quadratic" slider in SkyrimNet UI when set to "api"
-exaggeration = default
+exaggeration = 0.7
 
 
 # Advanced users: You can also set specific values instead of "default" or "api"

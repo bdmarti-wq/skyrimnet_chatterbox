@@ -18,7 +18,7 @@ from src.cache import (
     load_conditionals_cache, save_conditionals_cache, init_conditional_memory_cache,
     get_cache_key, try_audio_cache, check_and_update_ref, get_cache_stats, clear_cache_files,
     clear_output_directories, save_torchaudio_wav, create_dummy_conds, set_audio_cache, get_or_queue_voice_process,
-    validate_voice_path
+    validate_voice_path, _fuzzy_queue, try_fuzzy_audio_cache
 )
 from src.cache import ConditionalsCacheManager as _cache_manager  # For global access if needed
 from loguru import logger
@@ -232,11 +232,35 @@ def generate(model, text, language_id="en", audio_prompt_path=None, exaggeration
             wav_cached, sr = torchaudio.load(audio_reuse_path)
             wav_length = wav_cached.shape[-1] / sr
             logger.info(f"Reused audio: {wav_length:.2f}s in ~0s (infinite speed!)")
+            # NEW: Enqueue for fuzzy index (even exact reuses; enriches dict if variants)
+            voice_stem = Path(audio_prompt_path).stem
+            _fuzzy_queue.put((text, audio_reuse_path, voice_stem))  # Background index
             return audio_reuse_path
 
-    # Voice process
+    # ========== NEW: Fuzzy Audio Cache Check (Insert Here - After Exact, Before Voice Process) ==========
+    fuzzy_reuse_path = None
+    if text and audio_prompt_path and not audio_reuse_path:  # Only if exact MISS + has stem
+        voice_stem = Path(audio_prompt_path).stem
+        fuzzy_reuse_path = try_fuzzy_audio_cache(text, voice_stem)  # Optional threshold via kwarg if tuning
+        if fuzzy_reuse_path:
+            logger.info(f"Fuzzy audio cache HIT: \"{text}\" (near-match) for {voice_stem} – skipping gen (uuid={cache_uuid})")
+            # Log stats (mimic exact)
+            import torchaudio
+            wav_fuzzy, sr = torchaudio.load(fuzzy_reuse_path)
+            wav_length = wav_fuzzy.shape[-1] / sr
+            logger.info(f"Reused fuzzy audio: {wav_length:.2f}s in ~0s (infinite speed!)")
+            # NEW: Enqueue to refresh index (low-cost; ensures active)
+            _fuzzy_queue.put((text, fuzzy_reuse_path, voice_stem))
+            return fuzzy_reuse_path
+        else:
+            logger.debug(f"Fuzzy cache MISS for \"{text}\" on {voice_stem} – proceeding to full gen")
+    # ========== End Fuzzy Insertion ==========
+
+    audio_reuse = audio_reuse_path or fuzzy_reuse_path  # Combined reuse flag for post-gen enqueue
+
+    # Voice process (unchanged; only if no reuse)
     original_path = audio_prompt_path
-    if audio_prompt_path is not None:
+    if audio_prompt_path is not None and not audio_reuse:  # Skip process on reuse (already valid WAV)
         fixed_from_process = get_or_queue_voice_process(
             audio_prompt_path, model, device, dtype, cache_uuid, exaggeration,
             quiet=(not enable_memory_cache and not enable_disk_cache)
@@ -248,10 +272,10 @@ def generate(model, text, language_id="en", audio_prompt_path=None, exaggeration
             create_dummy_conds(model, device, dtype, "process_fail")
             audio_prompt_path = None
     else:
-        create_dummy_conds(model, device, dtype, "no_audio")
-        logger.info("No audio prompt – using dummy conditionals")
+        # If reuse or no audio: Skip process (fuzzy reuse is already fixed WAV)
+        logger.debug("Skipping voice process: Reuse or no audio")
 
-    if audio_prompt_path:
+    if audio_prompt_path and not audio_reuse:
         # Single validate/fix (post-process only if invalid; process already fixed if new)
         valid = validate_voice_path(audio_prompt_path)[0]
         logger.debug(f"Path after process: {audio_prompt_path}, valid: {valid}")
@@ -260,7 +284,6 @@ def generate(model, text, language_id="en", audio_prompt_path=None, exaggeration
             audio_prompt_path = check_and_update_ref(audio_prompt_path, exaggeration)
         else:
             logger.debug(f"Valid path from process: {audio_prompt_path} - no resample")
-
 
         # Conds prep (unchanged)
         cache_params = {'language_id': language_id, 'cache_uuid': cache_uuid}
@@ -280,9 +303,10 @@ def generate(model, text, language_id="en", audio_prompt_path=None, exaggeration
                 logger.info(f"Prepared and cached conditionals: {cache_key[:8]}... (uuid={cache_uuid})")
 
     else:
-        # No audio prompt: Use dummy (graceful fallback; doesn't break API)
-        create_dummy_conds(model, device, dtype, "no_audio")
-        logger.info("No audio prompt – using dummy conditionals")
+        # No audio prompt or reuse: Use dummy (graceful fallback; doesn't break API)
+        if not audio_reuse:
+            create_dummy_conds(model, device, dtype, "no_audio")
+            logger.info("No audio prompt – using dummy conditionals")
 
     conditional_start_time = perf_counter_ns()
     logger.info(f"Conditionals prepared. Time: {(conditional_start_time - func_start_time) / 1_000_000:.4f}ms")
@@ -344,7 +368,7 @@ def generate(model, text, language_id="en", audio_prompt_path=None, exaggeration
         f"Generated audio: {wav_length:.2f}s {model.sr / 1000:.2f}kHz in {total_duration_s:.2f}s. Speed: {wav_length / total_duration_s:.2f}x")
 
     # NEW: Cache full audio output for future API reuses (dedup uuid in params)
-    if audio_prompt_path:
+    if audio_prompt_path and not audio_reuse:  # Only cache new gens (skip if reused)
         full_cache_key = get_cache_key(audio_prompt_path, cache_uuid, exaggeration, params={
             'text': text, 'cfgw': cfgw, 'temperature': temperature, 'min_p': min_p, 'top_p': top_p,
             'repetition_penalty': repetition_penalty, 'language_id': language_id  # Dedup uuid
@@ -354,6 +378,13 @@ def generate(model, text, language_id="en", audio_prompt_path=None, exaggeration
         set_audio_cache(full_cache_key, wave_file)
     else:
         wave_file = str(save_torchaudio_wav(wav.cpu(), model.sr, audio_path=None, uuid=cache_uuid))
+
+    # ========== NEW: Enqueue for Fuzzy Index (Post-Gen, Only on True MISS) ==========
+    if not audio_reuse and wave_file and audio_prompt_path:  # Index new audio only
+        voice_stem = Path(audio_prompt_path).stem
+        _fuzzy_queue.put((text, wave_file, voice_stem))  # Async background
+        logger.debug(f"Enqueued for fuzzy index: \"{text[:20]}\" (stem={voice_stem})")
+    # ========== End Enqueue ==========
 
     # NEW: Log cache stats post-generation (for monitoring; doesn't affect return)
     stats = get_cache_stats()
