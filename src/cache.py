@@ -1019,25 +1019,56 @@ def string_similarity(s1: str, s2: str, threshold=0.75) -> float:
     return ratio  # Caller: if ratio >= threshold
 
 
-def _save_fuzzy_audio_cache():
+last_fuzzy_save = 0
+FUZZY_SAVE_INTERVAL = 5.0  # 5s min; or 10 enqueues
+
+def _save_fuzzy_audio_cache(save_all: bool = False):
+    """Save _fuzzy_audio_dict to JSON (throttled: min 5s or save_all=True; evict old if >1000 total)."""
+    global last_fuzzy_save
+    now = time.time()
+    if not save_all and (now - last_fuzzy_save) < FUZZY_SAVE_INTERVAL:
+        logger.trace(f"Save skipped: <{FUZZY_SAVE_INTERVAL}s since last (now at {now - last_fuzzy_save:.1f}s)")
+        return
+    last_fuzzy_save = now
     with _fuzzy_lock:
+        if not _fuzzy_audio_dict:
+            return
+        temp_dict = {}
+        total_entries = 0
+        for stem, stem_entries in _fuzzy_audio_dict.items():
+            if isinstance(stem_entries, dict) and stem_entries:
+                temp_dict[stem] = {}
+                for norm_key, entry in stem_entries.items():
+                    if 'wav_path' in entry and Path(entry['wav_path']).exists():
+                        abs_path = Path(entry['wav_path'])
+                        rel_path = abs_path.relative_to(ROOT_DIR)
+                        save_entry = entry.copy()
+                        save_entry['wav_path'] = str(rel_path)
+                        temp_dict[stem][norm_key] = save_entry
+                        total_entries += 1
+                    else:
+                        logger.trace(f"Save fuzzy: Skipping invalid for {stem}:{norm_key}")
+                if not temp_dict[stem]:
+                    del temp_dict[stem]
+        # Global eviction if too big (e.g., >1000 total)
+        if total_entries > MAX_INDEX_SIZE * 2:  # Over 2000: Prune oldest per-stem
+            for stem in list(temp_dict):
+                while len(temp_dict[stem]) > MAX_INDEX_SIZE:
+                    oldest_key = min(temp_dict[stem], key=lambda k: temp_dict[stem][k].get('time_indexed', 0))
+                    del temp_dict[stem][oldest_key]
+                    logger.debug(f"Pruned old entry in {stem}: {oldest_key}")
+        if total_entries == 0:
+            return
         fuzzy_json = CACHE_AUDIO_DIR / "fuzzy_audio_cache.json"
         try:
-            json.dump(_fuzzy_audio_dict, open(fuzzy_json, 'w'), indent=2)  # Nested ok
-            logger.debug(f"Saved fuzzy cache: {sum(len(d) for d in _fuzzy_audio_dict.values())} entries")
+            with open(fuzzy_json, 'w') as f:
+                json.dump(temp_dict, f, indent=2)
+            if save_all:
+                logger.info(f"Full fuzzy save: {total_entries} entries across {len(temp_dict)} stems")
+            else:
+                logger.trace(f"Throttled fuzzy save: {total_entries} entries")  # TRACE: Less spam
         except Exception as e:
             logger.error(f"Save fuzzy cache failed: {e}")
-def _load_fuzzy_audio_cache():  # Call in init
-    global _fuzzy_audio_dict
-    fuzzy_json = CACHE_AUDIO_DIR / "fuzzy_audio_cache.json"
-    if fuzzy_json.exists():
-        try:
-            _fuzzy_audio_dict = json.load(open(fuzzy_json, 'r'))
-            logger.info(f"Loaded fuzzy cache: {sum(len(d) for d in _fuzzy_audio_dict.values()) if isinstance(_fuzzy_audio_dict, dict) else len(_fuzzy_audio_dict)} entries")
-        except Exception as e:
-            logger.warning(f"Load fuzzy failed: {e} – fresh dict")
-            _fuzzy_audio_dict = {}
-# In init_conditional_memory_cache: _load_fuzzy_audio_cache()
 
 # Patched _background_index_worker (add 'sim_boost' meta to entry; optional prune short texts)
 # Minor: Track boost words used (debug); evict if < min_length, but index anyway (fuzzy skips short queries, but stores for full texts)
@@ -1130,7 +1161,7 @@ def try_fuzzy_audio_cache(audio_path: str = None, text_input: str = None, exagge
             best_sim = adjusted_sim
             best_match = entry['orig_text']
             best_path = entry['wav_path']
-            if not quiet and adjusted_sim >= threshold:
+            if not quiet and adjusted_sim >= threshold * 0.9:  # Only log near-hits (e.g., 0.675+ for 0.75 thresh)
                 logger.debug(
                     f"  Candidate: '{clean_entry[:30]}...' raw={raw_ratio:.3f} +boost={sim_boost:.3f} = {adjusted_sim:.3f}")
 
@@ -1146,6 +1177,7 @@ def try_fuzzy_audio_cache(audio_path: str = None, text_input: str = None, exagge
             if best_match:
                 logger.debug(f"  Closest: '{best_match[:30]}...' (sim={best_sim:.3f})")
         return None
+
 
 
 # Patched string_similarity (use if refactoring; now with config boost – optional, for consistency)
@@ -1169,7 +1201,10 @@ def string_similarity(s1: str, s2: str, threshold=0.75) -> float:
 
 # Patched _background_index_worker (add 'sim_boost' meta to entry; optional prune short texts)
 # Minor: Track boost words used (debug); evict if < min_length, but index anyway (fuzzy skips short queries, but stores for full texts)
+_fuzzy_save_counter = 0  # Global throttle for incremental saves
+
 def _background_index_worker():
+    global _fuzzy_save_counter
     while True:
         try:
             text, wav_path, voice_stem = _fuzzy_queue.get(timeout=1)
@@ -1189,26 +1224,38 @@ def _background_index_worker():
                         sim_boost = boost_amount
                         break  # Meta: Potential boost for this entry
             with _fuzzy_lock:
-                if norm_key in _fuzzy_audio_dict.get(voice_stem, {}):  # Dedup per-stem
+                # Ensure per-stem sub-dict
+                if voice_stem not in _fuzzy_audio_dict:
+                    _fuzzy_audio_dict[voice_stem] = {}
+                stem_dict = _fuzzy_audio_dict[voice_stem]
+                if norm_key in stem_dict:  # Dedup per-stem/norm_key
                     logger.debug(f"Skipped dup fuzzy index: {norm_key[:30]} ({voice_stem})")
                 else:
-                    # Ensure per-stem sub-dict
-                    if voice_stem not in _fuzzy_audio_dict:
-                        _fuzzy_audio_dict[voice_stem] = {}
-                    stem_dict = _fuzzy_audio_dict[voice_stem]
-                    if len(stem_dict) >= MAX_INDEX_SIZE:  # Per-stem cap (or global len(_fuzzy_audio_dict))
+                    if len(stem_dict) >= MAX_INDEX_SIZE:  # Per-stem cap
                         stem_dict.pop(next(iter(stem_dict)))  # Evict oldest in stem
                         logger.debug(f"Fuzzy per-stem full ({voice_stem}) – evicted oldest")
+                    time_indexed = time.time()
                     stem_dict[norm_key] = {
                         'wav_path': wav_path,
                         'orig_text': orig_text,
                         'stem': voice_stem,
-                        'sim_boost': sim_boost  # Meta for future (e.g., query-time adjust)
+                        'sim_boost': sim_boost,  # Meta for future
+                        'time_indexed': time_indexed
                     }
+                    _fuzzy_save_counter += 1
                     logger.debug(f"Indexed fuzzy audio: {norm_key[:30]} -> {wav_path} (stem: {voice_stem}, boost={sim_boost})")
+                # Throttle saves: Every 10 adds, queue >20, or 30s idle
+                if (_fuzzy_save_counter >= 10 or _fuzzy_queue.qsize() > 20):
+                    _save_fuzzy_audio_cache(save_all=False)  # Incremental
+                    _fuzzy_save_counter = 0
             _save_fuzzy_audio_cache()  # Persist (add if not exists; thread-safe)
         except:
-            pass
+            # Idle timeout: Save if dirty (e.g., >30s no queue, but entries > prev)
+            if _fuzzy_queue.empty() and _fuzzy_audio_dict:  # Periodic full save
+                time_since_last = time.time() - last_fuzzy_save
+                if time_since_last > 30:  # >30s idle → full safe save
+                    _save_fuzzy_audio_cache(save_all=True)
+            pass  # Continue loop
 
 # Start daemon thread at init (fuzzy worker)
 threading.Thread(target=_background_index_worker, daemon=True, name="FuzzyIndexer").start()

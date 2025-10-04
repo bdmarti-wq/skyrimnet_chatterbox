@@ -129,7 +129,6 @@ def generate_audio(model, text: str, audio_prompt_path: Optional[str], exaggerat
     Main orchestration: Validate, cache checks, prep, gen, post-process.
     Assumes model/device/dtype from globals; cleaned sig (no dead params).
     """
-    # Invalid: Handle None gracefully (original no-audio dummy)
     if not text:
         logger.warning("No text – using dummy")
         create_dummy_conds(model, DEVICE, DTYPE, "no_text")
@@ -148,7 +147,7 @@ def generate_audio(model, text: str, audio_prompt_path: Optional[str], exaggerat
         'repetition_penalty': repetition_penalty, 'language_id': language_id
     }
 
-    func_start_time = perf_counter_ns()
+    func_start_time = perf_counter_ns()  # Overall timer
 
     # Logging (ONLY here—no dup in shell)
     stem = Path(audio_prompt_path).stem if audio_prompt_path else "No ref audio"
@@ -159,30 +158,37 @@ def generate_audio(model, text: str, audio_prompt_path: Optional[str], exaggerat
     if seed_num != 0:
         set_seed(int(seed_num))
 
+    reuse_start = perf_counter_ns()  # Time reuse check
     # Reuse check (updated helper)
     reuse_result = try_reuse_audio(text, audio_prompt_path, exaggeration, params) if audio_prompt_path else None
+    reuse_time_ms = (perf_counter_ns() - reuse_start) / 1_000_000
     if reuse_result:
         audio_reuse_path, hit_type = reuse_result
         # Load/log (local torchaudio)
         wav_reused, sr = torchaudio.load(audio_reuse_path)
         wav_length = wav_reused.shape[-1] / sr
-        logger.info(f"{hit_type} cache HIT: \"{text[:20]}\" ({hit_type.lower()}-match) for {Path(audio_prompt_path).stem} – skipping gen (uuid={cache_uuid})")
-        logger.info(f"Reused {hit_type.lower()} audio: {wav_length:.2f}s in ~0s (infinite speed!)")
+        logger.info(f"{hit_type} cache HIT: \"{text[:20]}\" ({hit_type.lower()}-match) for {Path(audio_prompt_path).stem} – skipping gen (uuid={cache_uuid}; reuse: {reuse_time_ms:.2f}ms)")
+        logger.info(f"Reused {hit_type.lower()} audio: {wav_length:.2f}s in ~0s")
         # Enqueue fuzzy (low-priority enrichment on HIT; use normalized stem)
         if audio_prompt_path:
             voice_stem = Path(audio_prompt_path).stem.replace('_fixed', '').split('_')[0]  # Normalize: 'dlc1seranavoice'
             logger.debug(f"Enqueued for fuzzy enrich (HIT): \"{text[:20]}\" (norm stem={voice_stem})")
             _fuzzy_queue.put((text, audio_reuse_path, voice_stem))
+        total_time_ms = (perf_counter_ns() - func_start_time) / 1_000_000
+        logger.info(f"Full cycle: HIT in {total_time_ms:.2f}ms (infinite speed!)")
         return audio_reuse_path
 
-    logger.debug("No audio reuse – proceeding to full gen")
+    logger.debug(f"Reuse MISS (took {reuse_time_ms:.2f}ms) – proceeding to full gen")
 
     # Prep voice/conds (helper; handles None → dummy)
+    prep_start = perf_counter_ns()
     valid_path = prepare_voice_and_conds(
         model, audio_prompt_path, cache_uuid, exaggeration, language_id, enable_memory_cache, enable_disk_cache, DEVICE, DTYPE
     )
+    prep_time_ms = (perf_counter_ns() - prep_start) / 1_000_000
+    logger.debug(f"Prep/conds: {prep_time_ms:.2f}ms")
 
-    # Conds prep time log
+    # Conds prep time log (legacy)
     conditional_start_time = perf_counter_ns()
     logger.info(f"Conditionals prepared. Time: {(conditional_start_time - func_start_time) / 1_000_000:.4f}ms")
 
@@ -205,22 +211,28 @@ def generate_audio(model, text: str, audio_prompt_path: Optional[str], exaggerat
     if MULTILINGUAL:
         generate_args["language_id"] = language_id
 
-    # Core gen
+    # Core gen (time it)
+    gen_start = perf_counter_ns()
     wav = _generate_audio_core(model, generate_args, t3_params)
+    gen_time_s = (perf_counter_ns() - gen_start) / 1_000_000_000
+    logger.debug(f"Core gen time: {gen_time_s:.2f}s")
 
     # Post-gen timings/log
     func_end_time = perf_counter_ns()
     total_duration_s = (func_end_time - func_start_time) / 1_000_000_000
     wav_length = wav.shape[-1] / model.sr
     logger.info(
-        f"Generated audio: {wav_length:.2f}s {model.sr / 1000:.2f}kHz in {total_duration_s:.2f}s. Speed: {wav_length / total_duration_s:.2f}x")
+        f"Generated audio: {wav_length:.2f}s {model.sr / 1000:.2f}kHz in {total_duration_s:.2f}s. Speed: {wav_length / total_duration_s:.2f}x (gen: {gen_time_s:.2f}s)")
 
     # Save/cache
+    save_start = perf_counter_ns()
     wave_file = save_and_cache_output(
         wav, model, valid_path or audio_prompt_path, cache_uuid, text, exaggeration, params, enable_memory_cache, enable_disk_cache
     )
+    save_time_ms = (perf_counter_ns() - save_start) / 1_000_000
+    logger.debug(f"Save/cache: {save_time_ms:.2f}ms")
 
-     # Enqueue fuzzy (only on true MISS; use normalized stem from valid_path)
+    # Enqueue fuzzy (only on true MISS; use normalized stem from valid_path)
     if not reuse_result and (valid_path or audio_prompt_path):
         voice_stem = Path(valid_path or audio_prompt_path).stem.replace('_fixed', '').split('_')[0]  # Normalize: 'dlc1seranavoice'
         logger.debug(f"Enqueued for fuzzy index (MISS): \"{text[:20]}\" (norm stem={voice_stem})")
@@ -229,9 +241,11 @@ def generate_audio(model, text: str, audio_prompt_path: Optional[str], exaggerat
     # Stats
     stats = get_cache_stats()
     logger.info(
-        f"Cache stats post-gen: {stats['memory_cache_size']} mem, {stats['disk_files']} disk, {stats['audio_cache_size']} audio")
+        f"Cache stats post-gen: {stats['memory_cache_size']} mem, {stats['disk_files']} disk, {stats['audio_cache_size']} audio, fuzzy: {stats.get('fuzzy_size', 'N/A')}")
 
     # Cleanup (post-save)
     del wav
     torch.cuda.empty_cache()
+    total_time_ms = (perf_counter_ns() - func_start_time) / 1_000_000
+    logger.info(f"Full MISS cycle: {total_time_ms / 1000:.2f}s (reuse: {reuse_time_ms:.0f}ms, prep: {prep_time_ms:.0f}ms, gen: {gen_time_s:.2f}s, save: {save_time_ms:.0f}ms)")
     return wave_file
