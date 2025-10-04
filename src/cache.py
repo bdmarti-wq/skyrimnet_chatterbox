@@ -61,6 +61,12 @@ DEFAULT_DEVICE = "cuda"  # Fallback
 DEFAULT_DTYPE = torch.float32
 MODEL_SR = 24000  # Assume standard for TTS
 
+# Global voice cache (stem → dict: fixed_path, file_hash, conds_key)
+_voice_cache = {}  # In-memory; persist below
+_voice_cache_lock = threading.RLock()
+_voice_info_cache = {}  # {stem: (sr, channels, duration_frames)} – simple, thread-safe with lock
+_voice_info_lock = threading.RLock()  # Optional: For concurrent access (shared with _voice_cache_lock)
+
 # Create dirs (rooted)
 for d in [WAV_OUTPUT_DIR, CACHE_BASE, CACHE_DIR, CACHE_AUDIO_DIR, voices_dir]:
     d.mkdir(parents=True, exist_ok=True)
@@ -463,6 +469,39 @@ def save_torchaudio_wav(wav_tensor, sr, audio_path, uuid):
     return path.resolve()
 
 
+def _get_or_cache_audio_info(stem: str = None, audio_path: str = None, force_refresh: bool = False) -> Optional[
+    Tuple[int, int, int]]:
+    """Cached wrapper: Get info for stem/path; stem optional (extracts from path if None).
+    Backward-compatible: Works if called as _get_or_cache_audio_info(audio_path)."""
+    if not audio_path:
+        return None
+
+    # Extract stem if missing (for backward calls)
+    if stem is None:
+        full_stem = Path(audio_path).stem.replace('_fixed', '')  # e.g., 'vayne_csvp_voice' → 'vayne_csvp_voice'
+        split_stem = full_stem.split('_')
+        stem = split_stem[0] if len(split_stem) > 1 and len(
+            split_stem[0]) >= 2 else full_stem  # Robust: min 2 chars, fallback full
+
+    # Check cache (invalidate if force or file invalid)
+    if not force_refresh and stem in _voice_info_cache:
+        cached_info = _voice_info_cache[stem]
+        if Path(audio_path).exists() and Path(audio_path).stat().st_size > 0:
+            logger.trace(f"Info: Reused cached for stem '{stem}' (SR={cached_info[0]})")
+            return cached_info
+        else:
+            logger.trace(f"Info: Invalidated cache for '{stem}' (file issue) – recompute")
+
+    # Compute fresh
+    info = _get_audio_info_robust(audio_path)
+    if info:
+        with _voice_info_lock:
+            _voice_info_cache[stem] = info
+        logger.debug(f"Info: Cached new for stem '{stem}': SR={info[0]}, channels={info[1]}, frames={info[2]}")
+    return info
+
+
+
 # Helper: Robust torchaudio info fetch (used everywhere; logs branch)
 def _get_audio_info_robust(audio_path: str) -> Optional[Tuple[int, int, int]]:
     """Fetch audio info with new/old API fallback; return (sr, channels, duration_frames) or None."""
@@ -479,7 +518,7 @@ def _get_audio_info_robust(audio_path: str) -> Optional[Tuple[int, int, int]]:
         try:
             # Fallback to deprecated/old API (2.0.x)
             info = torchaudio.info(audio_path)
-            logger.debug(f"Audio info: Fallback to torchaudio.info (suppressed deprecation: {ie})")
+            logger.trace(f"Audio info: Fallback to torchaudio.info (suppressed deprecation: {ie})")
         except Exception as e:
             logger.warning(f"Failed to get audio info for {audio_path}: {e}")
             return None
@@ -498,13 +537,14 @@ def _get_audio_info_robust(audio_path: str) -> Optional[Tuple[int, int, int]]:
 
 
 # Patched validate_voice_path (robust + logging)
-def validate_voice_path(audio_path: str) -> Tuple[bool, Optional[float]]:
-    """Validate voice path with robust torchaudio handling; return (valid, duration)."""
+def validate_voice_path(audio_path: str, stem: str = None) -> Tuple[bool, Optional[float]]:
+    """Validate voice path with cached info; stem optional (extracts if None)."""
     if not os.path.exists(audio_path):
         logger.warning(f"Validate: Path does not exist {audio_path}")
         return False, None
 
-    info_tuple = _get_audio_info_robust(audio_path)
+    # Use cached helper (backward: works with just audio_path)
+    info_tuple = _get_or_cache_audio_info(stem=stem, audio_path=audio_path)  # Named args for clarity
     if info_tuple is None:
         return False, None
 
@@ -523,7 +563,7 @@ def validate_voice_path(audio_path: str) -> Tuple[bool, Optional[float]]:
 
 
 def check_and_update_ref(audio_path: str, exaggeration: float = 0.5, model_sr: int = MODEL_SR,
-                         out_path: Optional[Path] = None, enable_pre_adjustment: bool = None) -> str:
+                         out_path: Optional[Path] = None, enable_pre_adjustment: bool = None, stem: str = None) -> str:
     """Validate/resample + optional pad align for short refs; return validated path.
     enable_pre_adjustment: From CONFIG or kwarg (default False; True for pad)."""
     enable_pre_adjustment = (
@@ -629,42 +669,63 @@ def try_audio_cache(audio_path: str, text: str, exaggeration: float = 0.5, param
 
 
 # Patched _compute_file_hash (robust info)
-def _compute_file_hash(file_path: str, method='hybrid') -> str:  # New 'hybrid'
+def _compute_file_hash(file_path: str, method='hybrid', stem: str = None) -> str:
+    """Compute hash; use cached info if stem provided and method='quick'."""
     if not Path(file_path).exists():
         return ""
     try:
         if method == 'quick':
+            # Use cached if stem known
+            if stem:
+                cached_info = _get_or_cache_audio_info(stem=stem, audio_path=file_path)
+                if cached_info:
+                    sr, channels, frames = cached_info
+                    size = Path(file_path).stat().st_size
+                    return f"{size}_{frames}_{sr}"
+            # Fallback to old compute
             info_tuple = _get_audio_info_robust(file_path)
             if info_tuple:
                 sr, channels, frames = info_tuple
                 size = Path(file_path).stat().st_size
                 return f"{size}_{frames}_{sr}"
-            return ""  # Fail → empty hash
-        elif method == 'hybrid':  # Quick first; full if needed (for debug)
+            return ""  # Fail → empty
+
+        elif method == 'hybrid':
+            # Quick first (cached if possible)
             quick_h = None
-            info_tuple = _get_audio_info_robust(file_path)
-            if info_tuple:
-                sr, channels, frames = info_tuple
-                size = Path(file_path).stat().st_size
-                quick_h = f"{size}_{frames}_{sr}"
-                logger.debug("Hash: Used quick metadata")
+            if stem:
+                cached_info = _get_or_cache_audio_info(stem=stem, audio_path=file_path)
+                if cached_info:
+                    sr, channels, frames = cached_info
+                    size = Path(file_path).stat().st_size
+                    quick_h = f"{size}_{frames}_{sr}"
+                    logger.debug(f"Hash: Used quick cached metadata for {stem}")
+            if not quick_h:
+                info_tuple = _get_audio_info_robust(file_path)
+                if info_tuple:
+                    sr, channels, frames = info_tuple
+                    size = Path(file_path).stat().st_size
+                    quick_h = f"{size}_{frames}_{sr}"
+                    logger.debug("Hash: Used quick metadata")
             if quick_h:
-                return quick_h  # Fast; fallback full only on metadata fail
-        # Full MD5 (default/always for 'full' or hybrid fallback)
+                return quick_h  # Fast path
+
+        # Full MD5 (default/fallback)
         h = hashlib.md5()
         with open(file_path, 'rb') as f:
             for chunk in iter(lambda: f.read(8192), b""):
                 h.update(chunk)
-        logger.debug("Hash: Used full MD5 fallback")
+        logger.debug("Hash: Used full MD5")
         return h.hexdigest()
     except Exception as e:
         logger.warning(f"Hash failed {file_path}: {e}")
         return ""
 
 
+
 # Patched get_or_queue_voice_process (skip validate on quick match; robust info; dedup)
 def get_or_queue_voice_process(audio_path: str, model, device, dtype, uuid, exaggeration=0.5, quiet=False) -> str:
-    stem = Path(audio_path).stem
+    stem = Path(audio_path).stem.replace('_fixed', '')  # Normalize early (e.g., 'vayne_csvp_voice')
     with _voice_cache_lock:
         cached = _voice_cache.get(stem, {})
         cached_path = cached.get('fixed_path', '')
@@ -676,22 +737,22 @@ def get_or_queue_voice_process(audio_path: str, model, device, dtype, uuid, exag
         if not quiet:
             logger.debug(f"Recent BG for {stem}—skipping queue")
         # Ensure fixed even on skip
-        return cached_path if (cached_path and Path(cached_path).exists()) else check_and_update_ref(audio_path, exaggeration)
+        return cached_path if (cached_path and Path(cached_path).exists()) else check_and_update_ref(audio_path, exaggeration, stem=stem)  # Pass stem
 
-    # Quick pre-check: If cached_path exists, quick metadata match (size + SR/channels via robust info) → skip full hash/validate
+    # Quick pre-check: Use cached info (pass stem)
     quick_match = False
     if cached_path and Path(audio_path).exists() and Path(cached_path).exists():
-        if Path(audio_path).stat().st_size == Path(cached_path).stat().st_size:  # Size first
-            upload_info = _get_audio_info_robust(audio_path)
-            cached_info = _get_audio_info_robust(cached_path)
-            if upload_info and cached_info and upload_info[:2] == cached_info[:2]:  # SR + channels match
+        if Path(audio_path).stat().st_size == Path(cached_path).stat().st_size:  # Size first (fast)
+            upload_info = _get_or_cache_audio_info(stem=stem, audio_path=audio_path)  # Cached/optimized
+            cached_info = _get_or_cache_audio_info(stem=stem, audio_path=cached_path)  # Same stem
+            if upload_info and cached_info and upload_info[:2] == cached_info[:2]:  # SR + channels
                 quick_match = True
                 logger.debug(f"Quick metadata match for {stem}—reusing without full validate/hash")
                 upload_hash = cached_hash  # Assume same
             else:
                 logger.debug(f"Quick metadata mismatch for {stem}—full hash")
 
-    upload_hash = _compute_file_hash(audio_path, method='hybrid' if not quick_match else 'quick')
+    upload_hash = _compute_file_hash(audio_path, method='hybrid' if not quick_match else 'quick', stem=stem)  # Pass stem
     is_different = (not quick_match) and (upload_hash != cached_hash or not cached_path)
 
     if not is_different and Path(cached_path).exists():
@@ -708,7 +769,7 @@ def get_or_queue_voice_process(audio_path: str, model, device, dtype, uuid, exag
     if quick_match:
         fallback_path = candidate_path  # No need to refix
     else:
-        fallback_path = check_and_update_ref(candidate_path, exaggeration)
+        fallback_path = check_and_update_ref(candidate_path, exaggeration, stem=stem)  # Pass stem
     if not fallback_path or not Path(fallback_path).exists():
         logger.warning(f"Fix failed for {stem}—using original (may fail SR)")
         fallback_path = candidate_path
@@ -716,6 +777,7 @@ def get_or_queue_voice_process(audio_path: str, model, device, dtype, uuid, exag
     if cached_conds_key and not is_different:
         _cache_manager.load(cached_conds_key, model, device, dtype, quiet=quiet)
 
+    # BG process (unchanged; but pass stem if extending check_and_update_ref)
     def _bg_process_new():
         if not is_different or Path(fallback_path).exists():  # Skip if already fixed/same
             return
@@ -913,6 +975,9 @@ def clear_cache_files():
         _cache_manager._memory_cache.clear()
         _cache_manager._current_loaded_cache_key = None
         _cache_manager._disk_save_queue.clear()
+    with _voice_info_lock:
+        _voice_info_cache.clear()
+        logger.debug("Cleared voice info cache")
     _audio_manager.clear()
     logger.info(f"Cleared {removed_count} .pt + memory/audio")
     return removed_count
@@ -935,9 +1000,7 @@ def clear_cache(voice: Optional[str] = None, full: bool = False):
         return clear_cache_files()
 
 
-# Global voice cache (stem → dict: fixed_path, file_hash, conds_key)
-_voice_cache = {}  # In-memory; persist below
-_voice_cache_lock = threading.RLock()
+
 
 def _load_voice_cache():
     """Load _voice_cache from JSON on init."""
@@ -1091,8 +1154,14 @@ def try_fuzzy_audio_cache(audio_path: str = None, text_input: str = None, exagge
 
     # Extract/fix stem (required; fallback if swapped)
     if stem is None:
-        if audio_path:
-            stem = Path(audio_path).stem.split('_')[0]  # e.g., 'dlc1seranavoice' from ..._fixed.wav
+        if stem is None:
+            if audio_path:
+                full_stem = Path(audio_path).stem.replace('_fixed', '')  # e.g., 'ba_beatricevoice'
+                split_stem = full_stem.split('_')
+                stem = split_stem[0] if len(split_stem) > 1 else full_stem  # Fallback to full if short
+                if len(stem) < 3:  # Still short → warn but use full
+                    stem = full_stem
+                    logger.warning(f"Fuzzy stem fallback to full '{stem}' from '{audio_path}' (short prefix)")
         else:
             logger.warning(
                 "Fuzzy: No audio_path or stem – cannot filter per-voice; using global fallback (inefficient)")
