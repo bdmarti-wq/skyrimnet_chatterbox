@@ -1,0 +1,21 @@
+{
+  "dlc1seranavoice": {
+    "notch_gain_db": -12,
+    "noise_floor_db": -60,
+    "trim_threshold_db": -28,
+    "eq_gain_db": -3,
+    "eq_cutoff_hz": 4000,
+    "gain_target_max": 0.707,
+    "fade_ms": 20,
+    "speaking_rate": 1.05,
+    "normalize_method": "peak"
+  },
+  "femaleuniquelydia": {
+    "notch_gain_db": -8,
+    "noise_floor_db": -50,
+    "trim_threshold_db": -25,
+    "eq_gain_db": -2,
+    "gain_target_max": 0.6,
+    "fade_ms": 15
+  }
+}
