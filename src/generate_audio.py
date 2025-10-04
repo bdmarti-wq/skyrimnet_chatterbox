@@ -42,16 +42,17 @@ def _generate_audio_core(model, generate_args: Dict[str, Any], t3_params: Dict[s
     return wav  # No del—caller handles post-use
 
 def try_reuse_audio(text: str, audio_prompt_path: Optional[str], exaggeration: float, params: Dict[str, Any]) -> Optional[Tuple[str, str]]:
-    """Try exact then fuzzy; return (path, hit_type) or None. Handles None path."""
+    """Try exact then fuzzy; return (path, hit_type) or None. Handles None path.
+    Fixed: Pass audio_prompt_path as audio_path for stem extraction; text as text_input; explicit stem kwarg."""
     if not audio_prompt_path:
         return None
     # Exact
     exact_path = try_audio_cache(audio_prompt_path, text, exaggeration, params=params)
     if exact_path:
         return exact_path, "Full audio"
-    # Fuzzy
-    voice_stem = Path(audio_prompt_path).stem
-    fuzzy_path = try_fuzzy_audio_cache(text, voice_stem)
+    # Fuzzy: Extract stem explicitly (normalize, remove '_fixed' etc.)
+    voice_stem = Path(audio_prompt_path).stem.replace('_fixed', '').split('_')[0]  # e.g., 'dlc1seranavoice' (robust)
+    fuzzy_path = try_fuzzy_audio_cache(audio_prompt_path, text, stem=voice_stem)  # Correct: audio_path=voice path (for fallback extract), text_input=text, stem=voice_stem
     if fuzzy_path:
         return fuzzy_path, "Fuzzy audio"
     return None
@@ -167,9 +168,9 @@ def generate_audio(model, text: str, audio_prompt_path: Optional[str], exaggerat
         wav_length = wav_reused.shape[-1] / sr
         logger.info(f"{hit_type} cache HIT: \"{text[:20]}\" ({hit_type.lower()}-match) for {Path(audio_prompt_path).stem} – skipping gen (uuid={cache_uuid})")
         logger.info(f"Reused {hit_type.lower()} audio: {wav_length:.2f}s in ~0s (infinite speed!)")
-        # Enqueue fuzzy (low-priority enrichment on HIT)
+        # Enqueue fuzzy (low-priority enrichment on HIT; use normalized stem)
         if audio_prompt_path:
-            voice_stem = Path(audio_prompt_path).stem.replace('_fixed', '')  # Patch: Normalize base stem (no '_fixed')
+            voice_stem = Path(audio_prompt_path).stem.replace('_fixed', '').split('_')[0]  # Normalize: 'dlc1seranavoice'
             logger.debug(f"Enqueued for fuzzy enrich (HIT): \"{text[:20]}\" (norm stem={voice_stem})")
             _fuzzy_queue.put((text, audio_reuse_path, voice_stem))
         return audio_reuse_path
@@ -219,9 +220,9 @@ def generate_audio(model, text: str, audio_prompt_path: Optional[str], exaggerat
         wav, model, valid_path or audio_prompt_path, cache_uuid, text, exaggeration, params, enable_memory_cache, enable_disk_cache
     )
 
-    # Enqueue fuzzy (only on true MISS)
+     # Enqueue fuzzy (only on true MISS; use normalized stem from valid_path)
     if not reuse_result and (valid_path or audio_prompt_path):
-        voice_stem = Path(valid_path or audio_prompt_path).stem.replace('_fixed', '')  # Patch: Normalize base stem (no '_fixed')
+        voice_stem = Path(valid_path or audio_prompt_path).stem.replace('_fixed', '').split('_')[0]  # Normalize: 'dlc1seranavoice'
         logger.debug(f"Enqueued for fuzzy index (MISS): \"{text[:20]}\" (norm stem={voice_stem})")
         _fuzzy_queue.put((text, wave_file, voice_stem))
 

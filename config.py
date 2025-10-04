@@ -119,7 +119,8 @@ class SkyrimNetConfig:
 
         # Cache Caps (new from alt)
         'COND_CACHE_MAX_ENTRIES_MIN': 10, 'COND_CACHE_MAX_ENTRIES_MAX': 100,
-        'FUZZY_CACHE_LIMIT_MIN': 100, 'FUZZY_CACHE_LIMIT_MAX': 5000
+        'FUZZY_CACHE_LIMIT_MIN': 100, 'FUZZY_CACHE_LIMIT_MAX': 5000,
+        'FUZZY_THRESHOLD_MIN': 0.50, 'FUZZY_THRESHOLD_MAX': 0.95,
     }
 
     _instance = None
@@ -278,104 +279,106 @@ class SkyrimNetConfig:
 
 
         except Exception as e:
-
             logger.error(f"Config load failed: {e}, using hardcoded defaults")
-
             self._merge_defaults(default_config, config_mode, global_flags)
-
             _CONFIG_CACHE = (default_config, config_mode, global_flags)
-
             return _CONFIG_CACHE
 
     def _merge_defaults(self, input_defaults: Dict, modes: Dict, flags: Dict):
-
         """Internal: Merge input to class storage (non-breaking)."""
-
         # Merge defaults (input → _defaults; class DEFAULTS base)
-
         self._defaults.update({k: v for k, v in input_defaults.items() if k in self.DEFAULTS})
-
         for k in self.DEFAULTS:
-
             if k not in self._defaults:
                 self._defaults[k] = self.DEFAULTS[k]
-
         # Merge flags (input → _flags)
-
         self._flags.update({k: v for k, v in flags.items() if isinstance(v, bool)})
-
         for k, v in self.DEFAULTS.items():
-
             if isinstance(v, bool) and k not in self._flags:
                 self._flags[k] = v
-
         # Set self attrs from merged (easy access; e.g., self.temperature)
-
         for attr, val in self._defaults.items():
-
             if not hasattr(self, attr) or attr in ['device', 'dtype', 'model']:  # Avoid overwrite core
-
                 setattr(self, attr, val)
-
         for attr, val in self._flags.items():
             setattr(self, attr, val)
-
         # Core (clamped)
-
         self.device = torch.device(DEVICE if self.device == "cuda" else "cpu")
-
         dtype_str = self._defaults.get('dtype', 'bfloat16')
-
         self.dtype = torch.bfloat16 if dtype_str == 'bfloat16' else torch.float32
-
         DTYPE = self.dtype
 
     def get_value(self, param_name: str, api_value: Any = None, default: Any = None,
                   bypass_config: bool = False) -> Any:
-        """Get value with clamping (numerics only; from alt). Backward compat with old get_config_value."""
+        """Get value with clamping (numerics only; from alt). Backward compat with old get_config_value.
+        Handles list parsing for fuzzy_boost_words (str → list from comma-sep)."""
         if bypass_config or _USE_API_MODE:
             # API mode: Use api_value or fallback to DEFAULTS (preserve old fallback_defaults)
             fallback_defaults = {
                 'temperature': 0.9, 'min_p': 0.05, 'top_p': 1.0, 'repetition_penalty': 2.0,
-                'cfg_weight': 0.0, 'exaggeration': 0.55, 'hop_length': 256, 'n_fft': 1024  # New
+                'cfg_weight': 0.0, 'exaggeration': 0.55, 'hop_length': 256, 'n_fft': 1024,  # New
+                'fuzzy_threshold': 0.75, 'fuzzy_min_length': 3, 'fuzzy_boost_amount': 0.1,
+                'fuzzy_boost_words': ['ahh', 'mmm', 'ooh', 'gasp']  # Add default list
             }
-            return api_value if api_value is not None else fallback_defaults.get(param_name, default or 0.0)
+            val = api_value if api_value is not None else fallback_defaults.get(param_name, default or 0.0)
+            # Parse lists in API mode too (if str provided)
+            if param_name == 'fuzzy_boost_words' and isinstance(val, str):
+                val = [w.strip().lower() for w in val.split(',') if w.strip()]
+            return val
 
         # Prioritize self attrs (dynamic)
         if hasattr(self, param_name):
-            value = getattr(self, param_name)
-            if value is not None:
-                logger.debug(f"Dynamic {param_name} from self = {value}")
-                if isinstance(value, (int, float)):
-                    return self.clamp_value(param_name, value)
-                return value  # Non-numeric: No clamp
+            val = getattr(self, param_name)
+            if val is not None:
+                logger.debug(f"Dynamic {param_name} from self = {val}")
+                if isinstance(val, (int, float)):
+                    return self.clamp_value(param_name, val)
+                # Early parse for lists (if str attr)
+                if param_name == 'fuzzy_boost_words' and isinstance(val, str):
+                    val = [w.strip().lower() for w in val.split(',') if w.strip()]
+                    setattr(self, param_name, val)  # Cache parsed
+                return val  # Non-numeric: No clamp
 
         # Flags (bools first)
         if param_name in self._flags:
-            value = self._flags[param_name]
-            logger.debug(f"Flag {param_name} = {value}")
-            return bool(value)
+            val = self._flags[param_name]
+            logger.debug(f"Flag {param_name} = {val}")
+            return bool(val)
 
         # Strings (e.g., logging_level)
         if hasattr(self, '_strings') and param_name in self._strings:
-            value = self._strings[param_name]
-            logger.debug(f"String {param_name} = {value}")
-            return value
+            val = self._strings[param_name]
+            logger.debug(f"String {param_name} = {val}")
+            return val
 
         # Defaults (direct from _defaults; no modes here for simplicity)
-        value = self._defaults.get(param_name, self.DEFAULTS.get(param_name, default or 0.0))
+        val = self._defaults.get(param_name, self.DEFAULTS.get(param_name, default or 0.0))
+
+        # API override (if not bypass)
+        if api_value is not None:
+            val = api_value
+            logger.debug(f"API override for {param_name} = {val}")
 
         # Parse bools from str (if mis-typed)
         bool_keys = [k for k, v in self.DEFAULTS.items() if isinstance(v, bool)]
-        if param_name in bool_keys and isinstance(value, str):
-            value = value.lower() in ['true', 'yes', '1', 'on']
-            logger.debug(f"Parsed bool {param_name} = {value}")
-            return value
+        if param_name in bool_keys and isinstance(val, str):
+            val = val.lower() in ['true', 'yes', '1', 'on']
+            logger.debug(f"Parsed bool {param_name} = {val}")
+            return bool(val)
+
+        # Parse lists (e.g., fuzzy_boost_words: str → list)
+        if param_name == 'fuzzy_boost_words' and isinstance(val, str):
+            val = [w.strip().lower() for w in val.split(',') if w.strip()]
+            logger.debug(f"Parsed {param_name}: {val}")
+        # Defaults to list if requested (cached on self if needed)
+        elif param_name == 'fuzzy_boost_words' and val is None:
+            val = self.DEFAULTS.get(param_name, ['ahh', 'mmm', 'ooh', 'throbb', 'moan', 'gasp'])
+            logger.debug(f"Default {param_name}: {val}")
 
         # Clamp numerics (only if numeric)
-        if isinstance(value, (int, float)):
-            return self.clamp_value(param_name, value)
-        return value
+        if isinstance(val, (int, float)):
+            return self.clamp_value(param_name, val)
+        return val
 
 
     def clamp_value(self, param_name: str, value: Any) -> Any:
@@ -544,7 +547,6 @@ def load_skyrimnet_config():
 
 def get_config_value(param_name: str, api_value, defaults=None, modes=None, bypass_config=False):
     """Old API: Get value (now via class get_value; preserves args)."""
-
     if defaults is None:
         defaults = {}
     if modes is None:

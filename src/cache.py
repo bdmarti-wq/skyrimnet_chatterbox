@@ -29,10 +29,12 @@ from loguru import logger  # Assume available; fallback to print if not
 import threading  # Ensure imported (likely already is)
 from config import CONFIG
 
+
 # Suppress torchaudio deprecations precisely (exact message/module for backend utils)
 warnings.filterwarnings('ignore', message=r'.*torchaudio._backend.utils.info.*', category=UserWarning)
 warnings.filterwarnings('ignore', message=r'.*deprecated.*torchaudio.*', category=UserWarning, module='torchaudio')
 warnings.filterwarnings('ignore', category=UserWarning, module='torchaudio')  # Broad fallback
+warnings.filterwarnings('ignore', category=DeprecationWarning, module='torchaudio')
 
 # Anchor paths to project root (skyrimnet_chatterbox/) for relocatable code
 ROOT_DIR = Path(__file__).parent.parent  # From src/ -> skyrimnet_chatterbox/
@@ -1017,83 +1019,196 @@ def string_similarity(s1: str, s2: str, threshold=0.75) -> float:
     return ratio  # Caller: if ratio >= threshold
 
 
-# Background indexing worker (unchanged; FIFO evict)
+def _save_fuzzy_audio_cache():
+    with _fuzzy_lock:
+        fuzzy_json = CACHE_AUDIO_DIR / "fuzzy_audio_cache.json"
+        try:
+            json.dump(_fuzzy_audio_dict, open(fuzzy_json, 'w'), indent=2)  # Nested ok
+            logger.debug(f"Saved fuzzy cache: {sum(len(d) for d in _fuzzy_audio_dict.values())} entries")
+        except Exception as e:
+            logger.error(f"Save fuzzy cache failed: {e}")
+def _load_fuzzy_audio_cache():  # Call in init
+    global _fuzzy_audio_dict
+    fuzzy_json = CACHE_AUDIO_DIR / "fuzzy_audio_cache.json"
+    if fuzzy_json.exists():
+        try:
+            _fuzzy_audio_dict = json.load(open(fuzzy_json, 'r'))
+            logger.info(f"Loaded fuzzy cache: {sum(len(d) for d in _fuzzy_audio_dict.values()) if isinstance(_fuzzy_audio_dict, dict) else len(_fuzzy_audio_dict)} entries")
+        except Exception as e:
+            logger.warning(f"Load fuzzy failed: {e} – fresh dict")
+            _fuzzy_audio_dict = {}
+# In init_conditional_memory_cache: _load_fuzzy_audio_cache()
+
+# Patched _background_index_worker (add 'sim_boost' meta to entry; optional prune short texts)
+# Minor: Track boost words used (debug); evict if < min_length, but index anyway (fuzzy skips short queries, but stores for full texts)
+# Patched try_fuzzy_audio_cache (configurable boost words/amount via CONFIG; short text guard tunable)
+# Assumes config.py additions: DEFAULTS['fuzzy_boost_words'] = ['ahh', 'mmm', 'ooh', 'throbb', 'moan', 'gasp']
+# DEFAULTS['fuzzy_boost_amount'] = 0.1
+# DEFAULTS['fuzzy_min_length'] = 3  # For short guard
+# get_value: If isinstance(default, list) for words, return list (add if needed: return default if isinstance(default, list) else ...)
+
+def try_fuzzy_audio_cache(audio_path: str = None, text_input: str = None, exaggeration: float = 0.5,
+                          stem: str = None, threshold: float = None, quiet: bool = False) -> Optional[str]:
+    """Fuzzy audio cache: SequenceMatcher on per-stem DB; returns path or None.
+    REQUIRES stem (kwarg or from audio_path); detects/ warns on swap (text short like stem).
+    Boosts sim for configurable short/moans words; min length tunable."""
+    if not text_input or (
+            text_input and len(text_input.strip()) < 3):  # Min guard (hardcode 3 if config fails; tunable below)
+        if not quiet:
+            logger.debug(f"Fuzzy skip: No/invalid text_input ({text_input[:20] if text_input else 'None'})")
+        return None
+
+    # Extract/fix stem (required; fallback if swapped)
+    if stem is None:
+        if audio_path:
+            stem = Path(audio_path).stem.split('_')[0]  # e.g., 'dlc1seranavoice' from ..._fixed.wav
+        else:
+            logger.warning(
+                "Fuzzy: No audio_path or stem – cannot filter per-voice; using global fallback (inefficient)")
+            stem = 'global'  # Fallback: All entries (less precise)
+    if not stem or len(stem) < 3:  # Invalid stem (e.g., swapped long text)
+        logger.warning(f"Fuzzy: Invalid stem '{stem[:20]}...' – check caller args (possible swap: text as audio_path?)")
+        return None
+
+    threshold = threshold or CONFIG.get_value('fuzzy_threshold', default=0.75)
+
+    # Detect swap: If text_input short/looks like stem (e.g., 'dlc1seranavoice'), warn + auto-swap
+    min_length = CONFIG.get_value('fuzzy_min_length', default=3)
+    if len(text_input.strip()) < 10 and re.match(r'^[a-z0-9_]+(voice|maid|npc)?$',
+                                                 text_input.lower()):  # Heuristic: Looks like stem
+        logger.warning(
+            f"Fuzzy detect: Possible arg swap (text_input='{text_input}' too stem-like) – auto-fixing (use correct: audio_path, text_input=text, stem=voice)")
+        text_input, audio_path = audio_path, text_input  # Swap back
+        stem = Path(audio_path).stem.split('_')[0] if audio_path else stem  # Re-extract
+        if len(text_input.strip()) < min_length:
+            if not quiet:
+                logger.debug(f"Fuzzy skip after swap: Text too short (<{min_length} chars)")
+            return None
+
+    if not quiet:
+        per_stem_size = len(_fuzzy_audio_dict.get(stem, {}))
+        global_size = sum(len(entries) for entries in _fuzzy_audio_dict.values()) if _fuzzy_audio_dict else 0
+        logger.debug(
+            f"Trying fuzzy for stem '{stem}', text: '{text_input[:30]}...' | Global DB: {global_size} (this stem: {per_stem_size}) (threshold: {threshold:.2f})")
+
+    # Early exit if no entries for stem
+    if stem not in _fuzzy_audio_dict or not _fuzzy_audio_dict[stem]:
+        if not quiet:
+            logger.debug(
+                f"Fuzzy MISS for '{text_input[:30]}...' (stem '{stem}'): No candidates in DB (global: {global_size})")
+        return None
+
+    candidates = list(_fuzzy_audio_dict[stem].values())  # List for iteration
+    best_match, best_path, best_sim = None, None, 0.0
+
+    clean_text = re.sub(r'[^\w\s]', '', text_input.lower()).strip()  # Normalize text for sim
+    if len(clean_text.split()) < min_length // 2:  # Word-based too (e.g., "aah..." → short)
+        if not quiet:
+            logger.debug(f"Fuzzy MISS early: Normalized text too short ('{clean_text}')")
+        return None
+
+    boost_words = CONFIG.get_value('fuzzy_boost_words',
+                                   default=['ahh', 'mmm', 'ooh', 'throbb', 'moan', 'gasp', 'oh', 'fuck', 'yes',
+                                            'aah'])  # Extended for your RP logs
+    boost_amount = CONFIG.get_value('fuzzy_boost_amount', default=0.1)
+
+    for entry in candidates:
+        clean_entry = re.sub(r'[^\w\s]', '', entry['orig_text'].lower()).strip()
+        raw_ratio = SequenceMatcher(None, clean_text, clean_entry).ratio()
+
+        # Boost: Query + entry sides (additive; cap)
+        sim_boost = entry.get('sim_boost', 0.0)  # Stored meta
+        if boost_amount > 0 and boost_words:
+            has_boost_query = any(word in clean_text for word in boost_words)
+            has_boost_entry = any(word in clean_entry for word in boost_words)
+            if has_boost_query or has_boost_entry:
+                sim_boost += boost_amount * (1 if has_boost_query else 0.5) * (
+                    1 if has_boost_entry else 0.5)  # Weighted: Full if both, half if one
+        adjusted_sim = min(1.0, raw_ratio + sim_boost)
+
+        if adjusted_sim > best_sim:
+            best_sim = adjusted_sim
+            best_match = entry['orig_text']
+            best_path = entry['wav_path']
+            if not quiet and adjusted_sim >= threshold:
+                logger.debug(
+                    f"  Candidate: '{clean_entry[:30]}...' raw={raw_ratio:.3f} +boost={sim_boost:.3f} = {adjusted_sim:.3f}")
+
+    if best_sim >= threshold:
+        if not quiet:
+            logger.info(
+                f"Fuzzy cache HIT: '{text_input[:30]}...' ≈ '{best_match[:30]}...' (sim={best_sim:.3f} >= {threshold:.2f}, boost={boost_amount}) for stem '{stem}' -> {best_path}")
+        return best_path
+    else:
+        if not quiet:
+            logger.debug(
+                f"Fuzzy MISS for '{text_input[:30]}...' (stem '{stem}'): best sim={best_sim:.3f} < {threshold:.2f} ({len(candidates)} candidates)")
+            if best_match:
+                logger.debug(f"  Closest: '{best_match[:30]}...' (sim={best_sim:.3f})")
+        return None
+
+
+# Patched string_similarity (use if refactoring; now with config boost – optional, for consistency)
+def string_similarity(s1: str, s2: str, threshold=0.75) -> float:
+    """Compute similarity ratio (return float for logging; caller checks >= threshold). Boost for RP/short/moans."""
+    s1_clean = re.sub(r'[^\w\s]', '', s1.lower())
+    s2_clean = re.sub(r'[^\w\s]', '', s2.lower())
+    ratio = SequenceMatcher(None, s1_clean, s2_clean).ratio()
+    # Boost for configurable words (same as try_fuzzy)
+    boost_words = CONFIG.get_value('fuzzy_boost_words', default=['ahh', 'mmm', 'ooh', 'throbb', 'moan', 'gasp'])
+    boost_amount = CONFIG.get_value('fuzzy_boost_amount', default=0.1)
+    sim_boost = 0.0
+    if boost_amount > 0 and boost_words:
+        for word in boost_words:
+            if word in s1_clean or word in s2_clean:
+                sim_boost = boost_amount
+                break
+    adjusted_ratio = min(1.0, ratio + sim_boost)
+    return adjusted_ratio
+
+
+# Patched _background_index_worker (add 'sim_boost' meta to entry; optional prune short texts)
+# Minor: Track boost words used (debug); evict if < min_length, but index anyway (fuzzy skips short queries, but stores for full texts)
 def _background_index_worker():
     while True:
         try:
             text, wav_path, voice_stem = _fuzzy_queue.get(timeout=1)
             orig_text = text
+            min_length = CONFIG.get_value('fuzzy_min_length', default=3)
+            if len(orig_text.strip()) < min_length:  # Optional: Skip indexing very short (e.g., "a" noise)
+                logger.debug(f"Skipped indexing short text (<{min_length}): {orig_text[:10]}...")
+                continue
             norm_key = normalize_text(text)
+            boost_words = CONFIG.get_value('fuzzy_boost_words', default=['ahh', 'mmm', 'ooh', 'throbb', 'moan', 'gasp'])
+            boost_amount = CONFIG.get_value('fuzzy_boost_amount', default=0.1)
+            clean_text = re.sub(r'[^\w\s]', '', orig_text.lower())
+            sim_boost = 0.0
+            if boost_amount > 0 and boost_words:
+                for word in boost_words:
+                    if word in clean_text:
+                        sim_boost = boost_amount
+                        break  # Meta: Potential boost for this entry
             with _fuzzy_lock:
-                if norm_key in _fuzzy_audio_dict:  # Dedup
-                    logger.debug(f"Skipped dup fuzzy index: {norm_key[:30]}")
+                if norm_key in _fuzzy_audio_dict.get(voice_stem, {}):  # Dedup per-stem
+                    logger.debug(f"Skipped dup fuzzy index: {norm_key[:30]} ({voice_stem})")
                 else:
-                    if len(_fuzzy_audio_dict) >= MAX_INDEX_SIZE:
-                        _fuzzy_audio_dict.pop(next(iter(_fuzzy_audio_dict)))
-                        logger.debug(f"Fuzzy cache full ({MAX_INDEX_SIZE}) – evicted oldest")
-                    # Add stem for exact filter
-                    _fuzzy_audio_dict[norm_key] = {
+                    # Ensure per-stem sub-dict
+                    if voice_stem not in _fuzzy_audio_dict:
+                        _fuzzy_audio_dict[voice_stem] = {}
+                    stem_dict = _fuzzy_audio_dict[voice_stem]
+                    if len(stem_dict) >= MAX_INDEX_SIZE:  # Per-stem cap (or global len(_fuzzy_audio_dict))
+                        stem_dict.pop(next(iter(stem_dict)))  # Evict oldest in stem
+                        logger.debug(f"Fuzzy per-stem full ({voice_stem}) – evicted oldest")
+                    stem_dict[norm_key] = {
                         'wav_path': wav_path,
                         'orig_text': orig_text,
-                        'stem': voice_stem  # New: Exact stem match
+                        'stem': voice_stem,
+                        'sim_boost': sim_boost  # Meta for future (e.g., query-time adjust)
                     }
-                    logger.debug(f"Indexed fuzzy audio: {norm_key} -> {wav_path} (stem: {voice_stem})")
+                    logger.debug(f"Indexed fuzzy audio: {norm_key[:30]} -> {wav_path} (stem: {voice_stem}, boost={sim_boost})")
+            _save_fuzzy_audio_cache()  # Persist (add if not exists; thread-safe)
         except:
             pass
-
-
-# Patched try_fuzzy_audio_cache (detailed logs for testing; uses float from string_similarity)
-def try_fuzzy_audio_cache(input_text: str, voice_stem: str, threshold: float = 0.75) -> Optional[str]:
-    """
-    Fuzzy matching for audio cache: Checks string similarity in _fuzzy_audio_dict for voice-specific entries.
-    Logs attempts, matches/MISSES with ratios, and DB stats for debugging.
-    Assumes _fuzzy_audio_dict is dynamic (filled via enqueue from generations; capped elsewhere).
-    """
-    if not input_text or not voice_stem:
-        logger.debug("Fuzzy query skipped: Empty text or stem")
-        return None
-
-    if not _fuzzy_audio_dict:
-        logger.debug(f"Fuzzy DB empty – no matches possible ({len(_fuzzy_audio_dict)} entries)")
-        return None
-
-    # Normalize for lookup/sim (clean query)
-    norm_query_key = normalize_text(input_text)
-    norm_query_text = input_text.lower().strip()  # Semi-clean for sim (preserve words)
-
-    logger.debug(
-        f"Trying fuzzy for stem '{voice_stem}', text: '{norm_query_text[:50]}...' "
-        f"DB size: {len(_fuzzy_audio_dict)} (threshold: {threshold})"
-    )
-
-    candidate_count = 0
-    max_sim = 0.0
-    best_entry = None
-    with _fuzzy_lock:
-        for stored_key, data in _fuzzy_audio_dict.items():
-            # Exact stem match (faster, no substring)
-            if data.get('stem') == voice_stem:  # From data, not key
-                candidate_count += 1
-                sim_ratio = string_similarity(norm_query_text, data['orig_text'])
-                if sim_ratio > max_sim:
-                    max_sim = sim_ratio
-                    best_entry = data
-                if sim_ratio >= threshold:
-                    logger.info(
-                        f"Fuzzy cache HIT: '{norm_query_text[:20]}...' ≈ '{data['orig_text'][:20]}...' (sim={sim_ratio:.3f} >= {threshold}) for stem '{voice_stem}' -> {data['wav_path']}")
-                    return data['wav_path']
-
-    # Log MISS with stats (best sim, candidates) for tuning
-    logger.debug(
-        f"Fuzzy MISS for '{norm_query_text[:20]}...' (stem '{voice_stem}'): "
-        f"best sim={max_sim:.3f} < {threshold} ({candidate_count} candidates in DB)"
-    )
-    if best_entry:
-        logger.debug(
-            f"  Closest: '{best_entry['orig_text'][:20]}...' (sim={max_sim:.3f})"
-        )
-
-    return None
 
 # Start daemon thread at init (fuzzy worker)
 threading.Thread(target=_background_index_worker, daemon=True, name="FuzzyIndexer").start()
