@@ -1,5 +1,6 @@
-# skyrimnet_config.py - Fixed NameError in _initialize (use SkyrimNetConfig.DEFAULTS directly; cls not in scope)
-# Minor: Added logging in _initialize for debug; ensured global sync after load.
+# skyrimnet_config.py - Refactored for modularity: load_config broken into sharable helpers (_load_txt_config, _load_voices_json, _merge_defaults).
+# Removed voice_overrides from txt parsing (separate voices.json). Enhanced for post-processing (DEFAULTS/CAPS/audio_defaults/get_merged_audio_params).
+# Backward compat preserved (facades route to class). Patched for audio hierarchy (defaults < global < voice.json < overrides; no-op safe).
 
 import threading
 from pathlib import Path
@@ -21,7 +22,7 @@ _CONFIG_CACHE = None
 _CONFIG_FILE = "skyrimnet_config.txt"
 _USE_API_MODE = False  # Testing flag
 
-# SkyrimNetConfig Class (singleton; from alternative, simplified for migration)
+# SkyrimNetConfig Class (singleton; modular load/save for sharability)
 class SkyrimNetConfig:
     # DEFAULTS: Adjustable defaults (numerics/strings/booleans from config.txt; override via parser)
     DEFAULTS = {
@@ -38,34 +39,38 @@ class SkyrimNetConfig:
         'repetition_penalty': 2.0,
         'cfg_weight': 0.0,
         'exaggeration': 0.7,
-        'speaking_rate': 1.0,
 
-        # Audio Defaults (adjustable; new from alt)
-        'eq_gain_db': 0,
-        'eq_cutoff_hz': 3000,
+        # Audio Defaults (enhanced: No-ops explicit; match func checks)
+        'speaking_rate': 1.0,  # No-op
+        'eq_gain_db': 0.0,     # No-op (0=pass)
+        'eq_cutoff_hz': 3000,  # Default if eq_gain !=0
+        'notch_gain_db': None, # No-op (None=skip)
+        'notch_low_hz': 8000,  # Added (your 'notch_low' → rename)
+        'notch_high_hz': 11000, # Added
+        'gain_target_max': None, # No-op (None=skip; e.g., 0.707 if apply)
+        'gain_max_limit': 1.0, # No-op (1.0=pass)
+        'trim_threshold_db': -30.0,  # Default if denoise
+        'fade_ms': 20,         # Default if >0
+        'enable_denoise_normalize': False, # Gate denoise/trim/norm
+        'noise_floor_db': -60.0, # Default if enable_denoise
+        'normalize_method': 'peak', # Default if enable_denoise
+
         'max_gain': 2.0,
         'target_max': 0.6,
-        'noise_floor_db': -60,
-        'trim_threshold_db': -28,
-        'fade_ms': 20,
         'n_fft': 2048,  # New: For mel/STFT (alt)
         'n_mels': 80,
         'hop_length': 256,  # New: For mel/step (alt)
         'ebu_post_gain_db': 0,
         'ebu_true_peak': 0,
-        'notch_low': 8000,
-        'notch_high': 11000,
-        'notch_gain_db': -12,
 
         # Strings (adjustable defaults; new from alt)
-        'normalize_method': 'rms',
         'logging_level': 'INFO',
         'tts_name': 'Chatterbox',
         'dtype': 'bfloat16',
 
         # Booleans (adjustable flags; new from alt)
         'enable_pre_adjustment': False,  # New: Opt-in pad/mel align (alt; default False for non-breaking)
-        'enable_post_processing': True,  # New
+        'enable_post_processing': True,  # New (gate for post; set False for slowly)
         'enable_denoising': False,  # New
         'enable_smoothing': False,  # New
         'enable_quantization': True,  # New
@@ -96,7 +101,6 @@ class SkyrimNetConfig:
     }
 
     # CAPS: Hard constants/immutable limits for clamping (numerics only; from alt; used in get_value)
-    # Add MIN/MAX for all DEFAULTS numerics (user wants ready; non-breaking as optional in get_value)
     CAPS = {
         # Token Caps
         'MAX_NEW_TOKENS': 1499,
@@ -111,23 +115,19 @@ class SkyrimNetConfig:
         'REPETITION_PENALTY_MIN': 1.0, 'REPETITION_PENALTY_MAX': 2.0,
         'CFG_WEIGHT_MIN': 0.0, 'CFG_WEIGHT_MAX': 1.0,
         'EXAGGERATION_MIN': 0.0, 'EXAGGERATION_MAX': 2.0,
-        'SPEAKING_RATE_MIN': 0.5, 'SPEAKING_RATE_MAX': 2.0,
 
-        # Audio Caps
+        # Audio Caps (added/renamed for post)
+        'SPEAKING_RATE_MIN': 0.5, 'SPEAKING_RATE_MAX': 2.0,
         'EQ_GAIN_DB_MIN': -12, 'EQ_GAIN_DB_MAX': 6,
         'EQ_CUTOFF_HZ_MIN': 2000, 'EQ_CUTOFF_HZ_MAX': 5000,
-        'MAX_GAIN_MIN': 0.5, 'MAX_GAIN_MAX': 3.0,
-        'TARGET_MAX_MIN': 0.1, 'TARGET_MAX_MAX': 1.0,
-        'NOISE_FLOOR_DB_MIN': -60, 'NOISE_FLOOR_DB_MAX': -10,
+        'NOTCH_GAIN_DB_MIN': -24, 'NOTCH_GAIN_DB_MAX': 0,
+        'NOTCH_LOW_HZ_MIN': 4000, 'NOTCH_LOW_HZ_MAX': 10000,  # Renamed from notch_low
+        'NOTCH_HIGH_HZ_MIN': 8000, 'NOTCH_HIGH_HZ_MAX': 16000,  # Renamed
+        'GAIN_TARGET_MAX_MIN': 0.1, 'GAIN_TARGET_MAX_MAX': 1.0,
+        'GAIN_MAX_LIMIT_MIN': 0.5, 'GAIN_MAX_LIMIT_MAX': 3.0,
         'TRIM_THRESHOLD_DB_MIN': -50, 'TRIM_THRESHOLD_DB_MAX': -10,
         'FADE_MS_MIN': 10, 'FADE_MS_MAX': 50,
-        'N_FFT_MIN': 512, 'N_FFT_MAX': 2048,
-        'HOP_LENGTH_MIN': 128, 'HOP_LENGTH_MAX': 512,
-        'EBU_POST_GAIN_DB_MIN': -3, 'EBU_POST_GAIN_DB_MAX': 3,
-        'EBU_TRUE_PEAK_MIN': -5, 'EBU_TRUE_PEAK_MAX': 0,
-        'NOTCH_LOW_MIN': 4000, 'NOTCH_LOW_MAX': 10000,
-        'NOTCH_HIGH_MIN': 8000, 'NOTCH_HIGH_MAX': 16000,
-        'NOTCH_GAIN_DB_MIN': -24, 'NOTCH_GAIN_DB_MAX': 0,
+        'NOISE_FLOOR_DB_MIN': -60, 'NOISE_FLOOR_DB_MAX': -10,
 
         # Cache Caps (new from alt)
         'COND_CACHE_MAX_ENTRIES_MIN': 10, 'COND_CACHE_MAX_ENTRIES_MAX': 100,
@@ -138,6 +138,7 @@ class SkyrimNetConfig:
     _instance = None
     _lock = threading.Lock()
     _config_file_path = _CONFIG_FILE  # "skyrimnet_config.txt"
+    _voices_file_path = Path(__file__).parent.parent / "voices.json"  # Root dir
 
     def __new__(cls):
         with cls._lock:
@@ -162,7 +163,7 @@ class SkyrimNetConfig:
         self._defaults = self.DEFAULTS.copy()
         self._flags = {k: v for k, v in self.DEFAULTS.items() if isinstance(v, bool)}
         self._strings = {k: v for k, v in self.DEFAULTS.items() if isinstance(v, str) and k in ['normalize_method', 'logging_level', 'tts_name', 'dtype']}
-        self.voice_overrides = {}  # Dict[str, Dict] for voices
+        self.voice_overrides = {}  # Dict[str, Dict] for voices (from voices.json)
         self._is_modified = False
         self.sr = 24000  # Core
 
@@ -171,21 +172,9 @@ class SkyrimNetConfig:
         # Load full config
         self.load_config()
 
-    def load_config(self):
-        """Load config (simple INI + basic JSON blocks for overrides; merges with DEFAULTS). Non-blocking."""
-        global _CONFIG_CACHE, ENABLE_MEMORY_CACHE, ENABLE_DISK_CACHE
-
-        if _CONFIG_CACHE is not None:  # Preserve old cache
-            defaults, modes, global_flags = _CONFIG_CACHE
-            self._defaults.update(defaults)  # Merge old
-            self.enable_memory_cache = global_flags.get('enable_memory_cache', ENABLE_MEMORY_CACHE)
-            self.enable_disk_cache = global_flags.get('enable_disk_cache', ENABLE_DISK_CACHE)
-            ENABLE_MEMORY_CACHE = self.enable_memory_cache
-            ENABLE_DISK_CACHE = self.enable_disk_cache
-            logger.debug("Config from cache (merged with class)")
-            return _CONFIG_CACHE
-
-        # Default config (preserved from rollback)
+    # Sharable Helper: Load globals/flags from config.txt (INI-style; no voice block)
+    def _load_txt_config(self) -> Tuple[Dict[str, Any], Dict[str, str], Dict[str, bool]]:
+        """Sharable: Parse config.txt for globals/flags/modes. Returns (default_config, config_mode, global_flags)."""
         default_config = {
             'temperature': 0.8,
             'min_p': 0.07,
@@ -194,47 +183,35 @@ class SkyrimNetConfig:
             'cfg_weight': 0.0,
             'exaggeration': 0.7
         }
-        config_mode = {k: 'default' for k in default_config}  # Modes (default/api/custom)
+        config_mode = {k: 'default' for k in default_config}
         global_flags = {
-            'enable_memory_cache': ENABLE_MEMORY_CACHE,
-            'enable_disk_cache': ENABLE_DISK_CACHE
+            'enable_memory_cache': self.DEFAULTS.get('enable_memory_cache', True),
+            'enable_disk_cache': self.DEFAULTS.get('enable_disk_cache', True)
         }
 
-        try:
-            config_path = Path(self._config_file_path)
-            if not config_path.exists():
-                logger.warning(f"Config file {self._config_file_path} not found, using hardcoded defaults")
-                self._merge_defaults(default_config, config_mode, global_flags)
-                _CONFIG_CACHE = (default_config, config_mode, global_flags)
-                return _CONFIG_CACHE
+        config_path = Path(self._config_file_path)
+        if not config_path.exists():
+            logger.warning(f"Config file {self._config_file_path} not found, using hardcoded defaults")
+            return default_config, config_mode, global_flags
 
+        try:
             with open(config_path, 'r', encoding='utf-8') as f:
                 lines = f.readlines()
 
-            # Simple parser (INI-like; basic JSON for voice_overrides block)
-            in_json_block = False
-            json_buffer = []
+            # Parser: Globals/flags only (ignore old voice_overrides block)
+            in_voice_block = False
             for line in lines:
                 line = line.strip()
                 if not line or line.startswith('#'):
                     continue
-
-                if line.startswith('voice_overrides = {'):
-                    in_json_block = True
-                    json_buffer = [line]
+                if line.startswith('voice_overrides = {'):  # Deprecate: Ignore
+                    in_voice_block = True
+                    logger.warning("Ignoring old voice_overrides block in config.txt – use voices.json")
                     continue
-                if in_json_block:
-                    json_buffer.append(line)
-                    if line == '}':
-                        in_json_block = False
-                        try:
-                            # Parse JSON block for voice_overrides
-                            json_str = '\n'.join(json_buffer)
-                            self.voice_overrides = json.loads(json_str.replace('voice_overrides =', ''))
-                            logger.debug(f"Parsed voice_overrides: {len(self.voice_overrides)} voices")
-                        except json.JSONDecodeError as je:
-                            logger.warning(f"Invalid voice_overrides JSON: {je} – Skipped")
-                            self.voice_overrides = {}
+                if in_voice_block and line == '}':
+                    in_voice_block = False
+                    continue
+                if in_voice_block:  # Skip block lines
                     continue
 
                 if '=' in line:
@@ -261,7 +238,7 @@ class SkyrimNetConfig:
                         else:
                             logger.warning(f"Invalid boolean value '{value}' for {key}, using default")
 
-                    # Handle parameter modes/values (preserve old; merge to _defaults)
+                    # Parameter modes/values (preserve old; merge to default_config)
                     elif key in config_mode:
                         if value.lower() == 'default':
                             config_mode[key] = 'default'
@@ -276,28 +253,72 @@ class SkyrimNetConfig:
                             except ValueError:
                                 logger.warning(f"Invalid value '{value}' for {key}, using default")
 
-            # Merge: Old defaults → class _defaults; flags → self attrs
-            self._merge_defaults(default_config, config_mode, global_flags)
+            logger.debug(f"TXT config loaded: {len(default_config)} params, {len(global_flags)} flags")
+            return default_config, config_mode, global_flags
+
+        except Exception as e:
+            logger.error(f"TXT config load failed: {e}, using hardcoded defaults")
+            return default_config, config_mode, global_flags
+
+    # Sharable Helper: Load voice overrides from voices.json
+    def _load_voices_json(self) -> Dict[str, Dict]:
+        """Sharable: Load voices.json from root dir. Returns {voice: params} or {}."""
+        if not self._voices_file_path.exists():
+            logger.debug("voices.json not found – no per-voice overrides")
+            return {}
+
+        try:
+            with open(self._voices_file_path, 'r') as f:
+                voices_data = json.load(f)
+            # Validate/Flatten if list (optional)
+            if isinstance(voices_data, list):
+                voices_data = {item.get('voice', f'voice_{i}'): item for i, item in enumerate(voices_data)}
+            logger.debug(f"Voices.json loaded: {list(voices_data.keys())} voices")
+            return voices_data
+        except json.JSONDecodeError as e:
+            logger.warning(f"Invalid voices.json: {e} – no per-voice overrides")
+            return {}
+        except Exception as e:
+            logger.error(f"Voices.json load failed: {e} – empty dict")
+            return {}
+
+    def load_config(self):
+        """Load: Txt (globals/flags) → merge defaults → voices.json (overrides). Non-blocking; sharable via helpers."""
+        global _CONFIG_CACHE, ENABLE_MEMORY_CACHE, ENABLE_DISK_CACHE
+
+        if _CONFIG_CACHE is not None:  # Cache hit
+            defaults, modes, global_flags = _CONFIG_CACHE
+            self._defaults.update(defaults)  # Merge old
             self.enable_memory_cache = global_flags.get('enable_memory_cache', ENABLE_MEMORY_CACHE)
             self.enable_disk_cache = global_flags.get('enable_disk_cache', ENABLE_DISK_CACHE)
             ENABLE_MEMORY_CACHE = self.enable_memory_cache
             ENABLE_DISK_CACHE = self.enable_disk_cache
-
-            voices_count = len(self.voice_overrides)
-            logger.info(f"Config loaded: {voices_count} voices, {len(self._defaults)} params (logging_level={self.logging_level})")
-
-            _CONFIG_CACHE = (default_config, config_mode, global_flags)
+            logger.debug("Config from cache (merged with class)")
             return _CONFIG_CACHE
 
+        # Step 1: Load txt (globals/flags/modes; sharable)
+        default_config, config_mode, global_flags = self._load_txt_config()
 
-        except Exception as e:
-            logger.error(f"Config load failed: {e}, using hardcoded defaults")
-            self._merge_defaults(default_config, config_mode, global_flags)
-            _CONFIG_CACHE = (default_config, config_mode, global_flags)
-            return _CONFIG_CACHE
+        # Step 2: Merge defaults (input → _defaults; class DEFAULTS base)
+        self._merge_defaults(default_config, config_mode, global_flags)
+
+        # Step 3: Load voices.json (separate; overrides)
+        self.voice_overrides = self._load_voices_json()
+
+        # Step 4: Sync flags/enables (from globals)
+        self.enable_memory_cache = global_flags.get('enable_memory_cache', ENABLE_MEMORY_CACHE)
+        self.enable_disk_cache = global_flags.get('enable_disk_cache', ENABLE_DISK_CACHE)
+        ENABLE_MEMORY_CACHE = self.enable_memory_cache
+        ENABLE_DISK_CACHE = self.enable_disk_cache
+
+        voices_count = len(self.voice_overrides)
+        logger.info(f"Config loaded: {voices_count} voices, {len(self._defaults)} params (logging_level={self.logging_level})")
+
+        _CONFIG_CACHE = (default_config, config_mode, global_flags)
+        return _CONFIG_CACHE
 
     def _merge_defaults(self, input_defaults: Dict, modes: Dict, flags: Dict):
-        """Internal: Merge input to class storage (non-breaking)."""
+        """Internal: Merge input to class storage (non-breaking). Sharable for custom merges."""
         # Merge defaults (input → _defaults; class DEFAULTS base)
         self._defaults.update({k: v for k, v in input_defaults.items() if k in self.DEFAULTS})
         for k in self.DEFAULTS:
@@ -319,6 +340,88 @@ class SkyrimNetConfig:
         dtype_str = self._defaults.get('dtype', 'bfloat16')
         self.dtype = torch.bfloat16 if dtype_str == 'bfloat16' else torch.float32
         DTYPE = self.dtype
+
+    # Sharable Helper: Save globals/flags to config.txt (INI-style)
+    def _save_txt_config(self, config_path: Path):
+        """Sharable: Save globals/flags to txt (no voices block)."""
+        with open(config_path, 'w', encoding='utf-8') as f:
+            f.write("# Global Settings\n")
+            f.write(f"enable_pre_adjustment = {self.enable_pre_adjustment}\n")
+            f.write(f"speaking_rate = {self.speaking_rate}\n")
+            f.write(f"eq_gain_db = {self.eq_gain_db}\n")
+            f.write(f"eq_cutoff_hz = {self.eq_cutoff_hz}\n")
+            f.write(f"max_gain = {self.max_gain}\n")
+            f.write(f"target_max = {self.target_max}\n")
+            f.write(f"noise_floor_db = {self.noise_floor_db}\n")
+            f.write(f"trim_threshold_db = {self.trim_threshold_db}\n")
+            f.write(f"notch_enabled = {self.notch_enabled}\n")
+            f.write(f"hp_enabled = {self.hp_enabled}\n")
+            f.write(f"temperature = {self.temperature}\n")
+            f.write(f"exaggeration = {self.exaggeration}\n")
+            f.write(f"cfg_weight = {self.cfg_weight}\n")
+            f.write(f"min_p = {self.min_p}\n")
+            f.write(f"top_p = {self.top_p}\n")
+            f.write(f"repetition_penalty = {self.repetition_penalty}\n")
+            f.write(f"max_new_tokens = {self.max_new_tokens}\n")
+            f.write(f"min_new_tokens = {self.min_new_tokens}\n")
+            f.write(f"max_cache_len = {self.max_cache_len}\n")
+            f.write(f"n_fft = {self.n_fft}\n")
+            f.write(f"hop_length = {self.hop_length}\n")
+            f.write(f"stride_length = {self.stride_length}\n")
+            f.write(f"fade_ms = {self.fade_ms}\n")
+            f.write(f"enable_memory_cache = {self.enable_memory_cache}\n")
+            f.write(f"enable_disk_cache = {self.enable_disk_cache}\n")
+            f.write(f"force_local_refs = {self.force_local_refs}\n")
+            f.write(f"auto_update_refs = {self.auto_update_refs}\n")
+            f.write(f"tts_name = {self.tts_name}\n")
+            f.write(f"dtype = {self._defaults.get('dtype', 'bfloat16')}\n")  # Use _defaults
+            # Flags section
+            f.write("\n# Flags\n")
+            for flag, val in self._flags.items():
+                if flag not in ['enable_pre_adjustment', 'enable_memory_cache', 'enable_disk_cache',
+                                'force_local_refs', 'auto_update_refs']:
+                    f.write(f"{flag} = {val}\n")
+
+        logger.debug(f"TXT config saved: {config_path}")
+
+    # Sharable Helper: Save voice overrides to voices.json
+    def _save_voices_json(self, voices_file: Path):
+        """Sharable: Save voice_overrides to JSON (indent=2)."""
+        with open(voices_file, 'w', encoding='utf-8') as f:
+            json.dump(self.voice_overrides, f, indent=2)
+        logger.debug(f"Voices.json saved: {voices_file} ({len(self.voice_overrides)} voices)")
+
+    def save_config(self, create_backup: bool = True) -> Tuple[bool, str]:
+        """Save: Txt (globals/flags via _save_txt_config) + voices.json (_save_voices_json). Modular."""
+        try:
+            config_path = Path(self._config_file_path)
+            if create_backup and config_path.exists():
+                backup_path = config_path.with_suffix('.backup')
+                config_path.rename(backup_path)
+                logger.debug(f"Backup created: {backup_path}")
+
+            # Step 1: Save txt (globals/flags; sharable)
+            self._save_txt_config(config_path)
+
+            # Step 2: Save voices.json (separate; sharable)
+            voices_file = self._voices_file_path
+            self._save_voices_json(voices_file)
+
+            logger.info(f"Config saved: {config_path} + voices.json ({len(self.voice_overrides)} voices)")
+            self._is_modified = False
+            return True, f"Saved | {len(self.voice_overrides)} voices"
+
+        except Exception as e:
+            logger.error(f"Save failed: {e}")
+            return False, str(e)
+
+    def reload_config(self):
+        """Reload: Clears cache; re-calls load_config (txt + voices.json)."""
+        global _CONFIG_CACHE
+        _CONFIG_CACHE = None
+        self.voice_overrides = {}  # Clear prior
+        self.load_config()  # Re-parses txt → voices.json
+        logger.info("Config reloaded (txt + voices.json)")
 
     def get_value(self, param_name: str, api_value: Any = None, default: Any = None,
                   bypass_config: bool = False) -> Any:
@@ -392,9 +495,8 @@ class SkyrimNetConfig:
             return self.clamp_value(param_name, val)
         return val
 
-
     def clamp_value(self, param_name: str, value: Any) -> Any:
-        """Clamp numerics using CAPS (non-breaking; skip if no CAP)."""
+        """Clamp numerics using CAPS (non-breaking; skip if no CAP). Sharable."""
         if isinstance(value, (int, float)):
             upper_name = param_name.upper()
             min_key = f"{upper_name}_MIN"
@@ -405,14 +507,11 @@ class SkyrimNetConfig:
                 if clamped != value:
                     logger.debug(f"Clamped {param_name}: {value} → {clamped} (caps: {min_val}-{max_val})")
                 return clamped
-
         return value  # No clamp for non-numerics/missing CAPS
 
     @property
     def audio_defaults(self) -> Dict[str, Any]:
-
-        """Audio params subset (merged; from alt)."""
-
+        """Audio params subset (merged; from alt; sharable property)."""
         if not hasattr(self, '_audio_defaults'):
             self._audio_defaults = {
                 'enable_post_processing': self.get_value('enable_post_processing', default=False),
@@ -420,127 +519,81 @@ class SkyrimNetConfig:
                 'enable_post_jit_gain': self.get_value('enable_post_jit_gain', default=True),
                 'enable_post_voice_processing': self.get_value('enable_post_voice_processing', default=True),
                 'enable_pre_adjustment': self.get_value('enable_pre_adjustment', default=False),
-                'speaking_rate': self.speaking_rate,
-                'eq_gain_db': self.eq_gain_db,
-                'eq_cutoff_hz': self.eq_cutoff_hz,
-                'max_gain': self.max_gain,
-                'target_max': self.target_max,
-                'noise_floor_db': self.noise_floor_db,
-                'trim_threshold_db': self.trim_threshold_db,
-                'notch_enabled': self.notch_enabled,
-                'hp_enabled': self.hp_enabled,
-                'n_fft': self.n_fft,
-                'hop_length': self.hop_length,
-                'fade_ms': self.fade_ms,
-                'normalize_method': self.normalize_method,
-                'enable_denoising': self.enable_denoising
+                'speaking_rate': self.get_value('speaking_rate'),
+                'eq_gain_db': self.get_value('eq_gain_db'),
+                'eq_cutoff_hz': self.get_value('eq_cutoff_hz'),
+                'gain_max_limit': self.get_value('gain_max_limit'),
+                'gain_target_max': self.get_value('gain_target_max'),
+                'noise_floor_db': self.get_value('noise_floor_db'),
+                'trim_threshold_db': self.get_value('trim_threshold_db'),
+                'notch_gain_db': self.get_value('notch_gain_db'),
+                'notch_low_hz': self.get_value('notch_low_hz'),
+                'notch_high_hz': self.get_value('notch_high_hz'),
+                'n_fft': self.get_value('n_fft'),
+                'hop_length': self.get_value('hop_length'),
+                'fade_ms': self.get_value('fade_ms'),
+                'normalize_method': self.get_value('normalize_method'),
+                'enable_denoise_normalize': self.get_value('enable_denoise_normalize'),
+                'enable_denoising': self.get_value('enable_denoising')
             }
-
         return self._audio_defaults
 
+    def get_merged_audio_params(self, voice_name: Optional[str] = None, api_overrides: Optional[Dict] = None) -> Dict[str, Any]:
+        """Merge: Defaults → Global (if enables) → Voice (JSON) → API. No-op safe; patched for post-processing."""
+        params = self.audio_defaults.copy()  # Subset with clamped globals
+        params['voice_name'] = voice_name or 'default'  # Log ID
 
-    def get_merged_audio_params(self, voice_name: Optional[str] = None, api_overrides: Optional[Dict] = None) -> Dict[
-        str, Any]:
-        """Merge global + voice + api (from alt)."""
-        params = self.audio_defaults.copy()
+        # Global enables (map flags to params; only if enable_post_processing)
+        if params.get('enable_post_processing', False):
+            global_enables = {
+                'enable_post_resample': ['speaking_rate'],
+                'enable_eq': ['eq_gain_db', 'eq_cutoff_hz'],
+                'enable_notch': ['notch_gain_db', 'notch_low_hz', 'notch_high_hz'],
+                'enable_gain_norm': ['gain_target_max', 'gain_max_limit'],
+                'enable_denoise_normalize': ['enable_denoise_normalize', 'noise_floor_db', 'normalize_method', 'trim_threshold_db'],
+                'enable_fade': ['fade_ms']
+            }
+            for enable_flag, keys in global_enables.items():
+                if self.get_value(enable_flag, default=False):  # Global flag
+                    for key in (keys if isinstance(keys, list) else [keys]):
+                        global_val = self.get_value(key)  # Clamped
+                        if global_val is not None:
+                            params[key] = global_val
+                            logger.debug(f"Global {key}={global_val} (enable={enable_flag})")
+        else:
+            # Disable: Set to no-op (e.g., None/0/1.0 → functions skip)
+            no_op_keys = ['speaking_rate', 'eq_gain_db', 'notch_gain_db', 'gain_target_max']
+            for key in no_op_keys:
+                params[key] = 1.0 if key == 'speaking_rate' else (None if 'gain' in key or 'notch' in key else 0.0)
+
+        # Voice JSON (overrides global/default; from _load_voices_json)
         if voice_name and voice_name in self.voice_overrides:
-            voice_params = self.voice_overrides[voice_name]
-            params.update({k: v for k, v in voice_params.items() if k in params})
-            logger.debug(f"Merged audio for {voice_name}: enable_pre_adjustment={params['enable_pre_adjustment']}")
+            voice_params = self.get_voice_parameters(voice_name)
+            for key, value in voice_params.items():
+                if key in params and value is not None:  # Skip None (no override)
+                    params[key] = value  # e.g., dlc1seranavoice -12dB wins
+                    logger.debug(f"Voice override {key}={value} for {voice_name}")
+        elif voice_name:
+            logger.debug(f"No voices.json params for {voice_name} – global/defaults")
+
+        # API/UI overrides (highest)
         if api_overrides:
             params.update({k: v for k, v in api_overrides.items() if k in params})
+            logger.debug(f"API overrides for {voice_name}: {list(api_overrides.keys())}")
+
+        # Final enable (from params; functions check anyway)
+        logger.info(f"Merged audio for {voice_name}: enable_post={params['enable_post_processing']}, rate={params.get('speaking_rate', 1.0)}, notch={params.get('notch_gain_db')}")
         return params
 
-
     def get_voice_parameters(self, voice_name: str) -> Dict[str, Any]:
-        """Voice overrides (dict or empty)."""
+        """Voice overrides (from voices.json; dict or empty)."""
         return self.voice_overrides.get(voice_name, {})
-
 
     def get_all_voices(self) -> List[str]:
         """List voices from overrides."""
         return list(self.voice_overrides.keys())
 
-    def save_config(self, create_backup: bool = True) -> Tuple[bool, str]:
-        """Save to txt (INI + JSON block; from alt, simplified)."""
-        try:
-            config_path = Path(self._config_file_path)
-            if create_backup and config_path.exists():
-                backup_path = config_path.with_suffix('.backup')
-                config_path.rename(backup_path)
-                logger.debug(f"Backup: {backup_path}")
-            with open(config_path, 'w', encoding='utf-8') as f:
-                # Global settings (INI)
-                f.write("# Global Settings\n")
-                f.write(f"enable_pre_adjustment = {self.enable_pre_adjustment}\n")
-                f.write(f"speaking_rate = {self.speaking_rate}\n")
-                f.write(f"eq_gain_db = {self.eq_gain_db}\n")
-                f.write(f"eq_cutoff_hz = {self.eq_cutoff_hz}\n")
-                f.write(f"max_gain = {self.max_gain}\n")
-                f.write(f"target_max = {self.target_max}\n")
-                f.write(f"noise_floor_db = {self.noise_floor_db}\n")
-                f.write(f"trim_threshold_db = {self.trim_threshold_db}\n")
-                f.write(f"notch_enabled = {self.notch_enabled}\n")
-                f.write(f"hp_enabled = {self.hp_enabled}\n")
-                f.write(f"temperature = {self.temperature}\n")
-                f.write(f"exaggeration = {self.exaggeration}\n")
-                f.write(f"cfg_weight = {self.cfg_weight}\n")
-                f.write(f"min_p = {self.min_p}\n")
-                f.write(f"top_p = {self.top_p}\n")
-                f.write(f"repetition_penalty = {self.repetition_penalty}\n")
-                f.write(f"max_new_tokens = {self.max_new_tokens}\n")
-                f.write(f"min_new_tokens = {self.min_new_tokens}\n")
-                f.write(f"max_cache_len = {self.max_cache_len}\n")
-                f.write(f"n_fft = {self.n_fft}\n")
-                f.write(f"hop_length = {self.hop_length}\n")
-                f.write(f"stride_length = {self.stride_length}\n")
-                f.write(f"fade_ms = {self.fade_ms}\n")
-                f.write(f"enable_memory_cache = {self.enable_memory_cache}\n")
-                f.write(f"enable_disk_cache = {self.enable_disk_cache}\n")
-                f.write(f"force_local_refs = {self.force_local_refs}\n")  # New
-                f.write(f"auto_update_refs = {self.auto_update_refs}\n")  # New
-                f.write(f"tts_name = {self.tts_name}\n")
-                f.write(f"dtype = {self.dtype_str}\n")  # New
-                # Flags section
-                f.write("\n# Flags\n")
-
-                for flag, val in self._flags.items():
-                    if flag not in ['enable_pre_adjustment', 'enable_memory_cache', 'enable_disk_cache',
-                                    'force_local_refs', 'auto_update_refs']:
-                        f.write(f"{flag} = {val}\n")
-
-                # Voice overrides (JSON block)
-                f.write("\n# Voice Overrides (JSON block)\n")
-                f.write("voice_overrides = {\n")
-
-                for voice, params in self.voice_overrides.items():
-                    f.write(f'    "{voice}": {{\n')
-                    for k, v in params.items():
-                        f.write(f'        "{k}": {v},\n')
-                    f.write('    },\n')
-                f.write("}\n")
-
-            logger.info(f"Config saved: {config_path} ({len(self.voice_overrides)} voices)")
-            self._is_modified = False
-            return True, f"Saved | {len(self.voice_overrides)} voices"
-
-        except Exception as e:
-            logger.error(f"Save failed: {e}")
-            return False, str(e)
-
-
-    def reload_config(self):
-        """Reload (clears cache; re-parses)."""
-        global _CONFIG_CACHE
-        _CONFIG_CACHE = None
-
-        self.load_config()
-        logger.info("Config reloaded")
-
-
-
-# Backward Compat: Old Functions as Facades (Non-Breaking; Route to Class) TODO review facades
-
+# Backward Compat: Old Functions as Facades (Non-Breaking; Route to Class)
 def load_skyrimnet_config():
     """Old API: Load (now via class; returns tuple for compat)."""
     global _CONFIG_CACHE
@@ -550,12 +603,10 @@ def load_skyrimnet_config():
         default_config = CONFIG._defaults.copy()  # Shallow
         config_mode = {k: 'default' for k in default_config if
                        k in ['temperature', 'min_p', 'top_p', 'repetition_penalty', 'cfg_weight', 'exaggeration']}
-
         global_flags = {'enable_memory_cache': CONFIG.enable_memory_cache,
                         'enable_disk_cache': CONFIG.enable_disk_cache}
         _CONFIG_CACHE = (default_config, config_mode, global_flags)
     return _CONFIG_CACHE
-
 
 def get_config_value(param_name: str, api_value, defaults=None, modes=None, bypass_config=False):
     """Old API: Get value (now via class get_value; preserves args)."""
@@ -566,21 +617,16 @@ def get_config_value(param_name: str, api_value, defaults=None, modes=None, bypa
     # Route to class (drops unused modes for now; compat)
     return CONFIG.get_value(param_name, api_value, default=defaults.get(param_name), bypass_config=bypass_config)
 
-
 def reload_config():
     """Old API: Reload (now class method)."""
     CONFIG.reload_config()
     global _CONFIG_CACHE
     _CONFIG_CACHE = None
 
-
 # Global Instance (Backward Compat: Use class attrs as globals)
-
 CONFIG = SkyrimNetConfig()
 
-
 # Set preserved globals from class (on load)
-
 def _sync_globals():
     global DEVICE, DTYPE, MODEL, MULTILINGUAL, ENABLE_DISK_CACHE, ENABLE_MEMORY_CACHE, FUZZY_CACHE_LIMIT
     DEVICE = str(CONFIG.device)
@@ -590,7 +636,6 @@ def _sync_globals():
     ENABLE_DISK_CACHE = CONFIG.enable_disk_cache
     ENABLE_MEMORY_CACHE = CONFIG.enable_memory_cache
     FUZZY_CACHE_LIMIT = CONFIG.get_value('fuzzy_cache_limit', default=CONFIG.DEFAULTS.get('fuzzy_cache_limit', 1000))
-
 
 # Initial sync (non-blocking)
 load_skyrimnet_config()  # Triggers class init + _sync_globals implicit via properties

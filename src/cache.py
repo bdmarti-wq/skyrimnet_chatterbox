@@ -16,6 +16,7 @@ from difflib import SequenceMatcher
 from threading import Lock, Thread
 from queue import Queue
 import torch
+import torch.nn.functional as F
 import torchaudio
 from torch.serialization import safe_globals  # For whitelisting in load
 from torchaudio.io import StreamReader  # For non-blocking SR probe in async
@@ -627,30 +628,96 @@ def _resample_if_needed(waveform: torch.Tensor, load_sr: int, model_sr: int, aud
         logger.debug(f"No resample: load SR={load_sr}Hz matches {model_sr}Hz")
     return waveform, adjusted_path
 
+
 # New Helper: Pad if needed (extracted; testable: waveform/path → padded_waveform/bool)
-def _pad_if_needed(waveform: torch.Tensor, adjusted_path: str, model_sr: int, enable_pre_adjustment: bool) -> tuple[torch.Tensor, bool]:
-    """Pad/align if short or enabled; return (padded_waveform, padded)."""
-    padded = False
+# src/cache.py (replace your _pad_if_needed; assumes torchaudio imported)
+def _pad_if_needed(waveform: torch.Tensor, model_sr: int, original_path: str, stem: str | None,
+                   out_path: Optional[Path], enable_pre_adjustment: bool) -> torch.Tensor:
+    """Hybrid pad: Est min-length for stability + exact mel align (reflect pad) for quality. In-mem; saves if out_path."""
+    hop_length = CONFIG.get_value('hop_length', 256)
+    n_fft = CONFIG.get_value('n_fft', 2048)
+    n_mels = CONFIG.get_value('n_mels', 80)  # Dynamic
+
+    # Step 1: Est min-pad (your existing: Stability first; no Mel yet – fast)
+    est_tokens = waveform.shape[-1] / hop_length  # Float expected mel len
+    expected_samples = int(est_tokens * hop_length)
+    if waveform.shape[-1] < expected_samples:
+        pad_samples = expected_samples - waveform.shape[-1]
+        # Replicate initial (safe extension)
+        waveform = F.pad(waveform, (0, pad_samples), mode='replicate')
+        logger.info(f"Est min-pad for {stem}: {waveform.shape[-1]} → {expected_samples} samples (est_tokens={est_tokens:.1f}; stability)")
+    else:
+        logger.debug(f"Est length ok for {stem}: {waveform.shape[-1]} >= {expected_samples} – no min-pad")
+
+    # Step 2: If enabled, compute Mel + adjust (exact quality align; gated for speed)
     if enable_pre_adjustment:
-        hop_length = CONFIG.get_value('hop_length', 256)
-        n_fft = CONFIG.get_value('n_fft', 1024)
-        audio_samples = int(waveform.shape[-1])
-        estimated_tokens = (audio_samples // hop_length) * 1.5
-        expected_samples = int(estimated_tokens * hop_length)
+        mel_transform = torchaudio.transforms.MelSpectrogram(
+            sample_rate=model_sr, n_fft=n_fft, hop_length=hop_length, n_mels=n_mels
+        )
+        mel = mel_transform(waveform)  # ~0.02s compute (gated)
+        adjusted_waveform = adjust_audio_length_torch(waveform, model_sr, mel.shape, hop_length,
+                                                      enable_pre_adjustment, stem, logger)
+        if adjusted_waveform.shape[-1] != waveform.shape[-1]:
+            logger.info(f"Mel fine-tune for {stem}: {waveform.shape[-1]} → {adjusted_waveform.shape[-1]} samples (exact align)")
+            waveform = adjusted_waveform  # Update with reflect/trim
+    else:
+        logger.debug(f"Pre-adjust off for {stem} – est only (speed prioritized)")
 
-        mel_transform = torchaudio.transforms.MelSpectrogram(sample_rate=model_sr, n_fft=n_fft, hop_length=hop_length, n_mels=80)
-        mel = mel_transform(waveform)
-        actual_mel_len = mel.shape[-1]
-        logger.info(f"Mel check for {adjusted_path}: actual={actual_mel_len}, est_tokens={estimated_tokens}")
+    # Save if out_path (fixed: Always if out_path; no local var bug)
+    if out_path:
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            torchaudio.save(str(out_path), waveform, model_sr, encoding="PCM_S")
+            logger.info(f"Adjusted saved: {out_path} (final len={waveform.shape[-1]}, mel est={waveform.shape[-1] / hop_length:.1f})")
 
-        if actual_mel_len < estimated_tokens:
-            pad_samples = expected_samples - audio_samples
-            left_pad = pad_samples // 2
-            right_pad = pad_samples - left_pad
-            waveform = torch.nn.functional.pad(waveform, (left_pad, right_pad), mode='reflect')
-            padded = True
-            logger.info(f"Padded: {audio_samples / model_sr:.2f}s → {int(waveform.shape[-1]) / model_sr:.2f}s")
-    return waveform, padded
+    logger.debug(f"Pad complete for {stem}: {waveform.shape[-1]} samples (hybrid: stable + quality)")
+    return waveform  # Consistent tensor return
+
+
+# Add to src/cache.py (after imports; before _pad_if_needed)
+# src/cache.py (replace your adjust_audio_length_torch)
+import torch.nn.functional as F
+
+def adjust_audio_length_torch(waveform: torch.Tensor, model_sr: int, mel_shape: torch.Tensor, hop_length: int,
+                             enable_pre_adjustment: bool, stem: str | None, logger) -> torch.Tensor:
+    """In-memory pad/trim to match mel_shape[-1] * hop_length. Reflect pad for zero artifacts; no-op if disabled."""
+    if not enable_pre_adjustment:
+        logger.debug(f"Pre-adjust disabled for {stem} – raw waveform (speed preserved)")
+        return waveform  # No-op: Fast pass-through
+
+    actual_mel_len = mel_shape[-1]
+    expected_mel_len = waveform.shape[-1] // hop_length
+    if actual_mel_len == expected_mel_len:
+        logger.debug(f"Mel len exact match for {stem}: {actual_mel_len} frames – no adjustment (quality preserved)")
+        return waveform  # No compute/pad needed
+
+    expected_samples = actual_mel_len * hop_length
+    diff_samples = expected_samples - waveform.shape[-1]
+    adjusted = False
+    logger.debug(f"Mel align for {stem}: actual={actual_mel_len}, expected_len={expected_mel_len} (diff={diff_samples} samples)")
+
+    if diff_samples != 0:
+        if diff_samples > 0:
+            # Reflect pad: Mirror edges (zero artifacts; natural extension for voices – e.g., smooth moan fade)
+            # Split: Left half reverse + original + right half reverse
+            waveform = F.pad(waveform, (diff_samples // 2, (diff_samples + 1) // 2), mode='reflect')  # Approx symmetric (torch 'reflect' mirrors)
+            logger.info(f"Artifact-min pad for {stem}: +{diff_samples} samples (reflect mirror; quality boost)")
+            adjusted = True
+        else:
+            # Trim: Only if excess safe (e.g., >1s; log warning to monitor – preserves nuance)
+            excess = -diff_samples
+            if excess > hop_length * 10:  # >10 frames (~0.025s) – trim; else keep for safety
+                waveform = waveform[..., :expected_samples]
+                logger.info(f"Precise trim for {stem}: -{excess} samples (mel align; no content loss)")
+            else:
+                logger.debug(f"Minor excess {excess} samples for {stem} – kept (avoids over-trim artifacts)")
+            adjusted = True
+
+    if adjusted:
+        logger.debug(f"Adjust complete for {stem}: {waveform.shape[-1]} samples (quality: artifact-reduced alignment)")
+    return waveform
+
 
 # New Helper: Save adjusted and validate (extracted; testable: waveform/path/stem → final_path/valid)
 def _save_adjusted_and_validate(waveform: torch.Tensor, adjusted_path: str, original_path: str, model_sr: int, stem: str | None, out_path: Optional[Path], enable_pre_adjustment: bool, exaggeration: float) -> tuple[str, bool, Optional[float]]:
