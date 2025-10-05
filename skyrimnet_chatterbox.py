@@ -131,6 +131,7 @@ def generate_audio_ui(
     logger.debug(
         f"Final parameters - temp: {final_temperature}, min_p: {final_min_p}, top_p: {final_top_p}, rep_penalty: {final_repetition_penalty}, cfg_weight: {final_cfg_weight}, exaggeration: {final_exaggeration}")
 
+    # Important - use server supplied uuid for consistent seed
     seed_num = cpp_uuid_to_seed(uuid)
 
     # Lazy import + call (via kwargs for sig safety; model=MODEL from global)
@@ -306,6 +307,7 @@ if __name__ == "__main__":
 
     model = load_model()
     init_conditional_memory_cache(model, DEVICE, DTYPE, quiet=False, pre_validate_voices=True)  # Quiet for prod
+
     demo.queue(
         max_size=12,
         default_concurrency_limit=2,
