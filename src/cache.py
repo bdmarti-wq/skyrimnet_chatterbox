@@ -46,6 +46,8 @@ voices_dir = CACHE_AUDIO_DIR / "voices"  # For check_and_update_ref
 
 # Global model lock (new: serialize access to prevent graph races)
 MODEL_LOCK = threading.RLock()
+# Global gen lock (serialize vs async for CUDA graph safety)
+GEN_ACTIVE_LOCK = threading.RLock()
 
 # Tunable constants (hardcoded; override via env vars if needed)
 KEY_LEN = 32    # Hash length
@@ -162,6 +164,20 @@ class ConditionalsCacheManager:
                 if enable_memory_cache:
                     self._memory_cache[cache_key] = arg_dict
                     self._memory_cache.move_to_end(cache_key)
+                    # NEW: Proactive evict if pressure (prioritize temps/UUIDs)
+                    if len(self._memory_cache) > MAX_MEMORY_ENTRIES * 0.9:
+                        # Evict oldest temp-like (UUID/long keys first)
+                        to_evict = []
+                        for k in list(self._memory_cache):
+                            if (len(k) > 20 or any(c.isdigit() for c in k[:20]) and len(k) > 10) and len(
+                                    to_evict) < 10:  # Heuristic temp
+                                to_evict.append(k)
+                        for k in to_evict:
+                            self._memory_cache.pop(k, None)
+                            pt_file = CACHE_DIR / f"{k}.pt"
+                            if pt_file.exists():
+                                pt_file.unlink(missing_ok=True)
+                            logger.debug(f"Proactive evicted temp: {k[:8]}... (memory={len(self._memory_cache)})")
                     logger.info(f"Memory saved arg_dict: {cache_key[:8]}... (total: {len(self._memory_cache)})")
                     saved = True
 
@@ -652,7 +668,12 @@ def _save_adjusted_and_validate(waveform: torch.Tensor, adjusted_path: str, orig
             torchaudio.save(str(aligned_out), waveform, model_sr, encoding="PCM_S")
         if aligned_out.exists() and aligned_out.stat().st_size > 0:
             adjusted_path = str(aligned_out)
-            logger.info(f"Final adjusted saved: {adjusted_path} (mel_len post-pad={torchaudio.transforms.MelSpectrogram(sample_rate=model_sr, n_fft=1024, hop_length=256, n_mels=80)(waveform).shape[-1]})")
+            # NEW: Dynamic Mel (consistent with _pad_if_needed)
+            hop_length = CONFIG.get_value('hop_length', 256)
+            n_fft = CONFIG.get_value('n_fft', 1024)
+            n_mels = CONFIG.get_value('n_mels', 80)
+            mel_transform = torchaudio.transforms.MelSpectrogram(sample_rate=model_sr, n_fft=n_fft, hop_length=hop_length, n_mels=n_mels)
+            logger.info(f"Final adjusted saved: {adjusted_path} (mel_len post-pad={mel_transform(waveform).shape[-1]})")
         else:
             logger.warning(f"Final save failed – use pre-pad {adjusted_path}")
 
@@ -670,6 +691,8 @@ def _save_adjusted_and_validate(waveform: torch.Tensor, adjusted_path: str, orig
     if not final_valid:
         logger.warning(f"Final path {adjusted_path} invalid – TTS may fail/artifacts")
     return adjusted_path, final_valid, final_dur
+
+
 
 # Refactored Main Method (now ~60 lines; pipeline calls)
 def check_and_update_ref(audio_path: str, exaggeration: float = 0.5, model_sr: int = MODEL_SR,
@@ -1089,7 +1112,8 @@ def is_cache_key_loaded(cache_key):
 def get_cache_stats() -> Dict[str, Any]:
     cond_stats = _cache_manager.get_cache_stats()
     audio_stats = _audio_manager.stats()
-    return {**cond_stats, **audio_stats, 'fuzzy_size': len(_fuzzy_audio_dict)}  # New: Fuzzy stat
+    fuzzy_total = sum(len(entries) for entries in _fuzzy_audio_dict.values()) if _fuzzy_audio_dict else 0  # NEW: Total entries (not stems)
+    return {**cond_stats, **audio_stats, 'fuzzy_size': fuzzy_total, 'fuzzy_stems': len(_fuzzy_audio_dict)}  # Accurate
 
 
 # Clears (merged; rooted paths)
@@ -1184,16 +1208,23 @@ def _load_voice_cache():
 
 
 def _save_voice_cache():
-    """Save _voice_cache to JSON."""
+    """Save _voice_cache to JSON; skip temp UUIDs quietly."""
     with _voice_cache_lock:
         temp_cache = {}
         for stem, info in _voice_cache.items():
             if 'fixed_path' in info:
                 abs_path = Path(info['fixed_path'])
+                # NEW: Skip temp UUIDs (long numeric; non-persistent)
+                if len(str(stem)) > 15 and str(stem).isdigit():
+                    logger.trace(f"Save skip temp UUID stem: {stem} (non-persistent)")
+                    continue
                 if abs_path.exists():
-                    rel_path = abs_path.relative_to(ROOT_DIR)
-                    temp_cache[stem] = info.copy()
-                    temp_cache[stem]['fixed_path'] = str(rel_path)  # Absolute to relative
+                    try:
+                        rel_path = abs_path.relative_to(ROOT_DIR)
+                        temp_cache[stem] = info.copy()
+                        temp_cache[stem]['fixed_path'] = str(rel_path)  # Absolute to relative
+                    except ValueError:
+                        logger.debug(f"Save: Temp path non-relative for {stem}—skipping")
                 else:
                     logger.warning(f"Save: Invalid path for {stem}—skipping")
             else:

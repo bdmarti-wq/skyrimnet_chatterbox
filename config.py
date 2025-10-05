@@ -86,6 +86,8 @@ class SkyrimNetConfig:
         'max_memory_entries': 100,  # Cache size (voices/conds in RAM; up from 50)
         'save_queue_max': 20,       # Disk save queue limit (prevents backlog)
         'fuzzy_index_size': 1000,   # Max fuzzy entries per stem (DB size)
+        'fuzzy_boost_amount': 0.15, # boost given to short word matches to increase cache hits
+        'fuzzy_threshold': 0.70,    # level of string match required to use audio cache
         'memory_cache_enable': True, # Toggle memory cache (instead of env)
         'disk_cache_enable': True,  # Toggle disk cache
         'fuzzy_enable': True,       # Toggle fuzzy audio cache

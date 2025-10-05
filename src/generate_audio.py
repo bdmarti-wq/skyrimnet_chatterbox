@@ -61,14 +61,21 @@ def try_reuse_audio(text: str, audio_prompt_path: Optional[str], exaggeration: f
         return fuzzy_path, "Fuzzy audio"
     return None
 
+
 def prepare_voice_and_conds(model, audio_prompt_path: Optional[str], cache_uuid: int, exaggeration: float,
                             language_id: str, enable_memory_cache: bool, enable_disk_cache: bool,
                             device: torch.device, dtype: torch.dtype) -> Optional[str]:
     """Helper: Process voice, validate, load/prepare conds; returns valid path or None."""
     original_path = audio_prompt_path
+    # NEW: Derive voice_stem from path (e.g., 'nwsjennavoice' from temp/nwsjennavoice.wav)
+    voice_stem = Path(audio_prompt_path).stem.replace('_fixed', '').split('_')[
+        0] if audio_prompt_path else None  # Prefix like 'nwsjenna'
+    logger.debug(f"Derived voice_stem from '{audio_prompt_path}': '{voice_stem}' (cache_uuid={cache_uuid})")
+
     if audio_prompt_path is not None:
+        # FIXED: Pass voice_stem as stem (not cache_uuid); cache_uuid for key only
         fixed_from_process = get_or_queue_voice_process(
-            audio_prompt_path, model, device, dtype, cache_uuid, exaggeration,
+            audio_prompt_path, model, device, dtype, stem=voice_stem, exaggeration=exaggeration,  # stem=voice_stem
             quiet=(not enable_memory_cache and not enable_disk_cache)
         )
         audio_prompt_path = fixed_from_process
@@ -78,38 +85,37 @@ def prepare_voice_and_conds(model, audio_prompt_path: Optional[str], cache_uuid:
             return None
 
     if audio_prompt_path:
-        valid, _ = validate_voice_path(audio_prompt_path)
-        logger.debug(f"Path after process: {audio_prompt_path}, valid: {valid}")
+        valid, _ = validate_voice_path(audio_prompt_path, stem=voice_stem)  # Pass voice_stem
+        logger.debug(f"Path after process: {audio_prompt_path}, valid: {valid}, stem: {voice_stem}")
         if not valid:
             logger.debug(f"Re-fix invalid path: {audio_prompt_path}")
-            audio_prompt_path = check_and_update_ref(audio_prompt_path, exaggeration)
+            audio_prompt_path = check_and_update_ref(audio_prompt_path, exaggeration, stem=voice_stem)
         else:
             logger.debug(f"Valid path from process: {audio_prompt_path} - no resample")
 
-        # Conds
+        # Conds (use voice_stem if no cache hit)
         cache_params = {'language_id': language_id, 'cache_uuid': cache_uuid}
         cache_key = get_cache_key(audio_prompt_path, cache_uuid, exaggeration, params=cache_params)
         conditionals_loaded = False
         if cache_key and (enable_memory_cache or enable_disk_cache):
             if load_conditionals_cache(cache_key, model, device, dtype, enable_memory_cache, enable_disk_cache):
                 conditionals_loaded = True
-                logger.info(f"Conditionals cache HIT: {cache_key[:8]}... (uuid={cache_uuid})")
+                logger.info(f"Conditionals cache HIT: {cache_key[:8]}... (stem={voice_stem}, uuid={cache_uuid})")
         if not conditionals_loaded:
-            if not conditionals_loaded:
-                with GEN_ACTIVE_LOCK:  # NEW: Lock prep vs async
-                    model.prepare_conditionals(audio_prompt_path, exaggeration=exaggeration)
-                    if dtype != torch.float32:
-                        model.conds.t3.to(device=device, dtype=dtype)
-                    if cache_key and (enable_memory_cache or enable_disk_cache):
-                        save_conditionals_cache(cache_key, model.conds, model=model, device=device, dtype=dtype,
-                                                enable_memory_cache=enable_memory_cache,
-                                                enable_disk_cache=enable_disk_cache)
-                        logger.info(f"Prepared and cached conditionals: {cache_key[:8]}...")
+            model.prepare_conditionals(audio_prompt_path, exaggeration=exaggeration)
+            if dtype != torch.float32:
+                model.conds.t3.to(device=device, dtype=dtype)
+            if cache_key and (enable_memory_cache or enable_disk_cache):
+                save_conditionals_cache(cache_key, model.conds, model=model, device=device, dtype=dtype,
+                                        enable_memory_cache=enable_memory_cache, enable_disk_cache=enable_disk_cache)
+                logger.info(
+                    f"Prepared and cached conditionals: {cache_key[:8]}... (stem={voice_stem}, uuid={cache_uuid})")
         return audio_prompt_path
     else:
         create_dummy_conds(model, device, dtype, "no_audio")
         logger.info("No audio prompt – using dummy conditionals")
         return None
+
 
 def save_and_cache_output(wav: torch.Tensor, model, audio_prompt_path: Optional[str], cache_uuid: int,
                           text: str, exaggeration: float, params: Dict[str, Any], enable_memory_cache: bool,
@@ -130,7 +136,7 @@ def save_and_cache_output(wav: torch.Tensor, model, audio_prompt_path: Optional[
 
 def generate_audio(model, text: str, audio_prompt_path: Optional[str], exaggeration: float = 0.5, cache_uuid: int = 0,
                    temperature: float = 0.8, cfgw: float = 0, min_p: float = 0.05, top_p: float = 1.0,
-                   repetition_penalty: float = 1.2, language_id: str = "en", seed_num: int = 0,
+                   repetition_penalty: float = 1.2, language_id: str = "en", seed_num: int = 42,  # DEFAULT: Fixed 42 for consistency
                    enable_memory_cache: bool = True, enable_disk_cache: bool = True) -> str:
     """
     Main orchestration: Validate, cache checks, prep, gen, post-process.
@@ -161,9 +167,11 @@ def generate_audio(model, text: str, audio_prompt_path: Optional[str], exaggerat
     logger.info(f"generate called for: \"{text}\", {stem}, uuid: {cache_uuid}, exaggeration: {exaggeration}")
     logger.info(f"Parameters - temp: {temperature}, min_p: {min_p}, top_p: {top_p}, rep_penalty: {repetition_penalty}, cfg_weight: {cfgw}")
 
-    # Seed
-    if seed_num != 0:
-        set_seed(int(seed_num))
+    # FIXED: Always set seed (default 42 if 0; ensures consistent accents)
+    if seed_num == 0:
+        seed_num = 42  # Default for reproducibility
+    set_seed(int(seed_num))
+    logger.debug(f"Set seed: {seed_num} (for consistent voices/accents)")
 
     reuse_start = perf_counter_ns()  # Time reuse check
     # Reuse check (updated helper)
@@ -176,9 +184,9 @@ def generate_audio(model, text: str, audio_prompt_path: Optional[str], exaggerat
         wav_length = wav_reused.shape[-1] / sr
         logger.info(f"{hit_type} cache HIT: \"{text[:20]}\" ({hit_type.lower()}-match) for {Path(audio_prompt_path).stem} – skipping gen (uuid={cache_uuid}; reuse: {reuse_time_ms:.2f}ms)")
         logger.info(f"Reused {hit_type.lower()} audio: {wav_length:.2f}s in ~0s")
-        # Enqueue fuzzy (low-priority enrichment on HIT; use normalized stem)
+        # Enqueue fuzzy...
         if audio_prompt_path:
-            voice_stem = Path(audio_prompt_path).stem.replace('_fixed', '').split('_')[0]  # Normalize: 'dlc1seranavoice'
+            voice_stem = Path(audio_prompt_path).stem.replace('_fixed', '').split('_')[0]
             logger.debug(f"Enqueued for fuzzy enrich (HIT): \"{text[:20]}\" (norm stem={voice_stem})")
             _fuzzy_queue.put((text, audio_reuse_path, voice_stem))
         total_time_ms = (perf_counter_ns() - func_start_time) / 1_000_000
@@ -220,6 +228,8 @@ def generate_audio(model, text: str, audio_prompt_path: Optional[str], exaggerat
 
     # Core gen (time it)
     gen_start = perf_counter_ns()
+    # NEW: Ensure seed before gen (consistent even on retry)
+    set_seed(int(seed_num))  # Re-set post-prep (safe)
     wav = _generate_audio_core(model, generate_args, t3_params)
     gen_time_s = (perf_counter_ns() - gen_start) / 1_000_000_000
     logger.debug(f"Core gen time: {gen_time_s:.2f}s")
@@ -229,7 +239,7 @@ def generate_audio(model, text: str, audio_prompt_path: Optional[str], exaggerat
     total_duration_s = (func_end_time - func_start_time) / 1_000_000_000
     wav_length = wav.shape[-1] / model.sr
     logger.info(
-        f"Generated audio: {wav_length:.2f}s {model.sr / 1000:.2f}kHz in {total_duration_s:.2f}s. Speed: {wav_length / total_duration_s:.2f}x (gen: {gen_time_s:.2f}s)")
+        f"Generated audio: {wav_length:.2f}s {model.sr / 1000:.2f}kHz in {total_duration_s:.2f}s. Speed: {wav_length / total_duration_s:.2f}x (gen: {gen_time_s:.2f}s, seed: {seed_num})")
 
     # Save/cache
     save_start = perf_counter_ns()
@@ -241,7 +251,7 @@ def generate_audio(model, text: str, audio_prompt_path: Optional[str], exaggerat
 
     # Enqueue fuzzy (only on true MISS; use normalized stem from valid_path)
     if not reuse_result and (valid_path or audio_prompt_path):
-        voice_stem = Path(valid_path or audio_prompt_path).stem.replace('_fixed', '').split('_')[0]  # Normalize: 'dlc1seranavoice'
+        voice_stem = Path(valid_path or audio_prompt_path).stem.replace('_fixed', '').split('_')[0]
         logger.debug(f"Enqueued for fuzzy index (MISS): \"{text[:20]}\" (norm stem={voice_stem})")
         _fuzzy_queue.put((text, wave_file, voice_stem))
 
@@ -254,5 +264,5 @@ def generate_audio(model, text: str, audio_prompt_path: Optional[str], exaggerat
     del wav
     torch.cuda.empty_cache()
     total_time_ms = (perf_counter_ns() - func_start_time) / 1_000_000
-    logger.info(f"Full MISS cycle: {total_time_ms / 1000:.2f}s (reuse: {reuse_time_ms:.0f}ms, prep: {prep_time_ms:.0f}ms, gen: {gen_time_s:.2f}s, save: {save_time_ms:.0f}ms)")
+    logger.info(f"Full MISS cycle: {total_time_ms / 1000:.2f}s (reuse: {reuse_time_ms:.0f}ms, prep: {prep_time_ms:.0f}ms, gen: {gen_time_s:.2f}s, save: {save_time_ms:.0f}ms, seed: {seed_num})")
     return wave_file
