@@ -1,5 +1,7 @@
 # src/generate_audio.py
 import logging
+import threading
+
 from pathlib import Path
 import torch
 from time import perf_counter_ns
@@ -13,6 +15,7 @@ from .cache import (
 )
 
 logger = logging.getLogger(__name__)
+GEN_ACTIVE_LOCK = threading.RLock()  # Global for gen/prepare
 
 def set_seed(seed: int):
     """
@@ -23,23 +26,24 @@ def set_seed(seed: int):
 
 def _generate_audio_core(model, generate_args: Dict[str, Any], t3_params: Dict[str, Any]) -> torch.Tensor:
     """Core: Just model.generate + graph retry. Returns wav; no del/cleanup."""
-    wav = None
-    try:
-        wav = model.generate(**generate_args)
-    except RuntimeError as graph_e:
-        if "graph" in str(graph_e).lower() or "capture" in str(graph_e).lower():
-            logger.warning(f"Graph corrupt: {graph_e} – resetting t3 graphs and retrying")
-            if hasattr(model, 't3') and hasattr(model.t3, '_bucket_graphs'):
-                model.t3._bucket_graphs.clear()
-                torch.cuda.empty_cache()
-            t3_params_temp = t3_params.copy()
-            t3_params_temp['generate_token_backend'] = 'eager'
-            generate_args_temp = generate_args.copy()
-            generate_args_temp['t3_params'] = t3_params_temp
-            wav = model.generate(**generate_args_temp)
-        else:
-            raise
-    return wav  # No del—caller handles post-use
+    with GEN_ACTIVE_LOCK:  # NEW: Serialize vs async prepare (prevent graph race)
+        wav = None
+        try:
+            wav = model.generate(**generate_args)
+        except RuntimeError as graph_e:
+            if "graph" in str(graph_e).lower() or "capture" in str(graph_e).lower() or "offset" in str(graph_e).lower():
+                logger.warning(f"Graph corrupt: {graph_e} – resetting t3 graphs and retrying")
+                if hasattr(model, 't3') and hasattr(model.t3, '_bucket_graphs'):
+                    model.t3._bucket_graphs.clear()
+                    torch.cuda.empty_cache()
+                t3_params_temp = t3_params.copy()
+                t3_params_temp['generate_token_backend'] = 'eager'  # Force eager on retry
+                generate_args_temp = generate_args.copy()
+                generate_args_temp['t3_params'] = t3_params_temp
+                wav = model.generate(**generate_args_temp)
+            else:
+                raise
+        return wav
 
 def try_reuse_audio(text: str, audio_prompt_path: Optional[str], exaggeration: float, params: Dict[str, Any]) -> Optional[Tuple[str, str]]:
     """Try exact then fuzzy; return (path, hit_type) or None. Handles None path.
@@ -91,13 +95,16 @@ def prepare_voice_and_conds(model, audio_prompt_path: Optional[str], cache_uuid:
                 conditionals_loaded = True
                 logger.info(f"Conditionals cache HIT: {cache_key[:8]}... (uuid={cache_uuid})")
         if not conditionals_loaded:
-            model.prepare_conditionals(audio_prompt_path, exaggeration=exaggeration)
-            if dtype != torch.float32:
-                model.conds.t3.to(device=device, dtype=dtype)  # Explicit device too (safe)
-            if cache_key and (enable_memory_cache or enable_disk_cache):
-                save_conditionals_cache(cache_key, model.conds, model=model, device=device, dtype=dtype,
-                                        enable_memory_cache=enable_memory_cache, enable_disk_cache=enable_disk_cache)
-                logger.info(f"Prepared and cached conditionals: {cache_key[:8]}... (uuid={cache_uuid})")
+            if not conditionals_loaded:
+                with GEN_ACTIVE_LOCK:  # NEW: Lock prep vs async
+                    model.prepare_conditionals(audio_prompt_path, exaggeration=exaggeration)
+                    if dtype != torch.float32:
+                        model.conds.t3.to(device=device, dtype=dtype)
+                    if cache_key and (enable_memory_cache or enable_disk_cache):
+                        save_conditionals_cache(cache_key, model.conds, model=model, device=device, dtype=dtype,
+                                                enable_memory_cache=enable_memory_cache,
+                                                enable_disk_cache=enable_disk_cache)
+                        logger.info(f"Prepared and cached conditionals: {cache_key[:8]}...")
         return audio_prompt_path
     else:
         create_dummy_conds(model, device, dtype, "no_audio")

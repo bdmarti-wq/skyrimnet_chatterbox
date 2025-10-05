@@ -49,6 +49,7 @@ class SkyrimNetConfig:
         'trim_threshold_db': -28,
         'fade_ms': 20,
         'n_fft': 2048,  # New: For mel/STFT (alt)
+        'n_mels': 80,
         'hop_length': 256,  # New: For mel/step (alt)
         'ebu_post_gain_db': 0,
         'ebu_true_peak': 0,

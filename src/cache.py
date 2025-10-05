@@ -1,9 +1,5 @@
 """
-Merged Cache utilities for SkyrimNet TTS conditionals (memory/disk caching).
-Supports serialization (raw torch + T3Cond fallback). Integrates with original globals.
-Hybrid: Simple globals + Manager classes (threaded disk saves).
-Init loads existing .pt; async saves; audio manager with eviction.
-Fallback to no-cache if disabled.
+skyrimnet_chatterbox.py
 """
 
 import os
@@ -577,136 +573,141 @@ def validate_voice_path(audio_path: str, stem: str = None, force_refresh: bool =
 
 
 
-def check_and_update_ref(audio_path: str, exaggeration: float = 0.5, model_sr: int = MODEL_SR,
-                         out_path: Optional[Path] = None, enable_pre_adjustment: bool = None, stem: str = None) -> str:
-    """Validate/resample + optional pad align for short refs; return validated path.
-    enable_pre_adjustment: From CONFIG or kwarg (default False; True for pad).
-    Trust load SR over initial info; resample if load != model_sr. Force validate refresh post-load."""
-    enable_pre_adjustment = (
-        enable_pre_adjustment if enable_pre_adjustment is not None else getattr(CONFIG, 'enable_pre_adjustment', False))
-
-    original_path = audio_path  # Always track for fallback
-
-    # Initial validate (no force)
-    validated, duration = validate_voice_path(original_path, stem=stem)
-    initial_sr = None
-    if info_tuple := _get_audio_info_robust(original_path):  # Fresh for diag
-        initial_sr = info_tuple[0]
-    if not validated:
-        logger.warning(f"Initial validate failed for {original_path} (info SR={initial_sr or 'unknown'}Hz) – load to confirm")
-
-    if validated and not enable_pre_adjustment:
-        logger.debug(f"Initial valid {original_path} (no adjustment needed)")
-        return original_path
-
-    # Load/resample/mono
+# New Helper: Load and mono (extracted; testable: path → (waveform, sr) or error)
+def _load_and_mono(audio_path: str) -> tuple[torch.Tensor, int] | None:
+    """Load waveform, force mono; return (waveform, sr) or None on fail."""
     try:
-        waveform, load_sr = torchaudio.load(original_path)
-        logger.debug(f"Loaded {original_path}: load SR={load_sr}Hz, shape={waveform.shape} (initial info SR={initial_sr})")
-
-        # SR discrepancy check
-        if initial_sr and initial_sr != load_sr:
-            logger.warning(f"SR discrepancy in {original_path}: info={initial_sr}Hz vs load={load_sr}Hz – use load for decisions")
-
-        # Force mono
+        waveform, load_sr = torchaudio.load(audio_path)
+        logger.debug(f"Loaded {audio_path}: load SR={load_sr}Hz, shape={waveform.shape}")
         if waveform.shape[0] > 1:
             waveform = torch.mean(waveform, dim=0, keepdim=True)
             logger.debug(f"Converted to mono: {waveform.shape}")
-
-        adjusted_path = original_path
-        resampled_path = None
-
-        # Resample if load SR != model_sr
-        if load_sr != model_sr:
-            logger.info(f"Resampling {original_path} to {model_sr}Hz (load={load_sr}Hz)")
-            resampler = torchaudio.transforms.Resample(load_sr, model_sr)
-            waveform = resampler(waveform)
-            resampled_stem = Path(original_path).stem + '_resampled'
-            resampled_path = str(Path(original_path).parent / f"{resampled_stem}.wav")
-            with warnings.catch_warnings():
-                warnings.filterwarnings("ignore")
-                torchaudio.save(resampled_path, waveform, model_sr, encoding="PCM_S")
-            if Path(resampled_path).exists() and Path(resampled_path).stat().st_size > 0:
-                adjusted_path = resampled_path
-                logger.info(f"Resampled saved: {adjusted_path} (dur={int(waveform.shape[-1]) / model_sr:.2f}s)")
-            else:
-                logger.error(f"Resample save failed – fallback original")
-                adjusted_path = original_path
-        else:
-            logger.debug(f"No resample: load SR={load_sr}Hz matches {model_sr}Hz")
-
         if waveform.numel() == 0:
-            logger.error(f"Empty waveform after process for {adjusted_path}")
-            return original_path
-
-        # Pad/align if enabled or resampled
-        padded = False
-        if enable_pre_adjustment or adjusted_path != original_path:
-            hop_length = getattr(CONFIG, 'hop_length', 256)
-            n_fft = getattr(CONFIG, 'n_fft', 1024)
-            audio_samples = int(waveform.shape[-1])
-            estimated_tokens = (audio_samples // hop_length) * 1.5  # Conservative
-            expected_samples = int(estimated_tokens * hop_length)
-
-            mel_transform = torchaudio.transforms.MelSpectrogram(
-                sample_rate=model_sr, n_fft=n_fft, hop_length=hop_length, n_mels=80
-            )
-            mel = mel_transform(waveform)
-            actual_mel_len = mel.shape[-1]
-            logger.info(f"Mel check for {adjusted_path}: actual={actual_mel_len}, est_tokens={estimated_tokens}")
-
-            if actual_mel_len < estimated_tokens:
-                pad_samples = expected_samples - audio_samples
-                left_pad = pad_samples // 2
-                right_pad = pad_samples - left_pad
-                waveform = torch.nn.functional.pad(waveform, (left_pad, right_pad), mode='reflect')
-                padded = True
-                logger.info(f"Padded: {audio_samples / model_sr:.2f}s → {int(waveform.shape[-1]) / model_sr:.2f}s")
-
-            # Save padded/aligned
-            if padded or adjusted_path != original_path:
-                orig_stem = Path(original_path).stem
-                suffix = '' if orig_stem.endswith(('_resampled', '_padded')) else ('_padded' if padded else '_resampled')
-                if suffix:
-                    final_stem = orig_stem + suffix if not orig_stem.endswith(('_resampled', '_padded')) else orig_stem.replace(
-                        Path(orig_stem).suffix.split('_')[-1], suffix.split('_')[-1])
-                else:
-                    final_stem = orig_stem
-                aligned_out = out_path or voices_dir / f"{final_stem}.wav"
-                aligned_out.parent.mkdir(parents=True, exist_ok=True)
-                with warnings.catch_warnings():
-                    warnings.filterwarnings("ignore")
-                    torchaudio.save(str(aligned_out), waveform, model_sr, encoding="PCM_S")
-                if aligned_out.exists() and aligned_out.stat().st_size > 0:
-                    adjusted_path = str(aligned_out)
-                    logger.info(f"Final adjusted saved: {adjusted_path} (mel_len post-pad={mel_transform(waveform).shape[-1]})")
-                else:
-                    logger.warning(f"Final save failed – use pre-pad {adjusted_path}")
-
-        # Final validate with force_refresh (to clear any stale cache)
-        final_valid, final_dur = validate_voice_path(adjusted_path, stem=stem, force_refresh=True)
-        if not final_valid:
-            post_sr = (_get_audio_info_robust(adjusted_path) or (None,))[0] or 'unknown'
-            logger.error(f"Final validate failed for {adjusted_path} (SR={post_sr}Hz) – fallback original")
-            adjusted_path = original_path
-            # Re-validate fallback
-            final_valid, final_dur = validate_voice_path(original_path, stem=stem, force_refresh=True)
-        else:
-            logger.info(f"Final valid: {adjusted_path} (dur={final_dur:.2f}s)")
-
-        # Dedup
-        final_stem = Path(adjusted_path).stem
-        if final_stem.endswith(('_fixed', '_padded', '_resampled')):
-            logger.debug(f"Deduped: {adjusted_path}")
-
-        if not final_valid:
-            logger.warning(f"Final path {adjusted_path} invalid – TTS may fail/artifacts")
-        return adjusted_path
-
+            logger.error(f"Empty waveform for {audio_path}")
+            return None
+        return waveform, load_sr
     except Exception as e:
-        logger.error(f"Ref process failed for {original_path}: {e} – fallback original")
-        return original_path
+        logger.error(f"Load/mono failed for {audio_path}: {e}")
+        return None
 
+# New Helper: Resample if needed (extracted; testable: waveform/sr → new_waveform/path or orig)
+def _resample_if_needed(waveform: torch.Tensor, load_sr: int, model_sr: int, audio_path: str) -> tuple[torch.Tensor, str]:
+    """Resample if SR mismatch; save temp, return (new_waveform, path)."""
+    adjusted_path = audio_path
+    if load_sr != model_sr:
+        logger.info(f"Resampling {audio_path} to {model_sr}Hz (load={load_sr}Hz)")
+        resampler = torchaudio.transforms.Resample(load_sr, model_sr)
+        waveform = resampler(waveform)
+        resampled_stem = Path(audio_path).stem + '_resampled'
+        resampled_path = str(Path(audio_path).parent / f"{resampled_stem}.wav")
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            torchaudio.save(resampled_path, waveform, model_sr, encoding="PCM_S")
+        if Path(resampled_path).exists() and Path(resampled_path).stat().st_size > 0:
+            adjusted_path = resampled_path
+            logger.info(f"Resampled saved: {adjusted_path} (dur={int(waveform.shape[-1]) / model_sr:.2f}s)")
+        else:
+            logger.error(f"Resample save failed – fallback original")
+    else:
+        logger.debug(f"No resample: load SR={load_sr}Hz matches {model_sr}Hz")
+    return waveform, adjusted_path
+
+# New Helper: Pad if needed (extracted; testable: waveform/path → padded_waveform/bool)
+def _pad_if_needed(waveform: torch.Tensor, adjusted_path: str, model_sr: int, enable_pre_adjustment: bool) -> tuple[torch.Tensor, bool]:
+    """Pad/align if short or enabled; return (padded_waveform, padded)."""
+    padded = False
+    if enable_pre_adjustment:
+        hop_length = CONFIG.get_value('hop_length', 256)
+        n_fft = CONFIG.get_value('n_fft', 1024)
+        audio_samples = int(waveform.shape[-1])
+        estimated_tokens = (audio_samples // hop_length) * 1.5
+        expected_samples = int(estimated_tokens * hop_length)
+
+        mel_transform = torchaudio.transforms.MelSpectrogram(sample_rate=model_sr, n_fft=n_fft, hop_length=hop_length, n_mels=80)
+        mel = mel_transform(waveform)
+        actual_mel_len = mel.shape[-1]
+        logger.info(f"Mel check for {adjusted_path}: actual={actual_mel_len}, est_tokens={estimated_tokens}")
+
+        if actual_mel_len < estimated_tokens:
+            pad_samples = expected_samples - audio_samples
+            left_pad = pad_samples // 2
+            right_pad = pad_samples - left_pad
+            waveform = torch.nn.functional.pad(waveform, (left_pad, right_pad), mode='reflect')
+            padded = True
+            logger.info(f"Padded: {audio_samples / model_sr:.2f}s → {int(waveform.shape[-1]) / model_sr:.2f}s")
+    return waveform, padded
+
+# New Helper: Save adjusted and validate (extracted; testable: waveform/path/stem → final_path/valid)
+def _save_adjusted_and_validate(waveform: torch.Tensor, adjusted_path: str, original_path: str, model_sr: int, stem: str | None, out_path: Optional[Path], enable_pre_adjustment: bool, exaggeration: float) -> tuple[str, bool, Optional[float]]:
+    """Save padded/resampled; force validate; return (final_path, valid, dur). Fallback if fail."""
+    padded = enable_pre_adjustment  # Assume if here
+    if padded:
+        orig_stem = Path(original_path).stem
+        suffix = '_padded' if '_resampled' not in orig_stem else ''  # Dedup logic simplified
+        final_stem = orig_stem + suffix if not orig_stem.endswith(('_padded', '_resampled')) else orig_stem.replace('_resampled', '_padded')
+        aligned_out = out_path or voices_dir / f"{final_stem}.wav"
+        aligned_out.parent.mkdir(parents=True, exist_ok=True)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            torchaudio.save(str(aligned_out), waveform, model_sr, encoding="PCM_S")
+        if aligned_out.exists() and aligned_out.stat().st_size > 0:
+            adjusted_path = str(aligned_out)
+            logger.info(f"Final adjusted saved: {adjusted_path} (mel_len post-pad={torchaudio.transforms.MelSpectrogram(sample_rate=model_sr, n_fft=1024, hop_length=256, n_mels=80)(waveform).shape[-1]})")
+        else:
+            logger.warning(f"Final save failed – use pre-pad {adjusted_path}")
+
+    # Final validate (force refresh)
+    final_valid, final_dur = validate_voice_path(adjusted_path, stem=stem, force_refresh=True)
+    if not final_valid:
+        post_sr = _get_audio_info_robust(adjusted_path)[0] if _get_audio_info_robust(adjusted_path) else 'unknown'
+        logger.error(f"Final validate failed for {adjusted_path} (SR={post_sr}Hz) – fallback original")
+        adjusted_path = original_path
+        final_valid, final_dur = validate_voice_path(original_path, stem=stem, force_refresh=True)
+    else:
+        logger.info(f"Final valid: {adjusted_path} (dur={final_dur:.2f}s)")
+        if Path(adjusted_path).stem.endswith(('_fixed', '_padded', '_resampled')):
+            logger.debug(f"Deduped: {adjusted_path}")
+    if not final_valid:
+        logger.warning(f"Final path {adjusted_path} invalid – TTS may fail/artifacts")
+    return adjusted_path, final_valid, final_dur
+
+# Refactored Main Method (now ~60 lines; pipeline calls)
+def check_and_update_ref(audio_path: str, exaggeration: float = 0.5, model_sr: int = MODEL_SR,
+                         out_path: Optional[Path] = None, enable_pre_adjustment: bool = None, stem: str | None = None) -> str:
+    """Pipeline: Load/mono → resample? → pad? → save/validate. Returns validated path."""
+    enable_pre_adjustment = enable_pre_adjustment or CONFIG.get_value('enable_pre_adjustment', False)
+    stem = _normalize_stem(audio_path, stem) if stem else None  # Shared
+
+    original_path = audio_path
+
+    # Initial validate (no force)
+    validated, _ = validate_voice_path(original_path, stem=stem)
+    if info := _get_audio_info_robust(original_path):
+        initial_sr = info[0]
+    if validated and not enable_pre_adjustment:
+        logger.debug(f"Initial valid {original_path} (no adjustment needed)")
+        return original_path
+    if not validated:
+        logger.warning(f"Initial validate failed for {original_path} (info SR={initial_sr or 'unknown'}Hz) – load to confirm")
+
+    # Pipeline
+    load_result = _load_and_mono(original_path)
+    if not load_result:
+        logger.error(f"Ref process failed for {original_path} – fallback original")
+        return original_path
+    waveform, load_sr = load_result
+
+    # Resample if needed
+    waveform, adjusted_path = _resample_if_needed(waveform, load_sr, model_sr, original_path)
+
+    # Pad if needed
+    waveform, padded = _pad_if_needed(waveform, adjusted_path, model_sr, enable_pre_adjustment or adjusted_path != original_path)
+
+    # Save and final validate
+    final_path, final_valid, final_dur = _save_adjusted_and_validate(
+        waveform, adjusted_path, original_path, model_sr, stem, out_path, padded, exaggeration
+    )
+    return final_path if final_valid else original_path  # Fallback if invalid
 
 
 def try_audio_cache(audio_path: str, text: str, exaggeration: float = 0.5, params: Dict = None) -> Optional[str]:
@@ -778,28 +779,244 @@ def _compute_file_hash(file_path: str, method='hybrid', stem: str = None) -> str
         return ""
 
 
+# New Helper: Shared stem normalization (extracted from multiple places; testable: input path → expected stem)
+def _normalize_stem(audio_path: str, provided_stem: str | None = None, min_len: int = 3) -> str:
+    """Derive/clean stem from path or provided; handles temps/UUIDs. Returns str >= min_len or fallback."""
+    if provided_stem is not None and isinstance(provided_stem, (int, float)):
+        provided_stem = str(provided_stem)  # Handle old int calls
+
+    if provided_stem and len(str(provided_stem)) >= min_len:
+        # Clean if provided (remove suffixes)
+        stem = str(provided_stem).replace('_fixed', '').replace('_padded', '').replace('_resampled', '').replace(
+            '_ui_resampled', '')
+        if len(stem) >= min_len:
+            return stem
+        logger.debug(f"Provided stem '{provided_stem}' too short/invalid → derive from path")
+
+    if not audio_path:
+        raise ValueError("No audio_path for stem derivation")
+
+    basename = Path(audio_path).stem
+    # Regex extract voice before UUID/temp (e.g., 'vp_11_lilia_123hex' → 'vp_11_lilia')
+    match = re.match(r'([a-zA-Z0-9_]+[voice]?)(_?[0-9a-f]{15,})?$', basename)
+    stem = match.group(1) if match else basename.replace('_fixed', '').replace('_padded', '').replace('_resampled',
+                                                                                                      '').replace(
+        '_ui_resampled', '').replace('_temp', '')
+    if len(stem) < min_len:
+        stem = basename  # Fallback to full
+    logger.trace(f"Normalized stem for '{basename}': '{stem}'")
+    return stem
 
 
+# New Helper: Quick cache path validation (extracted; testable: stem/path → quick_reuse bool + info)
+def _quick_cache_validate(stem: str, cached_path: str, quiet: bool = False) -> tuple[bool, Optional[tuple]]:
+    """Check if cached path exists + SR/channels match; return (quick_reuse, info)."""
+    if not cached_path or not Path(cached_path).exists():
+        return False, None
+    info = _get_or_cache_audio_info(stem=stem, audio_path=cached_path)
+    if info and info[0] == MODEL_SR and info[1] == 1:
+        if not quiet:
+            logger.debug(f"Cached path valid for {stem} (SR={MODEL_SR}Hz)—immediate reuse")
+        return True, info
+    logger.warning(f"Cached path invalid for {stem}, SR={info[0] if info else 'unknown'}Hz – sync fix")
+    return False, info
 
-# Patched get_or_queue_voice_process (non-blocking reuse + async verify/update; robust info; dedup)
-# Patched get_or_queue_voice_process (non-blocking reuse + async verify/update; robust info; dedup)
-# Fixes: Light pre-probe to skip sync refresh if upload SR matches; pass model to async save; consistent globals
-def get_or_queue_voice_process(audio_path: str, model, device, dtype, stem: str | None = None, exaggeration: float = 0.5, quiet=False) -> str:
-    # Ensure stem is str (handle int from old calls; e.g., UUID id like 123)
-    if stem is not None and not isinstance(stem, str):
-        stem = str(stem)
 
-    # Derive/clean stem (handle UI temps with UUID-like stems, e.g., "747091233726058195" → try extract voice)
-    if stem is None or len(stem) > 15 or re.match(r'^[0-9a-f]{32,}$', stem):  # Temp UUID-like (now str)
-        basename = Path(audio_path).stem
-        match = re.match(r'([a-zA-Z0-9_]+[voice]?)(_?[0-9a-f]{32,})?$', basename)  # Extract "vayne_csvp_voice" before UUID
-        stem = match.group(1) if match else Path(basename.replace('_ui_resampled', '').replace('_temp', '')).stem.replace('_fixed', '').replace('_padded', '').replace('_resampled', '')  # Fallback clean
-        logger.debug(f"Derived stem for temp/audio_path '{basename}': '{stem}'")
+# New Helper: Light SR probe for upload (extracted/shared; testable: path → SR or None)
+def _probe_upload_sr(audio_path: str, quiet: bool = False) -> Optional[int]:
+    """Quick SR probe (header/info; ~1ms). Logs if mismatch."""
+    try:
+        info = _get_audio_info_robust(audio_path)
+        sr = info[0] if info else None
+        if sr == MODEL_SR:
+            if not quiet:
+                logger.trace(f"Upload SR match for {Path(audio_path).stem} ({MODEL_SR}Hz)")
+        else:
+            logger.debug(f"Upload SR {sr}Hz vs expected {MODEL_SR}Hz")
+        return sr
+    except Exception as e:
+        logger.trace(f"SR probe failed for {audio_path}: {e}")
+        return None
+
+
+# New Helper: Orig metadata compute (for dedup same server files; testable: path → (hash, sr))
+def _compute_orig_metadata(audio_path: str) -> tuple[str, Optional[int]]:
+    """Full MD5 hash + SR of raw upload (ignores local mods like resample). ~0.01s."""
+    if not Path(audio_path).exists():
+        return "", None
+    orig_hash = _compute_file_hash(audio_path, method='full')  # Full MD5
+    orig_sr = _probe_upload_sr(audio_path, quiet=True)
+    return orig_hash, orig_sr
+
+
+# New Helper: Orig match check (for async/same source skip; testable: upload + cached → bool + msg)
+def _is_same_server_file(upload_path: str, cached: dict) -> tuple[bool, str]:
+    """Check if upload is same source (raw hash/SR match cached orig). Return (match, msg)."""
+    cached_orig_hash = cached.get('orig_hash', '')
+    cached_orig_sr = cached.get('orig_sr')
+    upload_hash, upload_sr = _compute_orig_metadata(upload_path)
+
+    if upload_hash == cached_orig_hash:
+        if upload_sr == cached_orig_sr:
+            return True, "Identical server file (hash/SR match) – skip"
+        else:
+            return True, f"SR var for same server file (hash match, SR {upload_sr} vs {cached_orig_sr}) – keep cached 24kHz"
+    return False, f"Different file (hash {upload_hash[:8]} vs {cached_orig_hash[:8]}) – update"
+
+
+# New Helper: Sync fix handler (extracted; testable: path/stem → updated path + cache update)
+def _handle_sync_fix(audio_path: str, stem: str, exaggeration: float, model, device, dtype, cached: dict,
+                     cached_conds_key: str, quiet: bool = False) -> str:
+    """Perform sync refix + cache update (first-time/invalid). Returns fixed path."""
+    fallback_path = check_and_update_ref(audio_path, exaggeration, stem=stem)
+    if not fallback_path or not Path(fallback_path).exists():
+        logger.error(f"Sync fix failed for {stem}—fallback upload (risky)")
+        fallback_path = audio_path
+    # Update cache (main thread)
+    with _voice_cache_lock:
+        _voice_cache[stem] = {**cached, 'fixed_path': fallback_path, 'last_bg_time': time.time()}
+        # Add orig metadata for future dedup
+        orig_hash, orig_sr = _compute_orig_metadata(audio_path)
+        _voice_cache[stem].update({'orig_hash': orig_hash, 'orig_sr': orig_sr})
+    # Save only if persistent
+    if ROOT_DIR in Path(fallback_path).parents or voices_dir in Path(fallback_path).parents:
+        _save_voice_cache()
+        logger.debug(f"Updated voice cache post-sync: {stem}")
     else:
-        stem = stem.replace('_fixed', '').replace('_padded', '').replace('_resampled', '').replace('_ui_resampled', '')  # Clean if passed
-        if len(stem) < 3:  # Still invalid → derive from path
-            stem = Path(audio_path).stem.replace('_fixed', '').replace('_padded', '').replace('_resampled', '').replace('_ui_resampled', '')
-            logger.debug(f"Fallback stem derivation: '{stem}' from '{audio_path}'")
+        logger.debug(f"Skipped voice cache save for temp: {fallback_path} (stem: {stem})")
+    logger.info(f"Sync fixed/updated for {stem}: {fallback_path}")
+    # Load conds if available
+    if cached_conds_key:
+        _cache_manager.load(cached_conds_key, model, device, dtype, quiet=quiet)
+    # Update info cache post-fix (reduces future invalidations)
+    with _voice_info_lock:
+        new_info = _get_audio_info_robust(fallback_path)
+        if new_info:
+            _voice_info_cache[stem] = new_info
+    return fallback_path
+
+
+# New Helper: Reuse + conds load (extracted; testable: cached_key/path → conds loaded)
+def _handle_reuse_and_load_conds(cached_conds_key: str, cached_path: str, model, device, dtype, stem: str,
+                                 quiet: bool = False) -> None:
+    """Load conds from key; log reuse."""
+    if cached_conds_key:
+        conds = _cache_manager.load(cached_conds_key, model, device, dtype, quiet=quiet)
+        if conds and not quiet:
+            logger.info(f"Reused cached conds for {stem}")
+    if not quiet:
+        logger.info(f"Cached reuse for {stem}: {cached_path}")
+
+
+# Extracted Async Function (now outer; testable via mock Thread)
+def _async_verify_update(audio_path: str, stem: str, cached: dict, cached_path: str, exaggeration: float, model, device,
+                         dtype, quick_reuse: bool) -> None:
+    from src.generate_audio import GEN_ACTIVE_LOCK
+    """Async verify/update logic (extracted for testing; logs time)."""
+    start_time = time.time()
+    if not Path(audio_path).exists() or not quick_reuse:
+        return
+    needs_update = False
+    try:
+        # Orig check first (new dedup)
+        is_same, msg = _is_same_server_file(audio_path, cached)
+        if is_same:
+            logger.debug(f"Async skip for {stem}: {msg}")
+            return  # Skip all processing
+
+        # Fallback: Current quick compares
+        if Path(audio_path).stat().st_size != Path(cached_path).stat().st_size:
+            logger.debug(
+                f"Size differ for {stem} (upload={Path(audio_path).stat().st_size} vs cached={Path(cached_path).stat().st_size}) – async fix")
+            needs_update = True
+        else:
+            sr_u = _probe_upload_sr(audio_path, quiet=True)
+            sr_c = _get_or_cache_audio_info(stem=stem, audio_path=cached_path)[0]
+            if sr_u != sr_c:
+                logger.debug(f"SR differ for {stem} ({sr_u or 'unknown'}Hz vs {sr_c or 'unknown'}Hz) – async fix")
+                needs_update = True
+            else:
+                # Partial hash (1MB)
+                h_u = hashlib.md5(open(audio_path, 'rb').read(1024 * 1024) or b'')
+                h_c = hashlib.md5(open(cached_path, 'rb').read(1024 * 1024) or b'')
+                needs_update = (h_u.hexdigest() != h_c.hexdigest())
+                if needs_update:
+                    logger.debug(f"Partial hash differ for {stem} – async fix")
+                else:
+                    logger.trace(f"Quick verify complete for {stem}: Identical upload – no update")
+                    return
+
+        if needs_update:
+            new_fixed_path = voices_dir / f"{stem}_fixed_new.wav"
+            fixed_path = check_and_update_ref(audio_path, exaggeration, out_path=new_fixed_path, stem=stem)
+            if fixed_path and Path(fixed_path).exists():
+                valid_new, _ = validate_voice_path(fixed_path, stem=stem, force_refresh=True)
+                if valid_new:
+                    # Atomic swap
+                    with _voice_cache_lock:
+                        new_hash = _compute_file_hash(fixed_path, method='hybrid', stem=stem)
+                        _voice_cache[stem] = {**cached, 'fixed_path': fixed_path, 'file_hash': new_hash,
+                                              'last_bg_time': time.time()}
+                        # Update orig (from current upload)
+                        orig_hash, orig_sr = _compute_orig_metadata(audio_path)
+                        _voice_cache[stem].update({'orig_hash': orig_hash, 'orig_sr': orig_sr})
+                        # Save if persistent
+                        if voices_dir in Path(fixed_path).parents:
+                            _save_voice_cache()
+                    if fixed_path != cached_path and Path(cached_path).exists():
+                        Path(cached_path).unlink(missing_ok=True)
+                        logger.info(f"Async updated {stem}: {fixed_path} (old: {cached_path})")
+                    # Conds update (defer if graphs)
+                    # Async conds update if possible (defer if graphs or gen active)
+                    if hasattr(model, 't3') and len(model.t3._bucket_graphs) > 0:
+                        logger.debug(f"Async defer conds for {stem}: Graphs active")
+                    elif GEN_ACTIVE_LOCK.acquire(blocking=False):  # NEW: Try-acquire (non-block); defer if gen ongoing
+                        logger.debug(f"Async defer conds for {stem}: Gen active")
+                        GEN_ACTIVE_LOCK.release()  # Release immediately
+                    else:
+                        # Safe to prepare (no gen/graphs)
+                        orig_backend = getattr(model.t3, 'generate_token_backend', None) if hasattr(model,
+                                                                                                    't3') else None
+                        if hasattr(model.t3, 'generate_token_backend'):
+                            model.t3.generate_token_backend = 'eager'  # NEW: Force eager in async (no graph capture)
+                        try:
+                            with MODEL_LOCK:
+                                model.prepare_conditionals(fixed_path, exaggeration=exaggeration)
+                                new_conds_key = get_cache_key(fixed_path, uuid=stem, exaggeration=exaggeration)
+                                _cache_manager.save(new_conds_key, model.conds, model=model, device=device, dtype=dtype)
+                                with _voice_cache_lock:
+                                    _voice_cache[stem]['conds_key'] = new_conds_key
+                                logger.info(f"Async conds updated for {stem}: {new_conds_key[:8]}")
+                        except Exception as conds_e:
+                            logger.warning(f"Async conds failed for {stem}: {conds_e} – path updated only")
+                        finally:
+                            if orig_backend:
+                                model.t3.generate_token_backend = orig_backend
+                            torch.cuda.empty_cache()
+                        if hasattr(model, 'set_conditionals'):
+                            model.set_conditionals(None)  # Clear after
+                    # Update info cache
+                    with _voice_info_lock:
+                        _voice_info_cache[stem] = _get_audio_info_robust(fixed_path)
+                else:
+                    logger.warning(f"Async fix invalid for {stem} – keep old {cached_path}")
+                    if Path(fixed_path).exists():
+                        Path(fixed_path).unlink()
+            else:
+                logger.warning(f"Async fix failed for {stem} – keep old {cached_path}")
+        else:
+            logger.trace(f"Async verify: No update needed for {stem}")
+    except Exception as e:
+        logger.error(f"Async verify/update failed for {stem}: {e}")
+    async_time = time.time() - start_time
+    logger.debug(f"Async verify for {stem} took {async_time:.3f}s")
+
+
+# Refactored Main Method (now ~80 lines; calls helpers)
+def get_or_queue_voice_process(audio_path: str, model, device, dtype, stem: str | None = None,
+                               exaggeration: float = 0.5, quiet=False) -> str:
+    """Main: Derive stem, check cache, sync/async fix if needed. Returns fixed path (immediate reuse)."""
+    stem = _normalize_stem(audio_path, stem)  # Shared derivation
 
     with _voice_cache_lock:
         cached = _voice_cache.get(stem, {})
@@ -808,185 +1025,45 @@ def get_or_queue_voice_process(audio_path: str, model, device, dtype, stem: str 
         cached_conds_key = cached.get('conds_key', '')
         last_bg = cached.get('last_bg_time', 0)
 
-    # Quick validate cached (assume good if exists/valid SR)
-    quick_reuse = False
-    if cached_path and Path(cached_path).exists():
-        cached_info = _get_or_cache_audio_info(stem=stem, audio_path=cached_path)  # Header SR check
-        if cached_info and cached_info[0] == MODEL_SR and cached_info[1] == 1:  # 24kHz mono
-            quick_reuse = True
-            if not quiet:
-                logger.debug(f"Cached path valid for {stem} (SR={MODEL_SR}Hz)—immediate reuse")
-        else:
-            logger.warning(f"Cached path invalid for {stem}, SR={cached_info[0] if cached_info else 'unknown'}Hz – sync fix")
+    quick_reuse, _ = _quick_cache_validate(stem, cached_path, quiet)  # Isolated validate
 
-    # Light pre-probe upload SR (non-blocking; skip full refresh if match – reduces gen stall)
+    # Pre-probe upload SR (light; shared)
     upload_sr_match = False
     if quick_reuse and Path(audio_path).exists():
-        try:
-            u_info = _get_audio_info_robust(audio_path)
-            upload_sr = u_info[0] if u_info else None
-            if upload_sr == MODEL_SR:
-                upload_sr_match = True
-                logger.trace(f"Upload SR match for {stem} ({MODEL_SR}Hz) – full reuse, skip refresh")
-            else:
-                logger.debug(f"Upload SR {upload_sr}Hz vs cached {MODEL_SR}Hz – async will fix")
-        except Exception as probe_e:
-            logger.trace(f"Pre-probe failed for {stem}: {probe_e} – use cached (async checks)")
+        sr = _probe_upload_sr(audio_path, quiet)
+        upload_sr_match = (sr == MODEL_SR)
 
-    # Early out if recent BG and cached reuse possible
-    if time.time() - last_bg < 30 and quick_reuse:
+    # Early out: Recent BG + reuse → skip all
+    throttle_sec = CONFIG.get_value('async_throttle_sec', default=30)
+    if time.time() - last_bg < throttle_sec and quick_reuse:
         if not quiet:
             logger.debug(f"Recent BG + valid cache for {stem}—immediate reuse, skip queue/recheck")
-        if cached_conds_key:
-            _cache_manager.load(cached_conds_key, model, device, dtype, quiet=quiet)
+        _handle_reuse_and_load_conds(cached_conds_key, cached_path, model, device, dtype, stem, quiet)
         return cached_path
 
-    # If no valid cached, sync fix once (rare; first-time or invalid)
+    # No reuse: Sync fix (first-time/invalid)
     if not quick_reuse:
-        # Sync fix as fallback (non-blocking after this)
-        fallback_path = check_and_update_ref(audio_path, exaggeration, stem=stem)
-        if not fallback_path or not Path(fallback_path).exists():
-            logger.error(f"Sync fix failed for {stem}—fallback upload (risky)")
-            fallback_path = audio_path
-        # Update cache immediately (main thread)
-        with _voice_cache_lock:
-            _voice_cache[stem] = {
-                **cached,
-                'fixed_path': fallback_path,
-                'last_bg_time': time.time()  # Reset timer
-            }
-        # Only save if persistent (skip temps)
-        if ROOT_DIR in Path(fallback_path).parents or voices_dir in Path(fallback_path).parents:
-            _save_voice_cache()
-            logger.debug(f"Updated voice cache post-sync: {stem}")
-        else:
-            logger.debug(f"Skipped voice cache save for temp: {fallback_path} (stem: {stem})")
-        logger.info(f"Sync fixed/updated for {stem}: {fallback_path}")
-        # Load conds if available (sync, fast)
-        if cached_conds_key:
-            _cache_manager.load(cached_conds_key, model, device, dtype, quiet=quiet)
+        fallback_path = _handle_sync_fix(audio_path, stem, exaggeration, model, device, dtype, cached, cached_conds_key,
+                                         quiet)
         return fallback_path
 
-    # At this point: Valid cached → immediate reuse, but async verify new upload
-    logger.info(f"Cached reuse for {stem}: {cached_path} (async verify new upload)")
-    if cached_conds_key:
-        conds = _cache_manager.load(cached_conds_key, model, device, dtype, quiet=quiet)
-        if conds and not quiet:
-            logger.info(f"Reused cached conds for {stem}")
+    # Reuse path: Load conds + spawn async (non-blocking)
+    _handle_reuse_and_load_conds(cached_conds_key, cached_path, model, device, dtype, stem, quiet)
+    if not quiet:
+        logger.info(f"Cached reuse for {stem}: {cached_path} (async verify new upload)")
 
-    # Async verify/update thread (non-blocking; always spawn if new upload provided)
-    def _async_verify_update():
-        if not Path(audio_path).exists() or not quick_reuse:  # Skip if no upload or already fixed
-            return
-        needs_update = False  # Default
-        try:
-            # Quick compare: Size + SR probe (no full load/hash initially)
-            if Path(audio_path).stat().st_size != Path(cached_path).stat().st_size:
-                logger.debug(f"Size differ for {stem} (upload={Path(audio_path).stat().st_size} vs cached={Path(cached_path).stat().st_size}) – async fix")
-                needs_update = True
-            else:
-                # SR probe (light: first 1s, ~10ms via StreamReader)
-                sr_u = None
-                try:
-                    reader_u = StreamReader("file:" + audio_path)
-                    probe_u = reader_u._probe_content(return_seconds=1.0)
-                    sr_u = probe_u["output"][0][1].sample_rate  # Extract SR from probe output
-                    reader_u.close()
-                except Exception as probe_e:
-                    logger.trace(f"StreamReader probe failed for upload {stem}: {probe_e} – fallback header")
-                    u_info = _get_audio_info_robust(audio_path)
-                    sr_u = u_info[0] if u_info else None
-
-                sr_c = None
-                try:
-                    reader_c = StreamReader("file:" + cached_path)
-                    probe_c = reader_c._probe_content(return_seconds=1.0)
-                    sr_c = probe_c["output"][0][1].sample_rate
-                    reader_c.close()
-                except Exception as probe_e:
-                    logger.trace(f"StreamReader probe failed for cached {stem}: {probe_e} – fallback header")
-                    c_info = _get_or_cache_audio_info(stem=stem, audio_path=cached_path)
-                    sr_c = c_info[0] if c_info else None
-
-                if sr_u is None or sr_c is None or sr_u != sr_c:
-                    logger.debug(f"SR differ for {stem} ({sr_u or 'unknown'}Hz vs {sr_c or 'unknown'}Hz) – async fix")
-                    needs_update = True
-                else:
-                    # Final light hash (partial file, e.g., first 1MB)
-                    h_u = hashlib.md5()
-                    with open(audio_path, 'rb') as f:
-                        chunk = f.read(1024 * 1024)  # 1MB
-                        if chunk:
-                            h_u.update(chunk)
-                    h_c = hashlib.md5()
-                    with open(cached_path, 'rb') as f:
-                        chunk = f.read(1024 * 1024)
-                        if chunk:
-                            h_c.update(chunk)
-                    needs_update = (h_u.hexdigest() != h_c.hexdigest())
-                    if needs_update:
-                        logger.debug(f"Partial hash differ for {stem} – async fix")
-                    else:
-                        logger.trace(f"Quick verify complete for {stem}: Identical upload – no update")
-
-            if needs_update:
-                # Async refix (resample/pad/save new fixed)
-                new_fixed_path = voices_dir / f"{stem}_fixed_new.wav"  # Temp to avoid overwrite race
-                fixed_path = check_and_update_ref(audio_path, exaggeration, out_path=new_fixed_path, stem=stem)
-                if fixed_path and Path(fixed_path).exists():
-                    # Validate new (force refresh)
-                    valid_new, _ = validate_voice_path(fixed_path, stem=stem, force_refresh=True)
-                    if valid_new:
-                        # Atomic swap in cache
-                        with _voice_cache_lock:
-                            new_hash = _compute_file_hash(fixed_path, method='hybrid', stem=stem)
-                            _voice_cache[stem] = {
-                                **cached,
-                                'fixed_path': fixed_path,
-                                'file_hash': new_hash,
-                                'last_bg_time': time.time()
-                            }
-                            # Single save after swap (only if persistent)
-                            if ROOT_DIR in Path(fixed_path).parents or voices_dir in Path(fixed_path).parents:
-                                _save_voice_cache()
-                            else:
-                                logger.debug(f"Skipped async voice cache save for temp: {fixed_path}")
-                        # Cleanup old if different
-                        if fixed_path != cached_path and Path(cached_path).exists():
-                            Path(cached_path).unlink(missing_ok=True)
-                            logger.info(f"Async updated {stem}: {fixed_path} (old: {cached_path})")
-                        # Async conds update if possible (defer model access; use stem for key)
-                        if hasattr(model, 't3') and hasattr(model.t3, '_bucket_graphs') and len(model.t3._bucket_graphs) > 0:
-                            logger.debug(f"Async defer conds for {stem}: Graphs active")
-                        else:
-                            with MODEL_LOCK:
-                                model.prepare_conditionals(fixed_path, exaggeration=exaggeration)
-                                new_conds_key = get_cache_key(fixed_path, uuid=stem, exaggeration=exaggeration)  # Use stem (from outer scope)
-                                _cache_manager.save(new_conds_key, model.conds, model=model, device=device, dtype=dtype)
-                                with _voice_cache_lock:
-                                    _voice_cache[stem]['conds_key'] = new_conds_key
-                                logger.info(f"Async conds updated for {stem}: {new_conds_key[:8]}")
-                            if hasattr(model, 'set_conditionals'):
-                                model.set_conditionals(None)  # Clear after
-                    else:
-                        logger.warning(f"Async fix invalid for {stem} – keep old {cached_path}")
-                        if Path(fixed_path).exists():
-                            Path(fixed_path).unlink()
-                else:
-                    logger.warning(f"Async fix failed for {stem} – keep old {cached_path}")
-            else:
-                logger.trace(f"Async verify: No update needed for {stem}")
-        except Exception as e:
-            logger.error(f"Async verify/update failed for {stem}: {e}")
-
-    # Spawn async if not recent BG (throttle)
-    if time.time() - last_bg >= 30 and Path(audio_path).exists():
-        Thread(target=_async_verify_update, daemon=True, name=f"Async-Voice-{stem}").start()
-        logger.debug(f"Spawned async verify for {stem} (cached reuse, check new upload)")
-    elif time.time() - last_bg < 30:
+    # Spawn async (throttled)
+    if time.time() - last_bg >= throttle_sec and Path(audio_path).exists():
+        Thread(target=_async_verify_update,
+               args=(audio_path, stem, cached, cached_path, exaggeration, model, device, dtype, quick_reuse),
+               daemon=True, name=f"Async-Voice-{stem}").start()
+        logger.debug(f"Spawned async verify for {stem}")
+    elif time.time() - last_bg < throttle_sec:
         logger.trace(f"Skipped async for {stem}: Recent BG")
 
-    return cached_path  # Always immediate reuse (non-blocking)
+    return cached_path  # Always immediate
+
+
 
 # Facades (unchanged)
 def save_conditionals_cache(cache_key: str, cond_cls=None, model=None, device=None, dtype=None,
