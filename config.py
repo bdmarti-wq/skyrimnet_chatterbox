@@ -80,7 +80,16 @@ class SkyrimNetConfig:
         'enable_post_resample': True,  # New: Alt (review)
         'enable_post_jit_gain': True,  # New: Alt (review)
         'enable_post_voice_processing': True,  # New: Alt (review)
-        'enable_deferred_cleanup': True  # New
+        'enable_deferred_cleanup': True,  # New
+
+        'max_memory_entries': 100,  # Cache size (voices/conds in RAM; up from 50)
+        'save_queue_max': 20,       # Disk save queue limit (prevents backlog)
+        'fuzzy_index_size': 1000,   # Max fuzzy entries per stem (DB size)
+        'memory_cache_enable': True, # Toggle memory cache (instead of env)
+        'disk_cache_enable': True,  # Toggle disk cache
+        'fuzzy_enable': True,       # Toggle fuzzy audio cache
+        'compress_pt_saves': True,  # Toggle gzip compression on .pt files
+        'compress_level': 6,        # Gzip compression level (1=fast, 9=max small)
     }
 
     # CAPS: Hard constants/immutable limits for clamping (numerics only; from alt; used in get_value)
@@ -372,7 +381,7 @@ class SkyrimNetConfig:
             logger.debug(f"Parsed {param_name}: {val}")
         # Defaults to list if requested (cached on self if needed)
         elif param_name == 'fuzzy_boost_words' and val is None:
-            val = self.DEFAULTS.get(param_name, ['ahh', 'mmm', 'ooh', 'throbb', 'moan', 'gasp'])
+            val = self.DEFAULTS.get(param_name, ['ahh', 'mmm', 'ooh', 'gasp'])
             logger.debug(f"Default {param_name}: {val}")
 
         # Clamp numerics (only if numeric)

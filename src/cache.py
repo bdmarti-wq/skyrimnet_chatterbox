@@ -21,6 +21,7 @@ from queue import Queue
 import torch
 import torchaudio
 from torch.serialization import safe_globals  # For whitelisting in load
+from torchaudio.io import StreamReader  # For non-blocking SR probe in async
 import numpy as np
 from pathlib import Path
 from collections import OrderedDict
@@ -50,16 +51,20 @@ voices_dir = CACHE_AUDIO_DIR / "voices"  # For check_and_update_ref
 MODEL_LOCK = threading.RLock()
 
 # Tunable constants (hardcoded; override via env vars if needed)
-MAX_MEMORY_ENTRIES = int(os.getenv('COND_CACHE_MAX_ENTRIES', 50))
-ENABLE_MEMORY = bool(int(os.getenv('ENABLE_MEMORY_CACHE', 1)))
-ENABLE_DISK = bool(int(os.getenv('ENABLE_DISK_CACHE', 1)))
-ENABLE_THREADED_SAVES = bool(int(os.getenv('ENABLE_THREADED_SAVES', 1)))
-MAX_QUEUE = 10  # Disk save queue limit
 KEY_LEN = 32    # Hash length
 MAX_RECURSE = 3 # Reconstruction recursion limit
 DEFAULT_DEVICE = "cuda"  # Fallback
-DEFAULT_DTYPE = torch.float32
+DEFAULT_DTYPE = torch.bfloat16  # TODO was float32 test and review
 MODEL_SR = 24000  # Assume standard for TTS
+MAX_MEMORY_ENTRIES = CONFIG.get_value('max_memory_entries', default=100)
+ENABLE_MEMORY_CACHE = CONFIG.get_value('enable_memory_cache', default=True)
+ENABLE_DISK_CACHE = CONFIG.get_value('enable_disk_cache', default=True)
+ENABLE_THREADED_SAVES = True  # Hardcode or add to CONFIG if needed
+MAX_QUEUE = CONFIG.get_value('save_queue_max', default=20)
+MAX_INDEX_SIZE = CONFIG.get_value('fuzzy_index_size', default=1000)  # For fuzzy per-stem
+ENABLE_FUZZY = CONFIG.get_value('fuzzy_enable', default=True)  # New: Toggle fuzzy
+COMPRESS_PT_SAVES = CONFIG.get_value('compress_pt_saves', default=True)
+COMPRESS_LEVEL = CONFIG.get_value('compress_level', default=6)
 
 # Global voice cache (stem → dict: fixed_path, file_hash, conds_key)
 _voice_cache = {}  # In-memory; persist below
@@ -773,7 +778,9 @@ def _compute_file_hash(file_path: str, method='hybrid', stem: str = None) -> str
 
 
 
-# Patched get_or_queue_voice_process (skip validate on quick match; robust info; dedup)
+
+# Patched get_or_queue_voice_process (non-blocking reuse + async verify/update; robust info; dedup)
+# Patched get_or_queue_voice_process (non-blocking reuse + async verify/update; robust info; dedup)
 def get_or_queue_voice_process(audio_path: str, model, device, dtype, uuid, exaggeration=0.5, quiet=False) -> str:
     stem = Path(audio_path).stem.replace('_fixed', '')  # Normalize early (e.g., 'vayne_csvp_voice')
     with _voice_cache_lock:
@@ -783,184 +790,158 @@ def get_or_queue_voice_process(audio_path: str, model, device, dtype, uuid, exag
         cached_conds_key = cached.get('conds_key', '')
         last_bg = cached.get('last_bg_time', 0)
 
-    if time.time() - last_bg < 30:
+    # Quick validate cached (assume good if exists/valid SR)
+    quick_reuse = False
+    if cached_path and Path(cached_path).exists():
+        cached_info = _get_or_cache_audio_info(stem=stem, audio_path=cached_path)  # Header SR check
+        if cached_info and cached_info[0] == MODEL_SR and cached_info[1] == 1:  # 24kHz mono
+            quick_reuse = True
+            logger.debug(f"Cached path valid for {stem} (SR={MODEL_SR}Hz)—immediate reuse")
+        else:
+            logger.warning(f"Cached path invalid for {stem}, SR={cached_info[0] if cached_info else 'unknown'}Hz – sync fix")
+
+    # Early out if recent BG and cached reuse possible
+    if time.time() - last_bg < 30 and quick_reuse:
         if not quiet:
-            logger.debug(f"Recent BG for {stem}—skipping queue")
-        # Ensure fixed even on skip
-        return cached_path if (cached_path and Path(cached_path).exists()) else check_and_update_ref(audio_path, exaggeration, stem=stem)  # Pass stem
-
-    # Quick pre-check: Use cached info (pass stem)
-    quick_match = False
-    if cached_path and Path(audio_path).exists() and Path(cached_path).exists():
-        if Path(audio_path).stat().st_size == Path(cached_path).stat().st_size:  # Size first (fast)
-            upload_info = _get_or_cache_audio_info(stem=stem, audio_path=audio_path)  # Cached/optimized
-            cached_info = _get_or_cache_audio_info(stem=stem, audio_path=cached_path)  # Same stem
-            if upload_info and cached_info and upload_info[:2] == cached_info[:2]:  # SR + channels
-                quick_match = True
-                logger.debug(f"Quick metadata match for {stem}—reusing without full validate/hash")
-                upload_hash = cached_hash  # Assume same
-            else:
-                logger.debug(f"Quick metadata mismatch for {stem}—full hash")
-
-    upload_hash = _compute_file_hash(audio_path, method='hybrid' if not quick_match else 'quick', stem=stem)  # Pass stem
-    is_different = (not quick_match) and (upload_hash != cached_hash or not cached_path)
-
-    if not is_different and Path(cached_path).exists():
-        logger.info(f"Server WAV same as cached for {stem}—reusing {cached_path}")
+            logger.debug(f"Recent BG + valid cache for {stem}—immediate reuse, skip queue/recheck")
         if cached_conds_key:
-            conds = _cache_manager.load(cached_conds_key, model, device, dtype, quiet=quiet)
-            if conds and not quiet:
-                logger.info(f"Reused cached conds for {stem}")
-        return cached_path  # Valid; skipped validate
+            _cache_manager.load(cached_conds_key, model, device, dtype, quiet=quiet)
+        return cached_path
 
-    # Always fix/return valid for current (main thread; covers new/old invalid)
-    # Skip full validate/check if quick_match (already done)
-    candidate_path = cached_path if cached_path else audio_path
-    if quick_match:
-        fallback_path = candidate_path  # No need to refix
-    else:
-        fallback_path = check_and_update_ref(candidate_path, exaggeration, stem=stem)  # Pass stem
-    if not fallback_path or not Path(fallback_path).exists():
-        logger.warning(f"Fix failed for {stem}—using original (may fail SR)")
-        fallback_path = candidate_path
-    logger.info(f"Fixed/used for {stem} in main: {fallback_path}")
-    if cached_conds_key and not is_different:
-        _cache_manager.load(cached_conds_key, model, device, dtype, quiet=quiet)
+    # If no valid cached, sync fix once (rare; first-time or invalid)
+    if not quick_reuse:
+        # Sync fix as fallback (non-blocking after this)
+        fallback_path = check_and_update_ref(audio_path, exaggeration, stem=stem)
+        if not fallback_path or not Path(fallback_path).exists():
+            logger.error(f"Sync fix failed for {stem}—fallback upload (risky)")
+            fallback_path = audio_path
+        # Update cache immediately (main thread)
+        with _voice_cache_lock:
+            _voice_cache[stem] = {
+                **cached,
+                'fixed_path': fallback_path,
+                'last_bg_time': time.time()  # Reset timer
+            }
+        _save_voice_cache()
+        logger.info(f"Sync fixed/updated for {stem}: {fallback_path}")
+        # Load conds if available (sync, fast)
+        if cached_conds_key:
+            _cache_manager.load(cached_conds_key, model, device, dtype, quiet=quiet)
+        return fallback_path
 
-    # BG process (unchanged; but pass stem if extending check_and_update_ref)
-    def _bg_process_new():
-        if not is_different or Path(fallback_path).exists():  # Skip if already fixed/same
+    # At this point: Valid cached → immediate reuse, but async verify new upload
+    logger.info(f"Cached reuse for {stem}: {cached_path} (async verify new upload)")
+    if cached_conds_key:
+        conds = _cache_manager.load(cached_conds_key, model, device, dtype, quiet=quiet)
+        if conds and not quiet:
+            logger.info(f"Reused cached conds for {stem}")
+
+    # Async verify/update thread (non-blocking; always spawn if new upload provided)
+    def _async_verify_update():
+        if not Path(audio_path).exists() or not quick_reuse:  # Skip if no upload or already fixed
             return
+        needs_update = False  # Default
         try:
-            final_fixed = voices_dir / f"{stem}_fixed.wav"
-            fixed_path = check_and_update_ref(str(audio_path), exaggeration, out_path=final_fixed)  # Direct
-            if not fixed_path or not Path(fixed_path).exists():
-                if not quiet:
-                    logger.warning(f"BG full fail for {stem}")
-                return
-
-            # Prep/conds (locked)
-            conds_key = None
-            with MODEL_LOCK:
-                if (hasattr(model, 't3') and hasattr(model.t3, '_bucket_graphs') and len(model.t3._bucket_graphs) > 0):
-                    if not quiet:
-                        logger.debug(f"BG defer for {stem}: Graphs active")
+            # Quick compare: Size + SR probe (no full load/hash initially)
+            if Path(audio_path).stat().st_size != Path(cached_path).stat().st_size:
+                logger.debug(f"Size differ for {stem} (upload={Path(audio_path).stat().st_size} vs cached={Path(cached_path).stat().st_size}) – async fix")
+                needs_update = True
+            else:
+                # SR probe (light: first 1s, ~10ms via StreamReader)
+                try:
+                    reader_u = StreamReader("file:" + audio_path)
+                    probe_u = reader_u._probe_content(return_seconds=1.0)
+                    sr_u = probe_u["output"][0][1].sample_rate  # Extract SR from probe output
+                    reader_u.close()
+                except Exception as probe_e:
+                    logger.trace(f"StreamReader probe failed for upload {stem}: {probe_e} – fallback header")
+                    u_info = _get_audio_info_robust(audio_path)
+                    sr_u = u_info[0] if u_info else None
+                try:
+                    reader_c = StreamReader("file:" + cached_path)
+                    probe_c = reader_c._probe_content(return_seconds=1.0)
+                    sr_c = probe_c["output"][0][1].sample_rate
+                    reader_c.close()
+                except Exception as probe_e:
+                    logger.trace(f"StreamReader probe failed for cached {stem}: {probe_e} – fallback header")
+                    c_info = _get_or_cache_audio_info(stem=stem, audio_path=cached_path)
+                    sr_c = c_info[0] if c_info else None
+                if sr_u is None or sr_c is None or sr_u != sr_c:
+                    logger.debug(f"SR differ for {stem} ({sr_u or 'unknown'}Hz vs {sr_c or 'unknown'}Hz) – async fix")
+                    needs_update = True
                 else:
-                    model.prepare_conditionals(fixed_path, exaggeration=exaggeration)
-                    temp_conds = model.conds
-                    if temp_conds:
-                        model.set_conditionals(None)
-                        conds_key = get_cache_key(fixed_path, uuid, exaggeration)
-                        _cache_manager.save(conds_key, temp_conds, model=None, device=device, dtype=dtype)
+                    # Final light hash (partial file, e.g., first 1MB)
+                    h_u = hashlib.md5()
+                    with open(audio_path, 'rb') as f:
+                        chunk = f.read(1024 * 1024)  # 1MB
+                        if chunk:
+                            h_u.update(chunk)
+                    h_c = hashlib.md5()
+                    with open(cached_path, 'rb') as f:
+                        chunk = f.read(1024 * 1024)
+                        if chunk:
+                            h_c.update(chunk)
+                    needs_update = (h_u.hexdigest() != h_c.hexdigest())
+                    if needs_update:
+                        logger.debug(f"Partial hash differ for {stem} – async fix")
+                    else:
+                        logger.trace(f"Quick verify complete for {stem}: Identical upload – no update")
 
-            with _voice_cache_lock:
-                update_entry = {'fixed_path': fixed_path, 'file_hash': upload_hash, 'last_bg_time': time.time()}
-                if conds_key:
-                    update_entry['conds_key'] = conds_key
-                _voice_cache[stem] = {**cached, **update_entry}
-            _save_voice_cache()
-            if not quiet:
-                logger.info(f"BG processed {stem}: {fixed_path}" + (f", conds {conds_key[:8]}" if conds_key else ""))
+            if needs_update:
+                # Async refix (resample/pad/save new fixed)
+                new_fixed_path = voices_dir / f"{stem}_fixed_new.wav"  # Temp to avoid overwrite race
+                fixed_path = check_and_update_ref(audio_path, exaggeration, out_path=new_fixed_path, stem=stem)
+                if fixed_path and Path(fixed_path).exists():
+                    # Validate new (force refresh)
+                    valid_new, _ = validate_voice_path(fixed_path, stem=stem, force_refresh=True)
+                    if valid_new:
+                        # Atomic swap in cache
+                        with _voice_cache_lock:
+                            new_hash = _compute_file_hash(fixed_path, method='hybrid', stem=stem)
+                            _voice_cache[stem] = {
+                                **cached,
+                                'fixed_path': fixed_path,
+                                'file_hash': new_hash,
+                                'last_bg_time': time.time()
+                            }
+                        # Cleanup old if different
+                        if fixed_path != cached_path and Path(cached_path).exists():
+                            Path(cached_path).unlink(missing_ok=True)
+                            logger.info(f"Async updated {stem}: {fixed_path} (old: {cached_path})")
+                        _save_voice_cache()
+                        # Async conds update if possible (defer model access)
+                        if hasattr(model, 't3') and hasattr(model.t3, '_bucket_graphs') and len(model.t3._bucket_graphs) > 0:
+                            logger.debug(f"Async defer conds for {stem}: Graphs active")
+                        else:
+                            with MODEL_LOCK:
+                                model.prepare_conditionals(fixed_path, exaggeration=exaggeration)
+                                new_conds_key = get_cache_key(fixed_path, uuid, exaggeration)
+                                _cache_manager.save(new_conds_key, model.conds, model=None, device=device, dtype=dtype)
+                                with _voice_cache_lock:
+                                    _voice_cache[stem]['conds_key'] = new_conds_key
+                                _save_voice_cache()
+                                logger.info(f"Async conds updated for {stem}: {new_conds_key[:8]}")
+                        if hasattr(model, 'set_conditionals'):
+                            model.set_conditionals(None)  # Clear after
+                    else:
+                        logger.warning(f"Async fix invalid for {stem} – keep old {cached_path}")
+                        if Path(fixed_path).exists():
+                            Path(fixed_path).unlink()
+                else:
+                    logger.warning(f"Async fix failed for {stem} – keep old {cached_path}")
+            else:
+                logger.trace(f"Async verify: No update needed for {stem}")
         except Exception as e:
-            if not quiet:
-                logger.error(f"BG failed for {stem}: {e}")
+            logger.error(f"Async verify/update failed for {stem}: {e}")
 
-    if ENABLE_THREADED_SAVES and (Path(fallback_path).stem.endswith('_fixed') or is_different):  # Queue only if needed
-        threading.Thread(target=_bg_process_new, daemon=True, name=f"BG-Voice-{stem}").start()
-        logger.debug(f"Queued bg for {stem}")
-    return fallback_path  # Always fixed/valid
+    # Spawn async if not recent BG (throttle)
+    if time.time() - last_bg >= 30 and Path(audio_path).exists():
+        Thread(target=_async_verify_update, daemon=True, name=f"Async-Voice-{stem}").start()
+        logger.debug(f"Spawned async verify for {stem} (cached reuse, check new upload)")
+    elif time.time() - last_bg < 30:
+        logger.trace(f"Skipped async for {stem}: Recent BG")
 
-
-# Sync pre-extract (threaded for non-blocking; hardcoded top voices)
-def pre_extract_fixed_voices(model, device, dtype, top_voices: List[str] = ['nwskatyavoice', 'vp_11_lilia', 'nwsjennavoice', 'ba_ahnivoice']):
-    """Pre-extract conds for top voices (sync with threading; rooted paths)."""
-    def _extract_worker(voice):
-        if not T3_AVAILABLE:
-            return
-        ref_path = voices_dir / f"{voice}.wav"  # Rooted to cache/audio/voices/
-        if not ref_path.exists():
-            logger.warning(f"Skipping pre-extract {voice}: No {ref_path}")
-            return
-        cache_key = get_cache_key(str(ref_path), uuid=voice, exaggeration=0.5)
-        if _cache_manager.load(cache_key, model, device, dtype, quiet=True):
-            logger.info(f"Pre-extract HIT: {voice}")
-            return
-        try:
-            model.prepare_conditionals(str(ref_path), exaggeration=0.5)
-            _cache_manager.save(cache_key, model.conds, model, device, dtype)
-            logger.info(f"Pre-extracted: {voice} (key={cache_key[:8]})")
-        except Exception as e:
-            logger.warning(f"Pre-extract failed {voice}: {e}")
-
-    logger.info(f"Pre-extracting {len(top_voices)} voices")
-    threads = []
-    for voice in top_voices:
-        t = threading.Thread(target=_extract_worker, args=(voice,))
-        t.daemon = True
-        t.start()
-        threads.append(t)
-    for t in threads:
-        t.join()  # Wait for completion
-
-
-# Init (merged: preload + optional pre-extract)
-def init_conditional_memory_cache(model=None, device=None, dtype=None, quiet: bool = False,
-                                  pre_extract: bool = True) -> Tuple[bool, bool]:
-    _load_voice_cache()
-    device = device or DEFAULT_DEVICE
-    dtype = dtype or DEFAULT_DTYPE
-
-    # Verify voices dir (log available for debugging)
-    available_voices = [f.stem for f in voices_dir.glob("*.wav") if not f.stem.endswith('_fixed')]
-    missing_voices = []
-    if pre_extract:
-        top_voices = ['nwskatyavoice', 'vp_11_lilia', 'nwsjennavoice', 'ba_ahnivoice']
-        for v in top_voices:
-            if v not in available_voices:
-                missing_voices.append(v)
-        if missing_voices:
-            logger.warning(f"Pre-extract: Missing voices in {voices_dir}: {missing_voices}. Add WAV files for faster hits.")
-        if not quiet and available_voices:
-            logger.info(f"Found {len(available_voices)} voices in {voices_dir}: {available_voices[:5]}...")  # First 5
-
-    if quiet:
-        logger.debug(f"Voices dir {voices_dir} has {len(available_voices)} files")
-
-    # Preload all .pt
-    loaded = 0
-    for pt_file in CACHE_DIR.glob("*.pt"):
-        cache_key = pt_file.stem
-        try:
-            loaded_raw = torch.load(pt_file, map_location='cpu', weights_only=False)
-            state = loaded_raw if isinstance(loaded_raw, dict) else {'data': loaded_raw}
-            conds = _cache_manager._reconstruct_conds(state, model, device, dtype)
-            if ENABLE_MEMORY:
-                with _cache_manager._cache_lock:
-                    _cache_manager._memory_cache[cache_key] = conds or state
-                    _cache_manager._memory_cache.move_to_end(cache_key)
-            loaded += 1
-            if not quiet:
-                logger.debug(f"Preloaded {pt_file.name} → {cache_key[:8]}")
-        except Exception as e:
-            if not quiet:
-                logger.warning(f"Preload failed {pt_file}: {e}")
-
-    # Evict excess
-    if len(_cache_manager._memory_cache) > MAX_MEMORY_ENTRIES:
-        excess = len(_cache_manager._memory_cache) - MAX_MEMORY_ENTRIES
-        _cache_manager.evict_lru(excess)
-        if not quiet:
-            logger.info(f"Evicted {excess} excess after preload")
-
-    # Pre-extract if enabled
-    if pre_extract and model:
-        pre_extract_fixed_voices(model, device, dtype)
-
-    total_pt = len(list(CACHE_DIR.glob('*.pt')))
-    stats = _cache_manager.get_cache_stats()
-    if not quiet:
-        logger.info(f"Cache init: Memory={ENABLE_MEMORY}, Disk={ENABLE_DISK}, Loaded {loaded} from {total_pt} (memory: {stats['memory_cache_size']})")
-    return ENABLE_MEMORY, ENABLE_DISK
+    return cached_path  # Always immediate reuse (non-blocking)
 
 
 # Facades (unchanged)
@@ -977,7 +958,7 @@ def load_conditionals_cache(cache_key: str, model=None, device=None, dtype=None,
 
 
 def get_current_cache_key():
-    return _cache_manager.get_current_cache_key()
+    return _cache_manager.get_current_cache_key ()
 
 
 def is_cache_key_loaded(cache_key):
@@ -1378,3 +1359,185 @@ def _background_index_worker():
 
 # Start daemon thread at init (fuzzy worker)
 threading.Thread(target=_background_index_worker, daemon=True, name="FuzzyIndexer").start()
+
+# Sync pre-extract (threaded for non-blocking; hardcoded top voices)
+# Sync pre-extract (threaded for non-blocking; hardcoded top voices)
+def pre_extract_fixed_voices(model, device, dtype, top_voices: List[str] = ['nwskatyavoice', 'vp_11_lilia', 'nwsjennavoice', 'ba_ahnivoice']):
+    """Pre-extract conds for top voices (threaded; rooted paths). Non-blocking with timeout/error handling."""
+    def _extract_worker(voice):
+        logger.debug(f"Pre-extract worker start: {voice}")
+        if not T3_AVAILABLE:
+            logger.debug(f"Pre-extract skip {voice}: T3 unavailable")
+            return
+        ref_path = voices_dir / f"{voice}.wav"
+        if not ref_path.exists():
+            logger.warning(f"Skipping pre-extract {voice}: No {ref_path}")
+            return
+        cache_key = get_cache_key(str(ref_path), uuid=voice, exaggeration=0.5)
+        if _cache_manager.load(cache_key, model, device, dtype, quiet=True):
+            logger.info(f"Pre-extract HIT: {voice}")
+            return
+        try:
+            # Check graphs before prep (defer if active)
+            if hasattr(model, 't3') and hasattr(model.t3, '_bucket_graphs') and len(model.t3._bucket_graphs) > 0:
+                logger.debug(f"Pre-extract defer {voice}: Graphs active")
+                return
+            with MODEL_LOCK:  # Lock to prevent race with main model access
+                model.prepare_conditionals(str(ref_path), exaggeration=0.5)
+                if model.conds:  # Success check
+                    _cache_manager.save(cache_key, model.conds, model, device, dtype, quiet=True)
+                    logger.info(f"Pre-extracted: {voice} (key={cache_key[:8]})")
+                else:
+                    logger.warning(f"Pre-extract conds empty for {voice}")
+                model.set_conditionals(None)  # Clear after save
+        except Exception as e:
+            logger.warning(f"Pre-extract failed {voice}: {e}")
+            if hasattr(model, 'set_conditionals') and model.conds:
+                model.set_conditionals(None)
+        logger.debug(f"Pre-extract worker end: {voice}")
+
+    logger.info(f"Pre-extracting {len(top_voices)} voices")
+    threads = []
+    for voice in top_voices:
+        t = Thread(target=_extract_worker, args=(voice,))
+        t.daemon = True
+        t.start()
+        threads.append(t)
+
+    # Join with timeout (10s per thread; skip hangers)
+    for t in threads:
+        t.join(timeout=10)  # 10s timeout per worker
+        if t.is_alive():
+            logger.warning(f"Pre-extract worker timeout (skipped): {t.name} – may need manual WAV/SR check")
+        else:
+            logger.trace(f"Pre-extract worker complete: {t.name}")
+    logger.info("Pre-extract complete")
+
+
+
+# Init (merged: preload + optional pre-extract)
+# Init (merged: preload + optional pre-extract + pre-validate)
+def init_conditional_memory_cache(model=None, device=None, dtype=None, quiet: bool = False,
+                                  pre_extract: bool = False, pre_validate_voices: bool = False) -> Tuple[bool, bool]:
+    _load_voice_cache()
+    device = device or DEFAULT_DEVICE
+    dtype = dtype or DEFAULT_DTYPE
+
+    # Verify voices dir (log available for debugging)
+    available_voices = [f.stem for f in voices_dir.glob("*.wav") if not f.stem.endswith('_fixed')]
+    missing_voices = []
+    if pre_extract:
+        top_voices = ['nwskatyavoice', 'vp_11_lilia', 'nwsjennavoice', 'ba_ahnivoice']
+        for v in top_voices:
+            if v not in available_voices:
+                missing_voices.append(v)
+        if missing_voices:
+            logger.warning(f"Pre-extract: Missing voices in {voices_dir}: {missing_voices}. Add WAV files for faster hits.")
+        if not quiet and available_voices:
+            logger.info(f"Found {len(available_voices)} voices in {voices_dir}: {available_voices[:5]}...")  # First 5
+
+    if quiet:
+        logger.debug(f"Voices dir {voices_dir} has {len(available_voices)} files")
+
+    # Preload all .pt
+    loaded = 0
+    for pt_file in CACHE_DIR.glob("*.pt"):
+        cache_key = pt_file.stem
+        try:
+            loaded_raw = torch.load(pt_file, map_location='cpu', weights_only=False)
+            state = loaded_raw if isinstance(loaded_raw, dict) else {'data': loaded_raw}
+            conds = _cache_manager._reconstruct_conds(state, model, device, dtype)
+            if ENABLE_MEMORY_CACHE:
+                with _cache_manager._cache_lock:
+                    _cache_manager._memory_cache[cache_key] = conds or state
+                    _cache_manager._memory_cache.move_to_end(cache_key)
+            loaded += 1
+            if not quiet:
+                logger.debug(f"Preloaded {pt_file.name} → {cache_key[:8]}")
+        except Exception as e:
+            if not quiet:
+                logger.warning(f"Preload failed {pt_file}: {e}")
+
+    # Evict excess
+    if len(_cache_manager._memory_cache) > MAX_MEMORY_ENTRIES:
+        excess = len(_cache_manager._memory_cache) - MAX_MEMORY_ENTRIES
+        _cache_manager.evict_lru(excess)
+        if not quiet:
+            logger.info(f"Evicted {excess} excess after preload")
+
+    # Optional pre-extract (if enabled; skip if quiet/hang-prone)
+    if pre_extract and model:
+        pre_extract_fixed_voices(model, device, dtype)
+
+    # Optional pre-validate all voices (new: gains first-gen speedup; if enabled)
+    pre_validate_count = 0
+    if pre_validate_voices and model:
+        pre_validate_count = pre_validate_all_voices(model, device, dtype, quiet=quiet)
+
+    # Compute totals/stats *after* all preloads (includes new conds if pre-validated)
+    total_pt = len(list(CACHE_DIR.glob('*.pt')))
+    stats = _cache_manager.get_cache_stats()
+
+    # Log summary
+    if not quiet:
+        logger.info(f"Cache init: Memory={ENABLE_MEMORY_CACHE}, Disk={ENABLE_DISK_CACHE}, Loaded {loaded} from {total_pt} (memory: {stats['memory_cache_size']}, pre-valid: {pre_validate_count})")
+    return ENABLE_MEMORY_CACHE, ENABLE_DISK_CACHE
+
+
+# Parallel voice pre-validation (fix SR/pad/cache conds for all; optional, fast)
+def pre_validate_all_voices(model, device, dtype, voices_dir: Path = voices_dir, max_workers: int = 8, quiet: bool = False):
+    """Pre-validate/fix all voices in dir (resample/pad + conds); threaded for speed."""
+    if not model or not T3_AVAILABLE:
+        if not quiet:
+            logger.debug("Pre-validate skip: No model/T3")
+        return 0
+    voice_files = [f for f in voices_dir.glob("*.wav") if not f.stem.endswith(('_fixed', '_padded', '_resampled'))]
+    if not voice_files:
+        if not quiet:
+            logger.debug("No voices to pre-validate")
+        return 0
+
+    def _validate_worker(file_path: Path):
+        stem = file_path.stem.replace('_fixed', '').replace('_padded', '').replace('_resampled', '')  # Normalize
+        fixed_path = check_and_update_ref(str(file_path), exaggeration=0.5, stem=stem)  # Auto-resample/pad/save fixed
+        if not fixed_path or not Path(fixed_path).exists():
+            logger.warning(f"Pre-validate failed {stem}: {fixed_path}")
+            return 0
+        # Cache conds (locked)
+        cache_key = get_cache_key(fixed_path, uuid=stem, exaggeration=0.5)
+        if _cache_manager.is_cache_key_loaded(cache_key):
+            if not quiet:
+                logger.debug(f"Pre-validate hit: {stem}")
+            return 1
+        try:
+            with MODEL_LOCK:
+                if hasattr(model, 't3') and len(model.t3._bucket_graphs) > 0:  # Defer if graphs active
+                    logger.debug(f"Pre-validate defer {stem}: Graphs active")
+                    return 0
+                model.prepare_conditionals(fixed_path, exaggeration=0.5)
+                if model.conds:
+                    _cache_manager.save(cache_key, model.conds, model, device, dtype, quiet=True)
+                    model.set_conditionals(None)
+                    if not quiet:
+                        logger.debug(f"Pre-validated: {stem} -> {cache_key[:8]}")
+                    return 1
+                else:
+                    logger.warning(f"Pre-validate conds empty: {stem}")
+        except Exception as e:
+            logger.warning(f"Pre-validate conds failed {stem}: {e}")
+        return 0
+
+    if not quiet:
+        logger.info(f"Pre-validating {len(voice_files)} voices (max_workers={max_workers})")
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    validated_count = 0
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(_validate_worker, f) for f in voice_files]
+        for future in as_completed(futures, timeout=30):  # 30s total timeout
+            try:
+                validated_count += future.result(timeout=5)  # Per-worker 5s
+            except TimeoutError:
+                logger.warning("Pre-validate worker timeout – skip")
+    if not quiet:
+        logger.info(f"Pre-validated {validated_count}/{len(voice_files)} voices")
+    return validated_count

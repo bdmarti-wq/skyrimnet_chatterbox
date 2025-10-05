@@ -68,6 +68,8 @@ enable_memory_cache = true
 # Recommended: true (saves time on repeated requests)
 enable_disk_cache = true
 
+MAX_MEMORY_ENTRIES=100
+COND_CACHE_MAX_ENTRIES=200
 
 fuzzy_min_length = 3
 fuzzy_boost_words = mmm,ooh,throbb,moan,gasp,cock,pussy,cunt,twat,tits,aah,yes,please,more,cunt,gods
