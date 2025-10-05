@@ -1247,9 +1247,17 @@ def try_fuzzy_audio_cache(audio_path: str = None, text_input: str = None, exagge
             logger.warning(
                 "Fuzzy: No audio_path or stem – cannot filter per-voice; using global fallback (inefficient)")
             stem = 'global'  # Fallback: All entries (less precise)
-    if not stem or len(stem) < 3:  # Invalid stem (e.g., swapped long text)
-        logger.warning(f"Fuzzy: Invalid stem '{stem[:20]}...' – check caller args (possible swap: text as audio_path?)")
-        return None
+    # Auto-extend short stems (e.g., 'vp' → full from audio_path or cache)
+    if len(stem) < 3 and audio_path:
+        old_stem = stem
+        full_stem = Path(audio_path).stem.replace('_fixed', '').replace('_padded', '').replace('_resampled',
+                                                                                               '').replace(
+            '_ui_resampled', '')
+        match_full = re.match(r'^([a-zA-Z0-9_]+)_?([0-9a-f]{32,})?$', full_stem)
+        candidate_stem = match_full.group(1) if match_full else full_stem
+        if len(candidate_stem) >= 3 and candidate_stem not in ['global', 'audio_reuse']:
+            stem = candidate_stem  # Use full if valid
+            logger.debug(f"Fuzzy: Extended short stem '{old_stem}' to '{stem}' from path")
 
     threshold = threshold or CONFIG.get_value('fuzzy_threshold', default=0.75)
 
