@@ -784,8 +784,23 @@ def _compute_file_hash(file_path: str, method='hybrid', stem: str = None) -> str
 # Patched get_or_queue_voice_process (non-blocking reuse + async verify/update; robust info; dedup)
 # Patched get_or_queue_voice_process (non-blocking reuse + async verify/update; robust info; dedup)
 # Fixes: Light pre-probe to skip sync refresh if upload SR matches; pass model to async save; consistent globals
-def get_or_queue_voice_process(audio_path: str, model, device, dtype, uuid, exaggeration=0.5, quiet=False) -> str:
-    stem = Path(audio_path).stem.replace('_fixed', '')  # Normalize early (e.g., 'vayne_csvp_voice')
+def get_or_queue_voice_process(audio_path: str, model, device, dtype, stem: str | None = None, exaggeration: float = 0.5, quiet=False) -> str:
+    # Ensure stem is str (handle int from old calls; e.g., UUID id like 123)
+    if stem is not None and not isinstance(stem, str):
+        stem = str(stem)
+
+    # Derive/clean stem (handle UI temps with UUID-like stems, e.g., "747091233726058195" → try extract voice)
+    if stem is None or len(stem) > 15 or re.match(r'^[0-9a-f]{32,}$', stem):  # Temp UUID-like (now str)
+        basename = Path(audio_path).stem
+        match = re.match(r'([a-zA-Z0-9_]+[voice]?)(_?[0-9a-f]{32,})?$', basename)  # Extract "vayne_csvp_voice" before UUID
+        stem = match.group(1) if match else Path(basename.replace('_ui_resampled', '').replace('_temp', '')).stem.replace('_fixed', '').replace('_padded', '').replace('_resampled', '')  # Fallback clean
+        logger.debug(f"Derived stem for temp/audio_path '{basename}': '{stem}'")
+    else:
+        stem = stem.replace('_fixed', '').replace('_padded', '').replace('_resampled', '').replace('_ui_resampled', '')  # Clean if passed
+        if len(stem) < 3:  # Still invalid → derive from path
+            stem = Path(audio_path).stem.replace('_fixed', '').replace('_padded', '').replace('_resampled', '').replace('_ui_resampled', '')
+            logger.debug(f"Fallback stem derivation: '{stem}' from '{audio_path}'")
+
     with _voice_cache_lock:
         cached = _voice_cache.get(stem, {})
         cached_path = cached.get('fixed_path', '')
@@ -840,7 +855,12 @@ def get_or_queue_voice_process(audio_path: str, model, device, dtype, uuid, exag
                 'fixed_path': fallback_path,
                 'last_bg_time': time.time()  # Reset timer
             }
-        _save_voice_cache()
+        # Only save if persistent (skip temps)
+        if ROOT_DIR in Path(fallback_path).parents or voices_dir in Path(fallback_path).parents:
+            _save_voice_cache()
+            logger.debug(f"Updated voice cache post-sync: {stem}")
+        else:
+            logger.debug(f"Skipped voice cache save for temp: {fallback_path} (stem: {stem})")
         logger.info(f"Sync fixed/updated for {stem}: {fallback_path}")
         # Load conds if available (sync, fast)
         if cached_conds_key:
@@ -926,25 +946,28 @@ def get_or_queue_voice_process(audio_path: str, model, device, dtype, uuid, exag
                                 'file_hash': new_hash,
                                 'last_bg_time': time.time()
                             }
+                            # Single save after swap (only if persistent)
+                            if ROOT_DIR in Path(fixed_path).parents or voices_dir in Path(fixed_path).parents:
+                                _save_voice_cache()
+                            else:
+                                logger.debug(f"Skipped async voice cache save for temp: {fixed_path}")
                         # Cleanup old if different
                         if fixed_path != cached_path and Path(cached_path).exists():
                             Path(cached_path).unlink(missing_ok=True)
                             logger.info(f"Async updated {stem}: {fixed_path} (old: {cached_path})")
-                        _save_voice_cache()
-                        # Async conds update if possible (defer model access; fix: pass model to save)
+                        # Async conds update if possible (defer model access; use stem for key)
                         if hasattr(model, 't3') and hasattr(model.t3, '_bucket_graphs') and len(model.t3._bucket_graphs) > 0:
                             logger.debug(f"Async defer conds for {stem}: Graphs active")
                         else:
                             with MODEL_LOCK:
                                 model.prepare_conditionals(fixed_path, exaggeration=exaggeration)
-                                new_conds_key = get_cache_key(fixed_path, uuid, exaggeration)
-                                _cache_manager.save(new_conds_key, model.conds, model=model, device=device, dtype=dtype)  # Pass model
+                                new_conds_key = get_cache_key(fixed_path, uuid=stem, exaggeration=exaggeration)  # Use stem (from outer scope)
+                                _cache_manager.save(new_conds_key, model.conds, model=model, device=device, dtype=dtype)
                                 with _voice_cache_lock:
                                     _voice_cache[stem]['conds_key'] = new_conds_key
-                                _save_voice_cache()
                                 logger.info(f"Async conds updated for {stem}: {new_conds_key[:8]}")
-                        if hasattr(model, 'set_conditionals'):
-                            model.set_conditionals(None)  # Clear after
+                            if hasattr(model, 'set_conditionals'):
+                                model.set_conditionals(None)  # Clear after
                     else:
                         logger.warning(f"Async fix invalid for {stem} – keep old {cached_path}")
                         if Path(fixed_path).exists():
@@ -1445,9 +1468,9 @@ def pre_extract_fixed_voices(model, device, dtype, top_voices: List[str] = ['nws
 # Init (merged: preload + optional pre-extract)
 # Init (merged: preload + optional pre-extract + pre-validate)
 def init_conditional_memory_cache(model=None, device=None, dtype=None, quiet: bool = False,
-                                  pre_extract: bool = False, pre_validate_voices: bool = False) -> Tuple[bool, bool]:
+                                 pre_extract: bool = False, pre_validate_voices: bool = False) -> Tuple[bool, bool]:
     _load_voice_cache()
-    _load_fuzzy_cache() # TODO make generic init?
+    _load_fuzzy_cache()
     device = device or DEFAULT_DEVICE
     dtype = dtype or DEFAULT_DTYPE
 
@@ -1462,7 +1485,7 @@ def init_conditional_memory_cache(model=None, device=None, dtype=None, quiet: bo
         if missing_voices:
             logger.warning(f"Pre-extract: Missing voices in {voices_dir}: {missing_voices}. Add WAV files for faster hits.")
         if not quiet and available_voices:
-            logger.info(f"Found {len(available_voices)} voices in {voices_dir}: {available_voices[:5]}...")  # First 5
+            logger.info(f"Found {len(available_voices)} voices in {voices_dir}: {available_voices[:5]}...")
 
     if quiet:
         logger.debug(f"Voices dir {voices_dir} has {len(available_voices)} files")
@@ -1531,37 +1554,31 @@ def pre_validate_all_voices(model, device, dtype, voices_dir: Path = voices_dir,
         if not fixed_path or not Path(fixed_path).exists():
             logger.warning(f"Pre-validate failed {stem}: {fixed_path}")
             return 0
-        # Cache conds (locked)
+        # Cache conds (locked) – removed busy check; always try in init
         cache_key = get_cache_key(fixed_path, uuid=stem, exaggeration=0.5)
         if _cache_manager.is_cache_key_loaded(cache_key):
-            if not quiet:
-                logger.debug(f"Pre-validate hit: {stem}")
+            logger.debug(f"Pre-validate hit: {stem}")
             return 1
         try:
-            # Defer if model in use (conds not None) or graphs active (safe check)
-            if model and (model.conds is not None or
-                          (hasattr(model, 't3') and
-                           getattr(model.t3, '_bucket_graphs', None) and len(
-                                      getattr(model.t3, '_bucket_graphs', [])) > 0)):
-                logger.debug(f"Pre-validate defer {stem}: Model busy/graphs active")
-                return 0  # Skip conds, but file fixed (partial success)
+            # No defer check in init (attempt all conds; lock safe)
             with MODEL_LOCK:
                 model.prepare_conditionals(fixed_path, exaggeration=0.5)
                 if model.conds:
                     _cache_manager.save(cache_key, model.conds, model, device, dtype)
                     model.set_conditionals(None)  # Clear
-                    if not quiet:
-                        logger.debug(f"Pre-validated: {stem} -> {cache_key[:8]}")
-                    return 1
+                    logger.info(f"Pre-validated conds: {stem} -> {cache_key[:8]}")
+                    return 2  # File + conds
                 else:
-                    logger.warning(f"Pre-validate conds empty: {stem}")
+                    logger.warning(f"Pre-validate conds empty for {stem}")
+                    return 1  # File only
         except AttributeError as ae:
-            logger.trace(f"Pre-validate defer {stem}: Model not ready ({ae}) – file fixed, conds on-demand")
-            # Still count file fix as partial success
-            return 0.5  # Or 1 if you want; adjust validated_count += result
+            logger.debug(f"Pre-validate defer {stem}: Model not ready ({ae}) – file fixed")
+            return 1
         except Exception as e:
             logger.warning(f"Pre-validate conds failed {stem}: {e}")
-        return 0
+            if hasattr(model, 'set_conditionals') and model.conds:
+                model.set_conditionals(None)
+            return 1  # File success
 
     if not quiet:
         logger.info(f"Pre-validating {len(voice_files)} voices (max_workers={max_workers})")

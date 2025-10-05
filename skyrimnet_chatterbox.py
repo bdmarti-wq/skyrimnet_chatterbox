@@ -306,7 +306,7 @@ if __name__ == "__main__":
     load_skyrimnet_config()
 
     model = load_model()
-    init_conditional_memory_cache(model, DEVICE, DTYPE, quiet=False, pre_validate_voices=True)  # Quiet for prod
+    init_conditional_memory_cache(model, DEVICE, DTYPE, quiet=False, pre_validate_voices=False)  # Quiet for prod
 
     demo.queue(
         max_size=12,
