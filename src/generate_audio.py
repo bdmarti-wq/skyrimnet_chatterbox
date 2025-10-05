@@ -11,8 +11,9 @@ from config import ENABLE_MEMORY_CACHE, ENABLE_DISK_CACHE, DEVICE, DTYPE, MULTIL
 from .cache import (
     try_audio_cache, set_audio_cache, get_cache_key, get_or_queue_voice_process,
     validate_voice_path, create_dummy_conds, load_conditionals_cache, save_conditionals_cache,
-    get_cache_stats, try_fuzzy_audio_cache, _fuzzy_queue, check_and_update_ref, save_torchaudio_wav
+    get_cache_stats, check_and_update_ref, save_torchaudio_wav
 )
+from .fuzzy_cache import try_fuzzy_audio_cache, FUZZY_QUEUE
 
 logger = logging.getLogger(__name__)
 GEN_ACTIVE_LOCK = threading.RLock()  # Global for gen/prepare
@@ -188,7 +189,7 @@ def generate_audio(model, text: str, audio_prompt_path: Optional[str], exaggerat
         if audio_prompt_path:
             voice_stem = Path(audio_prompt_path).stem.replace('_fixed', '').split('_')[0]
             logger.debug(f"Enqueued for fuzzy enrich (HIT): \"{text[:20]}\" (norm stem={voice_stem})")
-            _fuzzy_queue.put((text, audio_reuse_path, voice_stem))
+            FUZZY_QUEUE.put((text, audio_reuse_path, voice_stem))
         total_time_ms = (perf_counter_ns() - func_start_time) / 1_000_000
         logger.info(f"Full cycle: HIT in {total_time_ms:.2f}ms (infinite speed!)")
         return audio_reuse_path
@@ -253,7 +254,7 @@ def generate_audio(model, text: str, audio_prompt_path: Optional[str], exaggerat
     if not reuse_result and (valid_path or audio_prompt_path):
         voice_stem = Path(valid_path or audio_prompt_path).stem.replace('_fixed', '').split('_')[0]
         logger.debug(f"Enqueued for fuzzy index (MISS): \"{text[:20]}\" (norm stem={voice_stem})")
-        _fuzzy_queue.put((text, wave_file, voice_stem))
+        FUZZY_QUEUE.put((text, wave_file, voice_stem))
 
     # Stats
     stats = get_cache_stats()
