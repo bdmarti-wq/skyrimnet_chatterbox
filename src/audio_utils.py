@@ -251,7 +251,6 @@ def apply_eq(audio: np.ndarray, sr: int, gain_db: float | None = 0.0, cutoff_hz:
     return np.clip(audio, -1.0, 1.0)
 
 
-# ... (other imports/funcs unchanged: trim_silence, denoise..., eq, notch, etc.)
 
 def apply_gain_normalization(audio: np.ndarray, target_max: Optional[float] = None,
                              max_gain_limit: float = 1.0) -> np.ndarray:
@@ -330,11 +329,8 @@ def apply_fade(audio: np.ndarray, sr: int, fade_ms: float | None = 20.0) -> np.n
 
 
 
-import asyncio  # Ensure at top
-from config import CONFIG
-
 async def apply_post_processing(wav: torch.Tensor, sr: int, params: dict | None = None) -> np.ndarray:
-    """Async post: Trim → Denoise → EQ → Notch → Normalize → Rate → Trail Cut → Fade → Clamp. FIXED: Async (executor for heavy librosa); speed (n_fft=1024, skip stretch=1.0); trail cut (-45dB post-rate); config 'enable_post_resample'=False no-op. FIXED: All vars (wav_np, enable_denoise, eq_gain_db, etc.) defined early in outer/inner (no reference/scope errors on skip/exception). Applied flags via nonlocal (track if ran)."""
+    """Async post: Trim → Pad → Heavy (denoise/EQ/notch/norm) → Rate → Trail Cut → Fade → Clamp. FIXED: Scope (all vars outer before heavy; nonlocal after assigns). Gated pad (enable_audio_padding; uses base_audio_pad_sec or legacy post_pad_sec)."""
     if params is None:
         params = {}
         logger.debug("Post skipped (no params) – raw")
@@ -364,22 +360,54 @@ async def apply_post_processing(wav: torch.Tensor, sr: int, params: dict | None 
 
     loop = asyncio.get_running_loop()
 
-    # Config min guard
+    # FIXED: All params/vars defined early (outer; before heavy; no scope error)
     min_dur_sec = CONFIG.clamp_value('min_post_duration_sec', params.get('min_post_duration_sec', CONFIG.get_value('min_post_duration_sec', 0.05)))
     min_samples = int(sr * min_dur_sec)
     light_mode = orig_len < min_samples
     if light_mode:
         logger.debug(f"Short input < {min_dur_sec}s – light post (skip heavy)")
 
-    # Trim (sync; fast)
+    # Trim params (early)
     trim_db = CONFIG.clamp_value('trim_threshold_db', params.get('trim_threshold_db', CONFIG.get_value('trim_threshold_db', -30.0)))
+    hop = params.get('hop_length', CONFIG.get_value('hop_length', 256))
+    frame_factor = CONFIG.clamp_value('trim_frame_length_factor', params.get('trim_frame_length_factor', CONFIG.get_value('trim_frame_length_factor', 4)))
+    frame_length = hop * frame_factor
+    n_fft_trim = CONFIG.clamp_value('max_n_fft_for_trim', min(params.get('max_n_fft_for_trim', CONFIG.get_value('max_n_fft_for_trim', 2048)), orig_len))
     did_trim = False
-    if trim_db is not None and abs(trim_db) > 5 and not light_mode:
-        hop = params.get('hop_length', CONFIG.get_value('hop_length', 256))
-        frame_factor = CONFIG.clamp_value('trim_frame_length_factor', params.get('trim_frame_length_factor', CONFIG.get_value('trim_frame_length_factor', 4)))
-        frame_length = hop * frame_factor
-        n_fft_trim = CONFIG.clamp_value('max_n_fft_for_trim', min(params.get('max_n_fft_for_trim', CONFIG.get_value('max_n_fft_for_trim', 2048)), orig_len))
 
+    # Pad params (early; gated)
+    enable_audio_pad = params.get('enable_audio_padding', CONFIG.get_value('enable_audio_padding', True))
+    base_pad_sec = params.get('base_audio_pad_sec', params.get('post_pad_sec', CONFIG.get_value('base_audio_pad_sec', 0.15)))
+    multiplier = CONFIG.clamp_value('tiny_audio_pad_multiplier', params.get('tiny_audio_pad_multiplier', CONFIG.get_value('tiny_audio_pad_multiplier', 2.0)))
+    tiny_threshold = CONFIG.clamp_value('tiny_threshold_sec', params.get('tiny_threshold_sec', CONFIG.get_value('tiny_threshold_sec', 0.5)))
+    did_pad = False
+    is_tiny = False  # Set later
+
+    # Heavy params (early; before def)
+    noise_floor_db = CONFIG.clamp_value('noise_floor_db', params.get('noise_floor_db', CONFIG.get_value('noise_floor_db', -60.0)))
+    min_denoise_samples = CONFIG.clamp_value('min_samples_for_denoise', params.get('min_samples_for_denoise', CONFIG.get_value('min_samples_for_denoise', 100)))
+    n_fft_denoise = min(CONFIG.clamp_value('n_fft_denoise', params.get('n_fft_denoise', CONFIG.get_value('n_fft_denoise', 1024))), orig_len * 2)
+    eq_gain_db = CONFIG.clamp_value('eq_gain_db', params.get('eq_gain_db', CONFIG.get_value('eq_gain_db', 0.0)))
+    eq_cutoff_hz = CONFIG.clamp_value('eq_cutoff_hz', params.get('eq_cutoff_hz', CONFIG.get_value('eq_cutoff_hz', 3000)))
+    notch_gain_db = params.get('notch_gain_db', CONFIG.get_value('notch_gain_db', None))
+    if notch_gain_db is not None:
+        notch_gain_db = CONFIG.clamp_value('notch_gain_db', notch_gain_db)
+    notch_low_hz = CONFIG.clamp_value('notch_low_hz', params.get('notch_low_hz', CONFIG.get_value('notch_low_hz', 8000)))
+    notch_high_hz = CONFIG.clamp_value('notch_high_hz', params.get('notch_high_hz', CONFIG.get_value('notch_high_hz', 11000)))
+    norm_method = params.get('normalize_method', CONFIG.get_value('normalize_method', 'peak'))
+    enable_norm = params.get('enable_denoise_normalize', CONFIG.get_value('enable_denoise_normalize', False))
+    enable_denoise = params.get('enable_denoising', CONFIG.get_value('enable_denoising', False))
+    enable_resample = params.get('enable_post_resample', CONFIG.get_value('enable_post_resample', False))
+    rate = CONFIG.clamp_value('speaking_rate', params.get('speaking_rate', CONFIG.get_value('speaking_rate', 1.0)))
+    trail_db = params.get('trailing_silence_db', CONFIG.get_value('trailing_silence_db', -45.0))
+    trail_db = CONFIG.clamp_value('trailing_silence_db', trail_db)
+    fade_ms = params.get('fade_ms', CONFIG.get_value('fade_ms', None))
+    if fade_ms is not None:
+        fade_ms = CONFIG.clamp_value('fade_ms', fade_ms)
+    gain_limit = CONFIG.clamp_value('gain_max_limit', params.get('gain_max_limit', CONFIG.get_value('gain_max_limit', 1.0)))
+
+    # Trim (sync; fast) – before pad/new_len
+    if trim_db is not None and abs(trim_db) > 5 and not light_mode:
         try:
             wav_np_trim, _ = librosa.effects.trim(wav_np, top_db=abs(trim_db), frame_length=frame_length, hop_length=hop)
             if len(wav_np_trim) == 0:
@@ -394,21 +422,24 @@ async def apply_post_processing(wav: torch.Tensor, sr: int, params: dict | None 
     else:
         logger.debug(f"Trim skipped (db={trim_db}; light={light_mode})")
 
-    # Targeted pad: Extra for tiny words ("ah"); base for all (smooths edges) TOTO config ON/OFF
-    post_pad_sec = params.get('post_pad_sec', CONFIG.get_value('post_pad_sec', 0.15))
-    is_tiny = orig_dur < 0.5  # Target short vocalises (<0.5s base; post-trim)
-    if is_tiny:
-        post_pad_sec *= 2  # Double (0.3s/side for tiny; ~0.6s total add)
-        logger.debug(f"Tiny audio detected ({orig_dur:.2f}s) – extra pad: {post_pad_sec}s/side")
-    did_pad = False
-    if post_pad_sec > 0 and len(wav_np) > 0:
-        pad_len = int(sr * post_pad_sec * 2)  # Front + back
-        silence = np.zeros(int(sr * post_pad_sec), dtype=wav_np.dtype)
-        wav_np = np.concatenate([silence, wav_np, silence])
-        did_pad = True
-        logger.debug(
-            f"Pad applied: {post_pad_sec}s silence each side (total {pad_len} samples; tiny_extra={is_tiny})")
+    # Gated pad (after trim; uses orig_dur for is_tiny)
+    if not enable_audio_pad:
+        logger.debug("Audio padding skipped (enable=False)")
+    else:
+        is_tiny = orig_dur < tiny_threshold  # FIXED: Pre-pad (catches shorts); var outer
+        if is_tiny:
+            base_pad_sec *= multiplier
+            logger.debug(f"Tiny audio ({orig_dur:.2f}s < {tiny_threshold}s) – pad x{multiplier}: {base_pad_sec}s/side")
+        if base_pad_sec > 0 and len(wav_np) > 0:
+            pad_len = int(sr * base_pad_sec * 2)  # Front + back
+            silence = np.zeros(int(sr * base_pad_sec), dtype=wav_np.dtype)
+            wav_np = np.concatenate([silence, wav_np, silence])
+            did_pad = True
+            logger.debug(f"Pad applied: {base_pad_sec}s silence each side (total {pad_len} samples; tiny_extra={is_tiny})")
+        else:
+            logger.debug(f"Pad skipped (sec={base_pad_sec}; len={len(wav_np)})")
 
+    # FIXED: new_len early (post-trim/pad; before heavy)
     new_len = len(wav_np)
     new_dur = new_len / sr
     heavy_skip = new_len < min_samples
@@ -417,41 +448,18 @@ async def apply_post_processing(wav: torch.Tensor, sr: int, params: dict | None 
     elif did_pad:
         logger.debug(f"Post-pad length: {new_len} samples ({new_dur:.2f}s)")
 
-    # FIXED: Define applied flags in outer (track if each step ran; nonlocal to heavy)
-    did_denoise = False
-    did_eq = False
-    did_notch = False
-    did_normalize = False
-    # All config vars early (for applied checks; no reliance on heavy)
-    enable_denoise = params.get('enable_denoising', CONFIG.get_value('enable_denoising', False))
-    eq_gain_db = CONFIG.clamp_value('eq_gain_db', params.get('eq_gain_db', CONFIG.get_value('eq_gain_db', 0.0)))
-    notch_gain_db = params.get('notch_gain_db', CONFIG.get_value('notch_gain_db', None))
-    if notch_gain_db is not None:
-        notch_gain_db = CONFIG.clamp_value('notch_gain_db', notch_gain_db)
-    enable_norm = params.get('enable_denoise_normalize', CONFIG.get_value('enable_denoise_normalize', False))
+    # Flags (no def yet)
+    did_denoise = did_eq = did_notch = did_normalize = did_rate = did_trail_cut = did_fade = False
 
-    # Heavy steps in executor (async speed; offloads CPU)
+    # Heavy steps in executor (now all vars in outer scope; safe nonlocal)
     def heavy_processing():
-        nonlocal wav_np, did_denoise, did_eq, did_notch, did_normalize  # FIXED: Nonlocal for wav_np + flags (mod in inner, access outer)
-        # Config denoise params early (always define; no scope error)
-        noise_floor_db = CONFIG.clamp_value('noise_floor_db', params.get('noise_floor_db', CONFIG.get_value('noise_floor_db', -60.0)))
-        min_denoise_samples = CONFIG.clamp_value('min_samples_for_denoise', params.get('min_samples_for_denoise', CONFIG.get_value('min_samples_for_denoise', 100)))
-        n_fft_denoise = CONFIG.clamp_value('n_fft_denoise', params.get('n_fft_denoise', CONFIG.get_value('n_fft_denoise', 1024)))  # Always defined (faster default)
-        n_fft_denoise = min(n_fft_denoise, new_len * 2)  # Scale to len
-        hop_length = params.get('hop_length', CONFIG.get_value('hop_length', 256))
-        eq_cutoff_hz = CONFIG.clamp_value('eq_cutoff_hz', params.get('eq_cutoff_hz', CONFIG.get_value('eq_cutoff_hz', 3000)))
-        notch_low_hz = CONFIG.clamp_value('notch_low_hz', params.get('notch_low_hz', CONFIG.get_value('notch_low_hz', 8000)))
-        notch_high_hz = CONFIG.clamp_value('notch_high_hz', params.get('notch_high_hz', CONFIG.get_value('notch_high_hz', 11000)))
-        norm_method = params.get('normalize_method', CONFIG.get_value('normalize_method', 'peak'))
+        nonlocal wav_np, did_denoise, did_eq, did_notch, did_normalize  # Now safe (all defined outer)
 
-        # Denoise (if enabled and not skipped)
-        # Denoise (enhanced spectral gating for bursts)
+        # Denoise (gated + fixed mask)
         if enable_denoise and not heavy_skip and new_len >= min_denoise_samples:
             try:
-                # Pre: High-pass 80Hz (cut low-rumble/breaths; preserve voice >80Hz)
-                highpass_hz = CONFIG.clamp_value('denoise_highpass_hz', params.get('highpass_cutoff_hz',
-                                                                                   CONFIG.get_value(
-                                                                                       'highpass_cutoff_hz', 80)))
+                # Pre: High-pass
+                highpass_hz = CONFIG.clamp_value('denoise_highpass_hz', params.get('highpass_cutoff_hz', 80))
                 if highpass_hz > 0:
                     nyquist = sr / 2.0
                     highpass_norm = highpass_hz / nyquist
@@ -459,50 +467,42 @@ async def apply_post_processing(wav: torch.Tensor, sr: int, params: dict | None 
                     wav_np = sosfilt(sos_hp, wav_np)
                     logger.debug(f"Denoise pre-highpass: {highpass_hz}Hz")
 
-                # Spectral gating (median smooth on mag; better for bursts than subtract)
-                n_fft_denoise = CONFIG.clamp_value('n_fft_denoise',
-                                                   params.get('n_fft_denoise', CONFIG.get_value('n_fft_denoise', 1024)))
-                n_fft_denoise = min(n_fft_denoise, new_len * 2)
-                hop_length = params.get('hop_length', CONFIG.get_value('hop_length', 256))
-
-                # STFT
-                stft = librosa.stft(wav_np, n_fft=n_fft_denoise, hop_length=hop_length)
+                # Spectral gating (fixed)
+                stft = librosa.stft(wav_np, n_fft=n_fft_denoise, hop_length=hop)
                 mag, phase = np.abs(stft), np.angle(stft)
 
-                # Enhanced: Median filter on high-band magnitudes (targets chirps)
+                freqs = librosa.fft_frequencies(sr=sr, n_fft=n_fft_denoise)
                 target_low = CONFIG.get_value('denoise_target_band_low', 5000)
                 target_high = CONFIG.get_value('denoise_target_band_high', 12000)
-                ksize = CONFIG.get_value('denoise_median_ksize', 3)  # 3-frame median (smooth bursts)
-                band_mask = (np.abs(np.fft.fftfreq(n_fft_denoise, 1 / sr)) >= target_low / sr) & (
-                            np.abs(np.fft.fftfreq(n_fft_denoise, 1 / sr)) <= target_high / sr)
+                band_mask = (freqs >= target_low) & (freqs <= target_high)
+                ksize = CONFIG.get_value('denoise_median_ksize', 3)
                 for frame in range(mag.shape[1]):
-                    high_mag = mag[band_mask, frame]  # High-band slice
+                    high_mag = mag[band_mask, frame]
                     if len(high_mag) > ksize:
                         median_high = np.median(high_mag)
-                        mag[band_mask, frame] = np.clip(mag[band_mask, frame], 0,
-                                                        median_high * 0.5)  # Gate 50% max in band (aggressive on peaks)
-                clean_stft = mag * phase
-                wav_np = librosa.istft(clean_stft, hop_length=hop_length, length=new_len)
+                        mag[band_mask, frame] = np.clip(high_mag, 0, median_high * 0.5)  # Or 0.7 milder
+
+                clean_stft = mag * np.exp(1j * phase)
+                wav_np = librosa.istft(clean_stft, hop_length=hop, length=new_len)
                 did_denoise = True
-                logger.debug(
-                    f"Denoise gating applied ({noise_floor_db}dB floor, {target_low}-{target_high}Hz band, median k={ksize}, n_fft={n_fft_denoise})")
+                logger.debug(f"Denoise gating applied (band {target_low}-{target_high}Hz, k={ksize}, n_fft={n_fft_denoise})")
             except Exception as denoise_e:
-                logger.warning(f"Denoise failed ({new_len} samples, n_fft={n_fft_denoise}): {denoise_e} – skip")
+                logger.warning(f"Denoise failed ({new_len} samples): {denoise_e} – skip")
         else:
             logger.debug(f"Denoise skipped (enable={enable_denoise}; skip={heavy_skip})")
 
-        # EQ (similar: define params early)
+        # EQ
         if eq_gain_db != 0.0 and not heavy_skip and len(wav_np) > 0:
             nyquist = sr / 2.0
             cutoff_norm = min(1.0, max(0.01, eq_cutoff_hz / nyquist))
             sos = butter(4, cutoff_norm, btype='lowpass' if eq_gain_db < 0 else 'highpass', output='sos')
-            wav_np = sosfilt(sos, wav_np)  # Modify nonlocal
-            did_eq = True  # FIXED: Set flag if success
+            wav_np = sosfilt(sos, wav_np)
+            did_eq = True
             logger.debug(f"EQ applied ({eq_gain_db}dB {'low' if eq_gain_db < 0 else 'high'}-pass @ {eq_cutoff_hz}Hz)")
         else:
             logger.debug(f"EQ skipped (gain={eq_gain_db}, heavy_skip={heavy_skip})")
 
-        # Notch (define early)
+        # Notch
         if notch_gain_db is not None and notch_gain_db < 0 and not heavy_skip and len(wav_np) > 0:
             nyquist = sr / 2.0
             low_norm = max(0.01, min(0.99, notch_low_hz / nyquist))
@@ -511,44 +511,42 @@ async def apply_post_processing(wav: torch.Tensor, sr: int, params: dict | None 
                 sos_notch = butter(4, [low_norm, high_norm], btype='bandstop', output='sos')
                 gain_factor = 10 ** (notch_gain_db / 20.0)
                 notched = sosfilt(sos_notch, wav_np)
-                wav_np = notched * gain_factor + wav_np * (1 - gain_factor)  # Modify nonlocal
-                did_notch = True  # FIXED: Set flag if success
+                wav_np = notched * gain_factor + wav_np * (1 - gain_factor)
+                did_notch = True
                 logger.debug(f"Notch applied ({notch_gain_db}dB @ {notch_low_hz}-{notch_high_hz}Hz)")
             else:
                 logger.debug(f"Notch skipped (invalid range {notch_low_hz}-{notch_high_hz})")
         else:
             logger.debug(f"Notch skipped (gain={notch_gain_db}, heavy_skip={heavy_skip})")
 
-        # Normalize (early params)
+        # Normalize
         if enable_norm and len(wav_np) > 0:
             if norm_method == 'peak':
                 peak = np.max(np.abs(wav_np))
                 if peak > 0:
-                    wav_np = (wav_np / peak) * 0.95  # Modify nonlocal
-                    did_normalize = True  # FIXED: Set flag if success
+                    wav_np = (wav_np / peak) * 0.95
+                    did_normalize = True
                     logger.debug(f"Normalize ({norm_method}: peak -1dB)")
             elif norm_method == 'rms':
                 rms = np.sqrt(np.mean(wav_np ** 2))
                 if rms > 0:
                     target_rms_db = params.get('target_rms_db', CONFIG.get_value('ebu_post_gain_db', -18))
                     target_rms = 10 ** (target_rms_db / 20)
-                    wav_np *= target_rms / rms  # Modify nonlocal
-                    did_normalize = True  # FIXED: Set flag if success
+                    wav_np *= target_rms / rms
+                    did_normalize = True
                     logger.debug(f"Normalize ({norm_method}: RMS {target_rms_db}dB)")
 
-        return wav_np  # Returns processed
+        return wav_np
 
-    # Async heavy (offloads to thread; ~50% faster than sync librosa)
+    # Async heavy (all vars now outer; no scope issue)
     wav_np_heavy = await loop.run_in_executor(None, heavy_processing)
     new_len_heavy = len(wav_np_heavy)
     logger.debug(f"Post-heavy: {new_len_heavy/sr:.2f}s (from {new_dur:.2f}s)")
 
-    # Rate (if enabled; executor if stretch heavy)
-    enable_resample = params.get('enable_post_resample', CONFIG.get_value('enable_post_resample', False))
-    rate = CONFIG.clamp_value('speaking_rate', params.get('speaking_rate', CONFIG.get_value('speaking_rate', 1.0)))
-    did_rate = False
+    # Rate (if enabled; executor if heavy)
     if enable_resample and abs(rate - 1.0) > 0.05 and new_len_heavy > 0:
         def rate_stretch():
+            nonlocal wav_np  # Now only if needed (less risky)
             target_len = int(new_len_heavy * rate)
             if target_len > 0:
                 stretch_rate = 1.0 / rate
@@ -566,31 +564,27 @@ async def apply_post_processing(wav: torch.Tensor, sr: int, params: dict | None 
         logger.debug(f"Rate skipped (enable={enable_resample}; rate={rate})")
         wav_np = wav_np_heavy
 
-    # Trail cut (new: Silence after rate; for breathy trails)
-    trail_db = params.get('trailing_silence_db', CONFIG.get_value('trailing_silence_db', -45.0))
-    trail_db = CONFIG.clamp_value('trailing_silence_db', trail_db)
-    did_trail_cut = False
-    if abs(trail_db) > 30 and len(wav_np) > sr * 0.1:  # Apply if meaningful
+    # Trail cut (gated + skip for tiny)
+    if abs(trail_db) > 30 and len(wav_np) > sr * 0.1:
         def cut_trails():
-            # Trim end only (keep start breaths)
+            nonlocal wav_np  # Safe now
             threshold = 10 ** (trail_db / 20)
             abs_audio = np.abs(wav_np)
             end_idx = len(wav_np) - np.argmax(abs_audio[::-1] > threshold)
             if end_idx < len(wav_np):
                 trimmed = wav_np[:end_idx]
-                logger.debug(f"Trail cut ({trail_db}dB): {len(trimmed)/sr:.2f}s (cut { (len(wav_np)-end_idx)/sr :.2f}s trail)")
+                logger.debug(f"Trail cut ({trail_db}dB): {len(trimmed)/sr:.2f}s (cut {(len(wav_np)-end_idx)/sr :.2f}s trail)")
                 return trimmed
             return wav_np
-        wav_np = await loop.run_in_executor(None, cut_trails)
-        did_trail_cut = len(wav_np) < new_len_heavy  # If shortened
+        if is_tiny:
+            logger.debug("Trail cut skipped for tiny audio (preserve sustain)")
+        else:
+            wav_np = await loop.run_in_executor(None, cut_trails)
+            did_trail_cut = len(wav_np) < new_len_heavy
     else:
         logger.debug(f"Trail cut skipped (db={trail_db})")
 
-    # Fade (sync; fast)
-    fade_ms = params.get('fade_ms', CONFIG.get_value('fade_ms', None))
-    if fade_ms is not None:
-        fade_ms = CONFIG.clamp_value('fade_ms', fade_ms)
-    did_fade = False
+    # Fade (if enabled)
     if fade_ms is not None and fade_ms > 0 and len(wav_np) > sr * 0.05:
         fade_samples = int(sr * (fade_ms / 1000.0))
         if len(wav_np) > 2 * fade_samples:
@@ -605,8 +599,7 @@ async def apply_post_processing(wav: torch.Tensor, sr: int, params: dict | None 
     else:
         logger.debug(f"Fade skipped (ms={fade_ms})")
 
-    # Clamp (sync)
-    gain_limit = CONFIG.clamp_value('gain_max_limit', params.get('gain_max_limit', CONFIG.get_value('gain_max_limit', 1.0)))
+    # Clamp
     wav_np = np.clip(wav_np, -gain_limit, gain_limit)
     if gain_limit != 1.0:
         logger.debug(f"Gain clamped to {gain_limit}")
@@ -615,13 +608,14 @@ async def apply_post_processing(wav: torch.Tensor, sr: int, params: dict | None 
     wav_np = np.clip(wav_np, -1.0, 1.0)
     final_len = len(wav_np)
     final_dur = final_len / sr
-    # FIXED: Use outer-defined vars/flags (all available; no reference error from inner)
+
+    # Flags (after all)
     applied = []
     if did_trim: applied.append('trim')
-    if did_denoise: applied.append('denoise')  # Flag from heavy
-    if did_eq: applied.append('eq')  # Flag from heavy
-    if did_notch: applied.append('notch')  # Flag from heavy
-    if did_normalize: applied.append('normalize')  # Flag from heavy
+    if did_denoise: applied.append('denoise')
+    if did_eq: applied.append('eq')
+    if did_notch: applied.append('notch')
+    if did_normalize: applied.append('normalize')
     if did_rate: applied.append('rate')
     if did_trail_cut: applied.append('trail_cut')
     if did_fade: applied.append('fade')
@@ -637,7 +631,7 @@ async def apply_post_processing(wav: torch.Tensor, sr: int, params: dict | None 
             wav_np = np.zeros(fallback_len)
             logger.debug(f"Fallback silence {fallback_sec}s")
 
-    return wav_np  # Awaitable now (async func)
+    return wav_np
 
 
 

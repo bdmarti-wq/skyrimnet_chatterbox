@@ -18,7 +18,6 @@
     "enable_post_processing": true,
     "enable_denoising": true,
     "enable_denoise_normalize": true,
-    "enable_audio_padding": true,
     "trim_threshold_db": -35.0,
     "noise_floor_db": -35.0,
     "normalize_method": "peak",
@@ -35,6 +34,14 @@
     "highpass_cutoff_hz": 80,
     "post_pad_sec": 0.15,
     "min_post_duration_sec": 0.02,
-    "n_fft_denoise": 1024
+    "n_fft_denoise": 1024,
+    "enable_audio_padding": true,
+    "base_audio_pad_sec": 0.2,
+    "tiny_audio_pad_multiplier": 2.0,
+    "tiny_threshold_sec": 0.4,
+    "enable_text_padding": true,
+    "text_ellipses_count": 2,
+    "max_short_word_len": 3,
+    "vocalise_patterns": ["ah", "oh", "aah", "mmm"]
   }
 }

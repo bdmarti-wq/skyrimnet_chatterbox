@@ -584,11 +584,13 @@ class SkyrimNetConfig:
                 return clamped
         return value  # No clamp for non-numerics/missing CAPS
 
+
     @property
     def audio_defaults(self) -> Dict[str, Any]:
-        """Audio params subset (merged; from alt; sharable property)."""
+        """Audio params subset (merged; from alt; sharable property). FIXED: Added padding gates/tunables."""
         if not hasattr(self, '_audio_defaults'):
             self._audio_defaults = {
+                # Existing core
                 'enable_post_processing': self.get_value('enable_post_processing', default=False),
                 'enable_post_resample': self.get_value('enable_post_resample', default=True),
                 'enable_post_jit_gain': self.get_value('enable_post_jit_gain', default=True),
@@ -606,12 +608,23 @@ class SkyrimNetConfig:
                 'notch_high_hz': self.get_value('notch_high_hz'),
                 'n_fft': self.get_value('n_fft'),
                 'hop_length': self.get_value('hop_length'),
-                'fade_ms': self.get_value('fade_ms'),
+                'fade_ms': self.get_value('fade_ms'),  # From DEFAULTS None (skips unless voice sets)
                 'normalize_method': self.get_value('normalize_method'),
                 'enable_denoise_normalize': self.get_value('enable_denoise_normalize'),
-                'enable_denoising': self.get_value('enable_denoising')
+                'enable_denoising': self.get_value('enable_denoising'),
+
+                # NEW: Padding gates/tunables (merged like others)
+                'enable_audio_padding': self.get_value('enable_audio_padding', default=True),
+                'base_audio_pad_sec': self.get_value('base_audio_pad_sec'),
+                'tiny_audio_pad_multiplier': self.get_value('tiny_audio_pad_multiplier'),
+                'tiny_threshold_sec': self.get_value('tiny_threshold_sec'),
+                'enable_text_padding': self.get_value('enable_text_padding', default=True),
+                'text_ellipses_count': self.get_value('text_ellipses_count'),
+                'max_short_word_len': self.get_value('max_short_word_len'),
+                'vocalise_patterns': self.get_value('vocalise_patterns'),  # List
             }
         return self._audio_defaults
+
 
     def get_merged_audio_params(self, voice_name: Optional[str] = None, api_overrides: Optional[Dict] = None) -> Dict[str, Any]:
         """Merge: audio_defaults → Voice (JSON) → API. FIXED: Log all keys in merged (voice/raw + final); force voice get."""
