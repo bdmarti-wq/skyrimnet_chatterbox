@@ -394,11 +394,28 @@ async def apply_post_processing(wav: torch.Tensor, sr: int, params: dict | None 
     else:
         logger.debug(f"Trim skipped (db={trim_db}; light={light_mode})")
 
+    # Targeted pad: Extra for tiny words ("ah"); base for all (smooths edges) TOTO config ON/OFF
+    post_pad_sec = params.get('post_pad_sec', CONFIG.get_value('post_pad_sec', 0.15))
+    is_tiny = orig_dur < 0.5  # Target short vocalises (<0.5s base; post-trim)
+    if is_tiny:
+        post_pad_sec *= 2  # Double (0.3s/side for tiny; ~0.6s total add)
+        logger.debug(f"Tiny audio detected ({orig_dur:.2f}s) – extra pad: {post_pad_sec}s/side")
+    did_pad = False
+    if post_pad_sec > 0 and len(wav_np) > 0:
+        pad_len = int(sr * post_pad_sec * 2)  # Front + back
+        silence = np.zeros(int(sr * post_pad_sec), dtype=wav_np.dtype)
+        wav_np = np.concatenate([silence, wav_np, silence])
+        did_pad = True
+        logger.debug(
+            f"Pad applied: {post_pad_sec}s silence each side (total {pad_len} samples; tiny_extra={is_tiny})")
+
     new_len = len(wav_np)
     new_dur = new_len / sr
     heavy_skip = new_len < min_samples
     if heavy_skip:
-        logger.debug("Post-trim short – skip heavy")
+        logger.debug("Post-trim/pad short – skip heavy")
+    elif did_pad:
+        logger.debug(f"Post-pad length: {new_len} samples ({new_dur:.2f}s)")
 
     # FIXED: Define applied flags in outer (track if each step ran; nonlocal to heavy)
     did_denoise = False
@@ -428,20 +445,51 @@ async def apply_post_processing(wav: torch.Tensor, sr: int, params: dict | None 
         norm_method = params.get('normalize_method', CONFIG.get_value('normalize_method', 'peak'))
 
         # Denoise (if enabled and not skipped)
+        # Denoise (enhanced spectral gating for bursts)
         if enable_denoise and not heavy_skip and new_len >= min_denoise_samples:
             try:
-                stft = librosa.stft(wav_np, n_fft=n_fft_denoise, hop_length=hop_length)  # Now always defined
+                # Pre: High-pass 80Hz (cut low-rumble/breaths; preserve voice >80Hz)
+                highpass_hz = CONFIG.clamp_value('denoise_highpass_hz', params.get('highpass_cutoff_hz',
+                                                                                   CONFIG.get_value(
+                                                                                       'highpass_cutoff_hz', 80)))
+                if highpass_hz > 0:
+                    nyquist = sr / 2.0
+                    highpass_norm = highpass_hz / nyquist
+                    sos_hp = butter(4, highpass_norm, btype='high', output='sos')
+                    wav_np = sosfilt(sos_hp, wav_np)
+                    logger.debug(f"Denoise pre-highpass: {highpass_hz}Hz")
+
+                # Spectral gating (median smooth on mag; better for bursts than subtract)
+                n_fft_denoise = CONFIG.clamp_value('n_fft_denoise',
+                                                   params.get('n_fft_denoise', CONFIG.get_value('n_fft_denoise', 1024)))
+                n_fft_denoise = min(n_fft_denoise, new_len * 2)
+                hop_length = params.get('hop_length', CONFIG.get_value('hop_length', 256))
+
+                # STFT
+                stft = librosa.stft(wav_np, n_fft=n_fft_denoise, hop_length=hop_length)
                 mag, phase = np.abs(stft), np.angle(stft)
-                noise_floor = 10 ** (noise_floor_db / 20.0)
-                clean_mag = np.maximum(mag - noise_floor, 0.0)
-                clean_stft = clean_mag * np.exp(1j * phase)
-                wav_np = librosa.istft(clean_stft, hop_length=hop_length, length=new_len)  # Modify nonlocal
-                did_denoise = True  # FIXED: Set flag if success
-                logger.debug(f"Denoise applied ({noise_floor_db}dB, n_fft={n_fft_denoise}, hop={hop_length}, min_samples={min_denoise_samples})")
+
+                # Enhanced: Median filter on high-band magnitudes (targets chirps)
+                target_low = CONFIG.get_value('denoise_target_band_low', 5000)
+                target_high = CONFIG.get_value('denoise_target_band_high', 12000)
+                ksize = CONFIG.get_value('denoise_median_ksize', 3)  # 3-frame median (smooth bursts)
+                band_mask = (np.abs(np.fft.fftfreq(n_fft_denoise, 1 / sr)) >= target_low / sr) & (
+                            np.abs(np.fft.fftfreq(n_fft_denoise, 1 / sr)) <= target_high / sr)
+                for frame in range(mag.shape[1]):
+                    high_mag = mag[band_mask, frame]  # High-band slice
+                    if len(high_mag) > ksize:
+                        median_high = np.median(high_mag)
+                        mag[band_mask, frame] = np.clip(mag[band_mask, frame], 0,
+                                                        median_high * 0.5)  # Gate 50% max in band (aggressive on peaks)
+                clean_stft = mag * phase
+                wav_np = librosa.istft(clean_stft, hop_length=hop_length, length=new_len)
+                did_denoise = True
+                logger.debug(
+                    f"Denoise gating applied ({noise_floor_db}dB floor, {target_low}-{target_high}Hz band, median k={ksize}, n_fft={n_fft_denoise})")
             except Exception as denoise_e:
                 logger.warning(f"Denoise failed ({new_len} samples, n_fft={n_fft_denoise}): {denoise_e} – skip")
         else:
-            logger.debug(f"Denoise skipped (enable={enable_denoise}, heavy_skip={heavy_skip}, len={new_len} < {min_denoise_samples})")
+            logger.debug(f"Denoise skipped (enable={enable_denoise}; skip={heavy_skip})")
 
         # EQ (similar: define params early)
         if eq_gain_db != 0.0 and not heavy_skip and len(wav_np) > 0:

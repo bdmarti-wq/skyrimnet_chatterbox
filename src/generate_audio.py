@@ -29,6 +29,15 @@ def set_seed(seed: int):
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
 
+# Text padding for short/vocalise (pre-TTS; smooths garble via pauses) TOTO config on off
+def pad_short_text(text: str, max_word_len: int = 3, ellipses: int = 2) -> str:
+    words = text.strip().split()
+    if len(words) == 1 and len(words[0]) <= max_word_len and words[0].isalpha() or '...' in words[0]:  # Tiny word or vocalise
+        pad = '...' * ellipses  # 2 ellipses ~0.3s pause
+        padded = f"{pad} {text} {pad}".strip()
+        logger.debug(f"Text padded for short: '{text}' → '{padded}'")
+        return padded
+    return text
 
 def _generate_audio_core(model, generate_args: Dict[str, Any], t3_params: Dict[str, Any]) -> torch.Tensor:
     """Core: Just model.generate + graph retry. Returns wav; no del/cleanup."""
@@ -160,6 +169,10 @@ async def generate_audio(model, text: str, audio_prompt_path: Optional[str], exa
         create_dummy_conds(model, DEVICE, DTYPE, "no_text")
         dummy_path = str(save_torchaudio_wav(torch.zeros(1, 24000), 24000, uuid=cache_uuid))  # Short dummy path
         return dummy_path
+
+    # In generate_audio, after if not text: ... else:
+    text = pad_short_text(text, max_word_len=3, ellipses=2)  # Tune ellipses=1-3
+    logger.debug(f"Padded text to TTS: '{text}'")
 
     # Float conversions
     exaggeration = float(exaggeration)

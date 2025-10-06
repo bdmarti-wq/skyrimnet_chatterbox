@@ -63,6 +63,10 @@ class SkyrimNetConfig:
         'ebu_post_gain_db': 0,
         'ebu_true_peak': 0,
 
+        'base_audio_pad_sec': 0.15,                    # Base pad per side (s)
+        'tiny_audio_pad_multiplier': 2.0,              # Extra x for tiny (< tiny_threshold_sec)
+        'tiny_threshold_sec': 0.5,                     # Detect short audio (post-trim dur <
+
         # Strings (adjustable defaults; new from alt)
         'logging_level': 'INFO',
         'tts_name': 'Chatterbox',
@@ -88,6 +92,12 @@ class SkyrimNetConfig:
         'enable_post_jit_gain': True,  # New: Alt (review)
         'enable_post_voice_processing': True,  # New: Alt (review)
         'enable_deferred_cleanup': True,  # New
+        'enable_audio_padding': False,  # Gate silence front/back
+
+        'denoise_highpass_hz': 80,        # High-pass before denoise (cut rumble/breaths)
+        'denoise_median_ksize': 3,         # Median kernel (smooths bursts; odd size)
+        'denoise_target_band_low': 5000,   # Gate high-freq (chirps >5kHz)
+        'denoise_target_band_high': 12000, # Gate up to 12kHz (chirp range)
 
         'max_memory_entries': 100,  # Cache size (voices/conds in RAM; up from 50)
         'save_queue_max': 20,       # Disk save queue limit (prevents backlog)
@@ -142,12 +152,20 @@ class SkyrimNetConfig:
         'FADE_MS_TRAIL_MIN': 20, 'FADE_MS_TRAIL_MAX': 200,
         'TRAILING_SILENCE_DB_MIN': -60, 'TRAILING_SILENCE_DB_MAX': -30,
         'FUZZY_ARTIFACT_THRESHOLD_HZ_MIN': 5000, 'FUZZY_ARTIFACT_THRESHOLD_HZ_MAX': 10000,
+        'DENOISE_HIGHPASS_HZ_MIN': 50, 'DENOISE_HIGHPASS_HZ_MAX': 200,
+        'DENOISE_MEDIAN_KSIZE_MIN': 1, 'DENOISE_MEDIAN_KSIZE_MAX': 5,
+        'DENOISE_TARGET_BAND_LOW_MIN': 3000, 'DENOISE_TARGET_BAND_LOW_MAX': 8000,
+        'DENOISE_TARGET_BAND_HIGH_MIN': 8000, 'DENOISE_TARGET_BAND_HIGH_MAX': 15000,
 
         # Cache Caps (new from alt)
         'COND_CACHE_MAX_ENTRIES_MIN': 10, 'COND_CACHE_MAX_ENTRIES_MAX': 100,
         'FUZZY_CACHE_LIMIT_MIN': 100, 'FUZZY_CACHE_LIMIT_MAX': 5000,
         'FUZZY_THRESHOLD_MIN': 0.50, 'FUZZY_THRESHOLD_MAX': 0.95,
-
+        'AUDIO_PAD_SEC_MIN': 0.0, 'AUDIO_PAD_SEC_MAX': 0.5,
+        'TINY_PAD_MULTIPLIER_MIN': 1.0, 'TINY_PAD_MULTIPLIER_MAX': 3.0,
+        'TINY_THRESHOLD_SEC_MIN': 0.1, 'TINY_THRESHOLD_SEC_MAX': 1.0,
+        'TEXT_ELLIPSES_COUNT_MIN': 0, 'TEXT_ELLIPSES_COUNT_MAX': 5,
+        'SHORT_WORD_LEN_MIN': 1, 'SHORT_WORD_LEN_MAX': 5,
     }
 
     _instance = None
