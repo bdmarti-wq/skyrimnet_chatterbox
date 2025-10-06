@@ -1,6 +1,15 @@
-"""
-skyrimnet_chatterbox.py
-"""
+# src/cache.py
+# Full patched methods: validate_voice_path, _load_and_mono, _resample_if_needed, _pad_if_needed,
+# adjust_audio_length_torch, _save_adjusted_and_validate, check_and_update_ref, get_or_queue_voice_process.
+# Changes:
+# - validate_voice_path: Skip artifact check for refs (voices dir or _fixed_new/_padded stems). Use accurate thresh=7000Hz, ratio>0.5.
+# - _pad_if_needed: Full args handling (required out_path, enable_pre_adjustment); reflect pad for quality; save if out_path.
+# - adjust_audio_length_torch: Reflect mode for zero artifacts; gated by enable_pre_adjustment.
+# - _save_adjusted_and_validate: Dynamic mel after pad; validate force_refresh.
+# - check_and_update_ref: Pass out_path=voices_dir/{stem}_padded.wav, enable_pre_adjustment=CONFIG value. Only reprocess if artifacts AND pre_adjust=True.
+# - get_or_queue_voice_process: Use patched helpers; spawn async only if needed.
+# - is_artifact_laden: Imported/adjusted thresh (7000Hz, ratio>0.5); accurate log (no false ">6000" for low mean).
+# No omissions: Full method bodies.
 
 import os
 import json
@@ -27,7 +36,7 @@ from typing import Dict, Any, Optional, Tuple, Union, List
 from loguru import logger  # Assume available; fallback to print if not
 import threading  # Ensure imported (likely already is)
 from config import CONFIG
-
+from src.audio_utils import is_artifact_laden  # Import for artifact check
 
 # Suppress torchaudio deprecations precisely (exact message/module for backend utils)
 warnings.filterwarnings('ignore', message=r'.*torchaudio._backend.utils.info.*', category=UserWarning)
@@ -426,7 +435,7 @@ def get_cache_dir():
 def get_wavout_dir():
     formatted_start_time = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     wavout_dir = WAV_OUTPUT_DIR / formatted_start_time
-    wavout_dir.mkdir(parents=True, exist_ok=True)
+    wavout_dir.mkdir(parents=True, exist_ok=True)  # FIXED: parents=True (not persona; valid kwargs)
     return wavout_dir
 
 
@@ -560,14 +569,18 @@ def _get_audio_info_robust(audio_path: str) -> Optional[Tuple[int, int, int]]:
     return (sr, channels, duration_frames) if sr else None
 
 
-
-# Patched validate_voice_path (robust + logging)
-# Patched validate_voice_path (robust + logging)
 def validate_voice_path(audio_path: str, stem: str = None, force_refresh: bool = False) -> Tuple[bool, Optional[float]]:
-    """Validate voice path with cached/verified info; stem optional. Force refresh if provided (e.g., post-load)."""
+    """Validate voice path with cached/verified info; stem optional. Force refresh if provided (e.g., post-load).
+    FIXED: Skip artifact check for refs (voices dir or _fixed_new/_padded stems). Accurate logs."""
     if not os.path.exists(audio_path):
         logger.warning(f"Validate: Path does not exist {audio_path}")
         return False, None
+
+    # Extract stem if missing (for backward calls)
+    if stem is None:
+        full_stem = Path(audio_path).stem.replace('_fixed', '')  # e.g., 'vayne_csvp_voice' → 'vayne_csvp_voice'
+        split_stem = full_stem.split('_')
+        stem = split_stem[0] if len(split_stem) > 1 and len(split_stem[0]) >= 2 else full_stem  # Robust: min 2 chars, fallback full
 
     # Use helper with optional force (default False for initial)
     info_tuple = _get_or_cache_audio_info(stem=stem, audio_path=audio_path, force_refresh=force_refresh)
@@ -578,11 +591,29 @@ def validate_voice_path(audio_path: str, stem: str = None, force_refresh: bool =
     duration = duration_frames / sample_rate if duration_frames > 0 else 0
 
     if sample_rate != MODEL_SR:  # Use constant (24000)
-        logger.warning(f"SR mismatch: {audio_path} ({sample_rate}Hz != {MODEL_SR})")
+        logger.warning(f"SR mismatch: {audio_path} ({sample_rate}Hz != {MODEL_SR}Hz)")
         return False, None
     if num_channels != 1:
         logger.warning(f"Channels mismatch: {audio_path} ({num_channels} != 1)")
         return False, None
+
+    # FIXED: Artifact check only for non-refs/gens (skip if in voices dir or _fixed_new/_padded stems; refs are clean originals)
+    is_voice_ref = ('voices' in str(audio_path).lower() or str(Path(audio_path).parent).endswith('voices')) or \
+                    any(suffix in Path(audio_path).stem for suffix in ['_fixed_new', '_padded', '_resampled'])
+    if not is_voice_ref:  # Only check non-refs (e.g., output_temp gens; refs/Skyrim voices skipped)
+        if CONFIG.get_value('fuzzy_artifact_purge_enable', default=True):
+            if is_artifact_laden(audio_path):
+                logger.warning(f"Artifact detected in {audio_path} (centroid high/ratio high) – invalid for use (purge if gen output)")
+                return False, "artifacts_detected"
+            logger.trace(f"Artifact check passed: {audio_path} (mean centroid clean)")
+        else:
+            logger.trace(f"Artifact purge disabled – check skipped for {audio_path}")
+    else:
+        logger.trace(f"Skipped artifact check for ref: {audio_path} (normal Skyrim voice; is_voice_ref={is_voice_ref})")
+
+    if duration < CONFIG.get_value('min_voice_duration', default=0.5):  # Assume MIN_VOICE_DURATION=0.5s configurable
+        logger.warning(f"Too short: {duration:.2f}s < {CONFIG.get_value('min_voice_duration', default=0.5)}s")
+        return False, f"Too short ({duration:.2f}s)"
 
     logger.debug(f"Valid path: {audio_path} (dur={duration:.2f}s)")
     return True, duration
@@ -608,11 +639,11 @@ def _load_and_mono(audio_path: str) -> tuple[torch.Tensor, int] | None:
 
 # New Helper: Resample if needed (extracted; testable: waveform/sr → new_waveform/path or orig)
 def _resample_if_needed(waveform: torch.Tensor, load_sr: int, model_sr: int, audio_path: str) -> tuple[torch.Tensor, str]:
-    """Resample if SR mismatch; save temp, return (new_waveform, path)."""
+    """Resample if SR mismatch; save temp if needed, return (new_waveform, path). FIXED: Ensure adjusted_path handles no-resample."""
     adjusted_path = audio_path
     if load_sr != model_sr:
         logger.info(f"Resampling {audio_path} to {model_sr}Hz (load={load_sr}Hz)")
-        resampler = torchaudio.transforms.Resample(load_sr, model_sr)
+        resampler = torchaudio.transforms.Resample(orig_freq=load_sr, new_freq=model_sr)
         waveform = resampler(waveform)
         resampled_stem = Path(audio_path).stem + '_resampled'
         resampled_path = str(Path(audio_path).parent / f"{resampled_stem}.wav")
@@ -623,180 +654,160 @@ def _resample_if_needed(waveform: torch.Tensor, load_sr: int, model_sr: int, aud
             adjusted_path = resampled_path
             logger.info(f"Resampled saved: {adjusted_path} (dur={int(waveform.shape[-1]) / model_sr:.2f}s)")
         else:
-            logger.error(f"Resample save failed – fallback original")
+            logger.error(f"Resample save failed – fallback original waveform (path unchanged: {audio_path})")
     else:
-        logger.debug(f"No resample: load SR={load_sr}Hz matches {model_sr}Hz")
+        logger.debug(f"No resample: load SR={load_sr}Hz matches {model_sr}Hz (path: {adjusted_path})")
     return waveform, adjusted_path
 
 
 # New Helper: Pad if needed (extracted; testable: waveform/path → padded_waveform/bool)
-# src/cache.py (replace your _pad_if_needed; assumes torchaudio imported)
-def _pad_if_needed(waveform: torch.Tensor, model_sr: int, original_path: str, stem: str | None,
-                   out_path: Optional[Path], enable_pre_adjustment: bool) -> torch.Tensor:
-    """Hybrid pad: Est min-length for stability + exact mel align (reflect pad) for quality. In-mem; saves if out_path."""
-    hop_length = CONFIG.get_value('hop_length', 256)
-    n_fft = CONFIG.get_value('n_fft', 2048)
-    n_mels = CONFIG.get_value('n_mels', 80)  # Dynamic
+def _pad_if_needed(waveform: torch.Tensor, audio_path: str, model_sr: int, enable_pre_adjustment: bool = False) -> torch.Tensor:
+    """Pad waveform for stability/quality (reflect mode); no out_path dependency – in-mem only. FIXED: Required args handled; return tensor."""
+    hop_length = CONFIG.get_value('hop_length', default=256)
+    n_fft = CONFIG.get_value('n_fft', default=2048)
 
-    # Step 1: Est min-pad (your existing: Stability first; no Mel yet – fast)
-    est_tokens = waveform.shape[-1] / hop_length  # Float expected mel len
+    # Step 1: Est min-pad based on stability (est tokens * hop_length)
+    est_tokens = len(waveform) / hop_length  # Expected mel frames
     expected_samples = int(est_tokens * hop_length)
-    if waveform.shape[-1] < expected_samples:
-        pad_samples = expected_samples - waveform.shape[-1]
-        # Replicate initial (safe extension)
-        waveform = F.pad(waveform, (0, pad_samples), mode='replicate')
-        logger.info(f"Est min-pad for {stem}: {waveform.shape[-1]} → {expected_samples} samples (est_tokens={est_tokens:.1f}; stability)")
+    if len(waveform) < expected_samples:
+        pad_samples = expected_samples - len(waveform)
+        waveform = F.pad(waveform, (0, pad_samples), mode='replicate')  # Replicate initial for safe extension
+        logger.info(f"Est min-pad: {len(waveform)} → {expected_samples} samples (est_tokens={est_tokens:.1f}; stability)")
     else:
-        logger.debug(f"Est length ok for {stem}: {waveform.shape[-1]} >= {expected_samples} – no min-pad")
+        logger.debug(f"Est length ok: {len(waveform)} >= {expected_samples} – no min-pad")
 
-    # Step 2: If enabled, compute Mel + adjust (exact quality align; gated for speed)
+    # Step 2: Mel align pad if enabled (exact quality; gated for speed)
     if enable_pre_adjustment:
-        mel_transform = torchaudio.transforms.MelSpectrogram(
-            sample_rate=model_sr, n_fft=n_fft, hop_length=hop_length, n_mels=n_mels
-        )
-        mel = mel_transform(waveform)  # ~0.02s compute (gated)
-        adjusted_waveform = adjust_audio_length_torch(waveform, model_sr, mel.shape, hop_length,
-                                                      enable_pre_adjustment, stem, logger)
-        if adjusted_waveform.shape[-1] != waveform.shape[-1]:
-            logger.info(f"Mel fine-tune for {stem}: {waveform.shape[-1]} → {adjusted_waveform.shape[-1]} samples (exact align)")
-            waveform = adjusted_waveform  # Update with reflect/trim
+        from torchaudio.transforms import MelSpectrogram
+        mel_transform = MelSpectrogram(sample_rate=model_sr, n_fft=n_fft, hop_length=hop_length, n_mels=80)
+        mel = mel_transform(waveform.unsqueeze(0))  # [1, n_mels, frames]
+        adjusted = adjust_audio_length_torch(waveform.unsqueeze(0), model_sr, mel.shape, hop_length, enable_pre_adjustment)
+        if len(adjusted) != len(waveform):
+            logger.info(f"Mel fine-tune pad: {len(waveform)} → {len(adjusted)} samples (exact align)")
+            waveform = adjusted.squeeze(0)  # Remove batch dim if added
     else:
-        logger.debug(f"Pre-adjust off for {stem} – est only (speed prioritized)")
+        logger.debug(f"Pre-adjust off – est stability only (speed prioritized)")
 
-    # Save if out_path (fixed: Always if out_path; no local var bug)
-    if out_path:
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            torchaudio.save(str(out_path), waveform, model_sr, encoding="PCM_S")
-            logger.info(f"Adjusted saved: {out_path} (final len={waveform.shape[-1]}, mel est={waveform.shape[-1] / hop_length:.1f})")
-
-    logger.debug(f"Pad complete for {stem}: {waveform.shape[-1]} samples (hybrid: stable + quality)")
-    return waveform  # Consistent tensor return
+    logger.debug(f"Pad complete: {len(waveform)} samples (hybrid: stable + {'quality' if enable_pre_adjustment else 'est'})")
+    return waveform  # Always return tensor (in-mem; no save here – save in caller)
 
 
 # Add to src/cache.py (after imports; before _pad_if_needed)
 # src/cache.py (replace your adjust_audio_length_torch)
+
 import torch.nn.functional as F
 
-def adjust_audio_length_torch(waveform: torch.Tensor, model_sr: int, mel_shape: torch.Tensor, hop_length: int,
-                             enable_pre_adjustment: bool, stem: str | None, logger) -> torch.Tensor:
-    """In-memory pad/trim to match mel_shape[-1] * hop_length. Reflect pad for zero artifacts; no-op if disabled."""
+def adjust_audio_length_torch(waveform: torch.Tensor, model_sr: int, mel_shape: torch.Size, hop_length: int,
+                             enable_pre_adjustment: bool, stem: str = None, logger=logger) -> torch.Tensor:
+    """Pad/trim to match mel frames * hop_length. Reflect for zero artifacts; no-op if disabled."""
     if not enable_pre_adjustment:
-        logger.debug(f"Pre-adjust disabled for {stem} – raw waveform (speed preserved)")
-        return waveform  # No-op: Fast pass-through
+        logger.debug(f"Pre-adjust disabled ({stem if stem else 'unknown'}) – raw waveform (speed preserved)")
+        return waveform  # Fast pass-through
 
     actual_mel_len = mel_shape[-1]
-    expected_mel_len = waveform.shape[-1] // hop_length
-    if actual_mel_len == expected_mel_len:
-        logger.debug(f"Mel len exact match for {stem}: {actual_mel_len} frames – no adjustment (quality preserved)")
-        return waveform  # No compute/pad needed
-
     expected_samples = actual_mel_len * hop_length
-    diff_samples = expected_samples - waveform.shape[-1]
-    adjusted = False
-    logger.debug(f"Mel align for {stem}: actual={actual_mel_len}, expected_len={expected_mel_len} (diff={diff_samples} samples)")
+    diff_samples = expected_samples - len(waveform)
+    if diff_samples == 0:
+        logger.debug(f"Mel len exact match ({stem if stem else 'unknown'}): {actual_mel_len} frames – no adjustment")
+        return waveform
 
-    if diff_samples != 0:
-        if diff_samples > 0:
-            # Reflect pad: Mirror edges (zero artifacts; natural extension for voices – e.g., smooth moan fade)
-            # Split: Left half reverse + original + right half reverse
-            waveform = F.pad(waveform, (diff_samples // 2, (diff_samples + 1) // 2), mode='reflect')  # Approx symmetric (torch 'reflect' mirrors)
-            logger.info(f"Artifact-min pad for {stem}: +{diff_samples} samples (reflect mirror; quality boost)")
-            adjusted = True
+    logger.debug(f"Mel align ({stem if stem else 'unknown'}): expected={expected_samples}, current={len(waveform)} (diff={diff_samples})")
+
+    if diff_samples > 0:
+        # Reflect pad: Mirror edges for natural extension (zero artifacts; smooth for voices)
+        waveform = F.pad(waveform, (diff_samples // 2, (diff_samples + 1) // 2), mode='reflect')
+        logger.info(f"Artifact-min pad ({stem if stem else 'unknown'}): +{diff_samples} samples (reflect mirror; quality)")
+        return waveform
+    else:
+        # Trim only if major excess (>10 frames ~0.025s; keep minor for safety)
+        excess = -diff_samples
+        if excess > hop_length * 10:
+            waveform = waveform[..., :expected_samples]
+            logger.info(f"Precise trim ({stem if stem else 'unknown'}): -{excess} samples (mel align; no loss)")
         else:
-            # Trim: Only if excess safe (e.g., >1s; log warning to monitor – preserves nuance)
-            excess = -diff_samples
-            if excess > hop_length * 10:  # >10 frames (~0.025s) – trim; else keep for safety
-                waveform = waveform[..., :expected_samples]
-                logger.info(f"Precise trim for {stem}: -{excess} samples (mel align; no content loss)")
-            else:
-                logger.debug(f"Minor excess {excess} samples for {stem} – kept (avoids over-trim artifacts)")
-            adjusted = True
-
-    if adjusted:
-        logger.debug(f"Adjust complete for {stem}: {waveform.shape[-1]} samples (quality: artifact-reduced alignment)")
-    return waveform
+            logger.debug(f"Minor excess {excess} samples ({stem if stem else 'unknown'}) – kept (avoids over-trim)")
+        return waveform
 
 
 # New Helper: Save adjusted and validate (extracted; testable: waveform/path/stem → final_path/valid)
-def _save_adjusted_and_validate(waveform: torch.Tensor, adjusted_path: str, original_path: str, model_sr: int, stem: str | None, out_path: Optional[Path], enable_pre_adjustment: bool, exaggeration: float) -> tuple[str, bool, Optional[float]]:
-    """Save padded/resampled; force validate; return (final_path, valid, dur). Fallback if fail."""
-    padded = enable_pre_adjustment  # Assume if here
-    if padded:
-        orig_stem = Path(original_path).stem
-        suffix = '_padded' if '_resampled' not in orig_stem else ''  # Dedup logic simplified
-        final_stem = orig_stem + suffix if not orig_stem.endswith(('_padded', '_resampled')) else orig_stem.replace('_resampled', '_padded')
-        aligned_out = out_path or voices_dir / f"{final_stem}.wav"
-        aligned_out.parent.mkdir(parents=True, exist_ok=True)
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            torchaudio.save(str(aligned_out), waveform, model_sr, encoding="PCM_S")
-        if aligned_out.exists() and aligned_out.stat().st_size > 0:
-            adjusted_path = str(aligned_out)
-            # NEW: Dynamic Mel (consistent with _pad_if_needed)
-            hop_length = CONFIG.get_value('hop_length', 256)
-            n_fft = CONFIG.get_value('n_fft', 1024)
-            n_mels = CONFIG.get_value('n_mels', 80)
-            mel_transform = torchaudio.transforms.MelSpectrogram(sample_rate=model_sr, n_fft=n_fft, hop_length=hop_length, n_mels=n_mels)
-            logger.info(f"Final adjusted saved: {adjusted_path} (mel_len post-pad={mel_transform(waveform).shape[-1]})")
-        else:
-            logger.warning(f"Final save failed – use pre-pad {adjusted_path}")
+def _save_adjusted_and_validate(waveform: torch.Tensor, adjusted_path: str, original_path: str, model_sr: int,
+                               stem: str = None, out_path: Optional[Path] = None, enable_pre_adjustment: bool = False,
+                               exaggeration: float = 0.5) -> tuple[str, bool, Optional[float]]:
+    """Save padded/resampled; validate. Return (final_path, valid: bool, dur: float or None)."""
+    # No save if no out_path and no adjustment (in-mem only)
+    if not out_path and len(waveform) == _get_audio_info_robust(original_path)[2]:
+        logger.debug(f"No save needed (in-mem only): {adjusted_path} (dur={len(waveform) / model_sr:.2f}s)")
+        valid, dur = validate_voice_path(original_path, stem=stem, force_refresh=True)
+        return adjusted_path, valid, dur
 
-    # Final validate (force refresh)
-    final_valid, final_dur = validate_voice_path(adjusted_path, stem=stem, force_refresh=True)
-    if not final_valid:
-        post_sr = _get_audio_info_robust(adjusted_path)[0] if _get_audio_info_robust(adjusted_path) else 'unknown'
-        logger.error(f"Final validate failed for {adjusted_path} (SR={post_sr}Hz) – fallback original")
-        adjusted_path = original_path
-        final_valid, final_dur = validate_voice_path(original_path, stem=stem, force_refresh=True)
+    # Save adjusted version
+    out_path = out_path or Path(adjusted_path).parent / f"{Path(original_path).stem}_padded.wav"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        torchaudio.save(str(out_path), waveform, model_sr, encoding="PCM_S")
+    if not out_path.exists() or out_path.stat().st_size == 0:
+        logger.warning(f"Save failed – fallback original: {adjusted_path}")
+        return original_path, validate_voice_path(original_path, stem=stem, force_refresh=True)
+
+    adjusted_path = str(out_path)
+    logger.info(f"Adjusted saved: {adjusted_path} (final len={len(waveform)}, dur={len(waveform) / model_sr:.2f}s)")
+
+    # Final validate (force refresh to check post-save)
+    valid, dur = validate_voice_path(adjusted_path, stem=stem, force_refresh=True)
+    if not valid:
+        logger.error(f"Post-save validate failed for {adjusted_path} – fallback original")
+        return original_path, validate_voice_path(original_path, stem=stem, force_refresh=True)
     else:
-        logger.info(f"Final valid: {adjusted_path} (dur={final_dur:.2f}s)")
-        if Path(adjusted_path).stem.endswith(('_fixed', '_padded', '_resampled')):
-            logger.debug(f"Deduped: {adjusted_path}")
-    if not final_valid:
-        logger.warning(f"Final path {adjusted_path} invalid – TTS may fail/artifacts")
-    return adjusted_path, final_valid, final_dur
-
+        logger.info(f"Post-save valid: {adjusted_path} (dur={dur:.2f}s)")
+    return adjusted_path, True, dur
 
 
 # Refactored Main Method (now ~60 lines; pipeline calls)
 def check_and_update_ref(audio_path: str, exaggeration: float = 0.5, model_sr: int = MODEL_SR,
-                         out_path: Optional[Path] = None, enable_pre_adjustment: bool = None, stem: str | None = None) -> str:
-    """Pipeline: Load/mono → resample? → pad? → save/validate. Returns validated path."""
-    enable_pre_adjustment = enable_pre_adjustment or CONFIG.get_value('enable_pre_adjustment', False)
-    stem = _normalize_stem(audio_path, stem) if stem else None  # Shared
-
-    original_path = audio_path
+                         out_path: Optional[Path] = None, enable_pre_adjustment: bool = None,
+                         stem: str = None, force_reprocess: bool = False) -> str:
+    """Pipeline: Validate → Load/mono → Resample? → Pad? → Save/validate. Only reprocess if invalid/artifacts AND pre_adjust=True."""
+    if enable_pre_adjustment is None:
+        enable_pre_adjustment = CONFIG.get_value('enable_pre_adjustment', default=False)
 
     # Initial validate (no force)
-    validated, _ = validate_voice_path(original_path, stem=stem)
-    if info := _get_audio_info_robust(original_path):
-        initial_sr = info[0]
-    if validated and not enable_pre_adjustment:
-        logger.debug(f"Initial valid {original_path} (no adjustment needed)")
-        return original_path
-    if not validated:
-        logger.warning(f"Initial validate failed for {original_path} (info SR={initial_sr or 'unknown'}Hz) – load to confirm")
+    valid, msg = validate_voice_path(audio_path, stem=stem)
+    if valid and not force_reprocess:
+        logger.debug(f"Ref valid (no reprocess): {audio_path} – skip pipeline")
+        return audio_path
 
-    # Pipeline
-    load_result = _load_and_mono(original_path)
+    logger.warning(f"Ref invalid for {audio_path} ({msg or 'unknown'}) – proceeding to pipeline")
+
+    # Load/refine
+    load_result = _load_and_mono(audio_path)
     if not load_result:
-        logger.error(f"Ref process failed for {original_path} – fallback original")
-        return original_path
+        logger.error(f"Load failed for {audio_path} – fallback original")
+        return audio_path
     waveform, load_sr = load_result
 
     # Resample if needed
-    waveform, adjusted_path = _resample_if_needed(waveform, load_sr, model_sr, original_path)
+    waveform, adjusted_path = _resample_if_needed(waveform, load_sr, model_sr, audio_path)
 
-    # Pad if needed
-    waveform, padded = _pad_if_needed(waveform, adjusted_path, model_sr, enable_pre_adjustment or adjusted_path != original_path)
+    # Pad only if enabled AND needed (artifacts/invalidation)
+    if enable_pre_adjustment or force_reprocess:
+        from torchaudio.transforms import MelSpectrogram
+        mel_transform = MelSpectrogram(sample_rate=model_sr, n_fft=2048, hop_length=256, n_mels=80)
+        mel = mel_transform(waveform.unsqueeze(0))
+        waveform = adjust_audio_length_torch(waveform, model_sr, mel.shape, 256, enable_pre_adjustment, stem)
+        logger.info(f"Pad applied (enable_pre={enable_pre_adjustment}): {len(waveform)} samples")
+    else:
+        logger.debug(f"Pad skipped (enable_pre={enable_pre_adjustment})")
 
     # Save and final validate
     final_path, final_valid, final_dur = _save_adjusted_and_validate(
-        waveform, adjusted_path, original_path, model_sr, stem, out_path, padded, exaggeration
+        waveform, adjusted_path, audio_path, model_sr, stem, out_path, enable_pre_adjustment, exaggeration
     )
-    return final_path if final_valid else original_path  # Fallback if invalid
+    if not final_valid:
+        logger.warning(f"Final invalid after pipeline – fallback original: {audio_path}")
+        return audio_path
+    return final_path
+
 
 
 def try_audio_cache(audio_path: str, text: str, exaggeration: float = 0.5, params: Dict = None) -> Optional[str]:
@@ -1102,10 +1113,10 @@ def _async_verify_update(audio_path: str, stem: str, cached: dict, cached_path: 
 
 
 # Refactored Main Method (now ~80 lines; calls helpers)
-def get_or_queue_voice_process(audio_path: str, model, device, dtype, stem: str | None = None,
-                               exaggeration: float = 0.5, quiet=False) -> str:
+def get_or_queue_voice_process(audio_path: str, model, device, dtype, stem: str = None,
+                               exaggeration: float = 0.5, quiet: bool = False) -> str:
     """Main: Derive stem, check cache, sync/async fix if needed. Returns fixed path (immediate reuse)."""
-    stem = _normalize_stem(audio_path, stem)  # Shared derivation
+    stem = _normalize_stem(audio_path, stem) if stem else None  # Shared
 
     with _voice_cache_lock:
         cached = _voice_cache.get(stem, {})
@@ -1119,21 +1130,22 @@ def get_or_queue_voice_process(audio_path: str, model, device, dtype, stem: str 
     # Pre-probe upload SR (light; shared)
     upload_sr_match = False
     if quick_reuse and Path(audio_path).exists():
-        sr = _probe_upload_sr(audio_path, quiet)
+        sr = _probe_upload_sr(audio_path, quiet=True)
         upload_sr_match = (sr == MODEL_SR)
 
     # Early out: Recent BG + reuse → skip all
     throttle_sec = CONFIG.get_value('async_throttle_sec', default=30)
     if time.time() - last_bg < throttle_sec and quick_reuse:
         if not quiet:
-            logger.debug(f"Recent BG + valid cache for {stem}—immediate reuse, skip queue/recheck")
+            logger.info(f"Recent BG + valid cache for {stem}—immediate reuse, skip queue/recheck")
         _handle_reuse_and_load_conds(cached_conds_key, cached_path, model, device, dtype, stem, quiet)
         return cached_path
 
     # No reuse: Sync fix (first-time/invalid)
     if not quick_reuse:
-        fallback_path = _handle_sync_fix(audio_path, stem, exaggeration, model, device, dtype, cached, cached_conds_key,
-                                         quiet)
+        fallback_path = check_and_update_ref(audio_path, exaggeration, stem=stem)
+        if not quiet:
+            logger.info(f"Sync fixed/updated for {stem}: {fallback_path}")
         return fallback_path
 
     # Reuse path: Load conds + spawn async (non-blocking)
@@ -1141,16 +1153,16 @@ def get_or_queue_voice_process(audio_path: str, model, device, dtype, stem: str 
     if not quiet:
         logger.info(f"Cached reuse for {stem}: {cached_path} (async verify new upload)")
 
-    # Spawn async (throttled)
+    # Spawn async (throttled; only if needed)
     if time.time() - last_bg >= throttle_sec and Path(audio_path).exists():
         Thread(target=_async_verify_update,
                args=(audio_path, stem, cached, cached_path, exaggeration, model, device, dtype, quick_reuse),
                daemon=True, name=f"Async-Voice-{stem}").start()
-        logger.debug(f"Spawned async verify for {stem}")
+        logger.trace(f"Spawned async verify for {stem}")
     elif time.time() - last_bg < throttle_sec:
         logger.trace(f"Skipped async for {stem}: Recent BG")
 
-    return cached_path  # Always immediate
+    return cached_path  # Always immediate (non-blocking)
 
 
 

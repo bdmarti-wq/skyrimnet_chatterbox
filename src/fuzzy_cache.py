@@ -7,7 +7,10 @@ import time
 from difflib import SequenceMatcher
 from queue import Queue
 from typing import Optional
-
+import numpy as np  # NEW: For np ops in artifact detect
+import torchaudio  # NEW: For fast load in validate
+import librosa  # NEW: For spectral_centroid in artifact detection
+from queue import Queue, Empty
 from pathlib import Path
 
 from loguru import logger
@@ -21,8 +24,47 @@ FUZZY_LOCK = threading.Lock()
 FUZZY_AUDIO_DICT = {}  # {stem: {norm_key: entry}}
 FUZZY_SAVE_INTERVAL = 5.0
 _last_fuzzy_save = 0
+_fuzzy_save_counter = 0  # NEW: Define missing global
 MAX_INDEX_SIZE = CONFIG.get_value('fuzzy_index_size', default=1000)  # For fuzzy per-stem
 ENABLE_FUZZY = CONFIG.get_value('fuzzy_enable', default=True)  # New: Toggle fuzzy
+ENABLE_ARTIFACT_PURGE = CONFIG.get_value('fuzzy_artifact_purge_enable', default=True)  # NEW: Config toggle for purging
+
+
+def is_artifact_laden(wav_path: str, threshold_hz: float = 8000.0, sr: int = 24000) -> bool:
+    """
+    Detect artifacts via spectral centroid (high = chirpy highs > threshold_hz avg).
+    Quick: Loads WAV, computes librosa.feature.spectral_centroid (mean < threshold = clean).
+    Returns True if likely bad (high centroid, e.g., chirps/noise).
+    """
+    try:
+        # Fast load (torchaudio; mono squeeze)
+        y, actual_sr = torchaudio.load(wav_path)
+        y = y.mean(dim=0).numpy()  # Mono np; ~1-10ms
+        if len(y) < 1024:  # Too short: Skip or assume clean (e.g., <50ms noise ok)
+            return False
+
+        # Spectral centroid (freq center of mass; high = artifacts/chirps)
+        # Params: n_fft=2048/hop=512 for ~10-50ms compute (shorts fast)
+        centroid = librosa.feature.spectral_centroid(
+            y=y, sr=actual_sr, n_fft=2048, hop_length=512
+        )[0]  # [frames] Hz
+
+        mean_centroid = np.mean(centroid)
+        high_freq_ratio = np.mean(centroid > threshold_hz / 2)  # Energy > half thresh?
+
+        is_bad = mean_centroid > threshold_hz or high_freq_ratio > 0.2  # 20% frames high
+
+        if is_bad:
+            logger.debug(
+                f"Artifact detected in {wav_path}: mean_centroid={mean_centroid:.0f}Hz > {threshold_hz}Hz (ratio={high_freq_ratio:.2f})")
+        else:
+            logger.trace(f"Clean check: {wav_path} centroid={mean_centroid:.0f}Hz")
+
+        return is_bad
+    except Exception as e:
+        logger.trace(f"Artifact check failed for {wav_path}: {e} – assuming clean")
+        return False  # Fail-safe: Don't purge on errors
+
 
 def normalize_text(text: str) -> str:
     """Normalize text for fuzzy indexing."""
@@ -30,6 +72,7 @@ def normalize_text(text: str) -> str:
     cleaned = re.sub(r'\s+', ' ', cleaned).strip()
     text_hash = hashlib.md5(cleaned.encode()).hexdigest()[:8]
     return f"{text_hash}_{cleaned}"
+
 
 def string_similarity(s1: str, s2: str, threshold=0.75) -> float:
     """Similarity with RP boosts."""
@@ -43,11 +86,13 @@ def string_similarity(s1: str, s2: str, threshold=0.75) -> float:
         ratio = min(1.0, ratio + boost_amount)
     return ratio
 
+
 def try_fuzzy_audio_cache(audio_path: str = None, text_input: str = None, exaggeration: float = 0.5,
                           stem: str = None, threshold: float = None, quiet: bool = False) -> Optional[str]:
     """Fuzzy audio cache: SequenceMatcher on per-stem DB; returns path or None.
     REQUIRES stem (kwarg or from audio_path); detects/ warns on swap (text short like stem).
-    Boosts sim for configurable short/moans words; min length tunable."""
+    Boosts sim for configurable short/moans words; min length tunable.
+    NEW: On HIT, validate wav_path for artifacts (purge if bad; fallback MISS)."""
     if not text_input or (
             text_input and len(text_input.strip()) < 3):  # Min guard (hardcode 3 if config fails; tunable below)
         if not quiet:
@@ -143,7 +188,27 @@ def try_fuzzy_audio_cache(audio_path: str = None, text_input: str = None, exagge
                 logger.debug(
                     f"  Candidate: '{clean_entry[:30]}...' raw={raw_ratio:.3f} +boost={sim_boost:.3f} = {adjusted_sim:.3f}")
 
-    if best_sim >= threshold:
+    if best_sim >= threshold and best_path:
+        # NEW: Validate HIT for artifacts (purge if bad; log fallback)
+        if ENABLE_ARTIFACT_PURGE:
+            artifact_threshold = CONFIG.get_value('fuzzy_artifact_threshold_hz', default=8000.0)
+            if is_artifact_laden(best_path, threshold_hz=artifact_threshold):
+                logger.warning(
+                    f"Fuzzy HIT invalid: Artifacts in {best_path} (centroid >{artifact_threshold}Hz) – purging entry and MISS fallback")
+                # Purge: Remove from dict (thread-safe; save will persist purge)
+                with FUZZY_LOCK:
+                    if stem in FUZZY_AUDIO_DICT and best_match:
+                        norm_key = normalize_text(best_match)
+                        if norm_key in FUZZY_AUDIO_DICT[stem]:
+                            del FUZZY_AUDIO_DICT[stem][norm_key]
+                            logger.debug(f"Purged bad fuzzy entry: {norm_key} for stem '{stem}'")
+                            if not FUZZY_AUDIO_DICT[stem]:  # Empty stem → Clean
+                                del FUZZY_AUDIO_DICT[stem]
+                _save_fuzzy_audio_cache(save_all=True)  # Force save post-purge
+                if not quiet:
+                    logger.debug(f"Fuzzy MISS after artifact purge for '{text_input[:30]}...' (stem '{stem}')")
+                return None  # Fallback to MISS (regen clean)
+
         if not quiet:
             logger.info(
                 f"Fuzzy cache HIT: '{text_input[:30]}...' ≈ '{best_match[:30]}...' (sim={best_sim:.3f} >= {threshold:.2f}, boost={boost_amount}) for stem '{stem}' -> {best_path}")
@@ -156,8 +221,10 @@ def try_fuzzy_audio_cache(audio_path: str = None, text_input: str = None, exagge
                 logger.debug(f"  Closest: '{best_match[:30]}...' (sim={best_sim:.3f})")
         return None
 
+
 def _save_fuzzy_audio_cache(save_all: bool = False):
-    """Save FUZZY_AUDIO_DICT to JSON (throttled: min 5s or save_all=True; evict old if >1000 total)."""
+    """Save FUZZY_AUDIO_DICT to JSON (throttled: min 5s or save_all=True; evict old if >1000 total).
+    NEW: Pre-save: Purge any bad entries (validate wav_path exists + no artifacts)."""
     global _last_fuzzy_save
     now = time.time()
     if not save_all and (now - _last_fuzzy_save) < FUZZY_SAVE_INTERVAL:
@@ -167,6 +234,31 @@ def _save_fuzzy_audio_cache(save_all: bool = False):
     with FUZZY_LOCK:
         if not FUZZY_AUDIO_DICT:
             return
+
+        # NEW: Pre-save purge (validate paths + artifacts; optional but ensures clean saves)
+        purged_count = 0
+        if ENABLE_ARTIFACT_PURGE:
+            artifact_threshold = CONFIG.get_value('fuzzy_artifact_threshold_hz', default=8000.0)
+            for stem in list(FUZZY_AUDIO_DICT):
+                for norm_key in list(FUZZY_AUDIO_DICT[stem]):
+                    entry = FUZZY_AUDIO_DICT[stem][norm_key]
+                    wav_path = entry.get('wav_path')
+                    if wav_path and Path(wav_path).exists() and is_artifact_laden(wav_path,
+                                                                                  threshold_hz=artifact_threshold):
+                        logger.warning(f"Pre-save purge: Artifacts in {wav_path} for {stem}:{norm_key} – removing")
+                        del FUZZY_AUDIO_DICT[stem][norm_key]
+                        purged_count += 1
+                    elif not wav_path or not Path(wav_path).exists():
+                        logger.trace(f"Pre-save skip invalid: {stem}:{norm_key}")
+                        del FUZZY_AUDIO_DICT[stem][norm_key]
+                        purged_count += 1
+                if not FUZZY_AUDIO_DICT[stem]:  # Empty after purge
+                    del FUZZY_AUDIO_DICT[stem]
+                    logger.debug(f"Purged empty stem: {stem}")
+
+        if purged_count > 0:
+            logger.info(f"Pre-save purged {purged_count} bad/invalid fuzzy entries (artifacts/invalid paths)")
+
         temp_dict = {}
         total_entries = 0
         for stem, stem_entries in FUZZY_AUDIO_DICT.items():
@@ -198,11 +290,13 @@ def _save_fuzzy_audio_cache(save_all: bool = False):
             with open(fuzzy_json, 'w') as f:
                 json.dump(temp_dict, f, indent=2)
             if save_all:
-                logger.info(f"Full fuzzy save: {total_entries} entries across {len(temp_dict)} stems")
+                logger.info(
+                    f"Full fuzzy save: {total_entries} entries across {len(temp_dict)} stems (purged {purged_count} bad)")
             else:
                 logger.trace(f"Throttled fuzzy save: {total_entries} entries")  # TRACE: Less spam
         except Exception as e:
             logger.error(f"Save fuzzy cache failed: {e}")
+
 
 # Load (called from init)
 def load_fuzzy_cache():
@@ -213,6 +307,12 @@ def load_fuzzy_cache():
             with open(fuzzy_json, 'r') as f:
                 data = json.load(f)
             FUZZY_AUDIO_DICT = {}
+            total_entries = 0
+            purged_count = 0
+            if ENABLE_ARTIFACT_PURGE:
+                artifact_threshold = CONFIG.get_value('fuzzy_artifact_threshold_hz', default=8000.0)
+                logger.info(f"Loading fuzzy cache with artifact purge (threshold={artifact_threshold}Hz)")
+
             for stem, stem_entries in data.items():
                 FUZZY_AUDIO_DICT[stem] = {}
                 for norm_key, entry in stem_entries.items():
@@ -220,14 +320,37 @@ def load_fuzzy_cache():
                         rel_path = entry['wav_path']
                         full_path = ROOT_DIR / rel_path
                         if full_path.exists():
-                            entry['wav_path'] = str(full_path)
+                            # NEW: Validate for artifacts on load (purge bad entries)
+                            if not ENABLE_ARTIFACT_PURGE or not is_artifact_laden(str(full_path),
+                                                                                  threshold_hz=artifact_threshold):
+                                entry['wav_path'] = str(full_path)
+                                FUZZY_AUDIO_DICT[stem][norm_key] = entry
+                                total_entries += 1
+                            else:
+                                logger.warning(
+                                    f"Load-time purge: Artifacts in {full_path} for {stem}:{norm_key} – skipping")
+                                purged_count += 1
                         else:
-                            continue  # Skip invalid
-                    FUZZY_AUDIO_DICT[stem][norm_key] = entry
-            logger.info(f"Loaded fuzzy cache: {sum(len(entries) for entries in FUZZY_AUDIO_DICT.values())} entries across {len(FUZZY_AUDIO_DICT)} stems")
+                            logger.trace(f"Load skip invalid path: {stem}:{norm_key} ({rel_path})")
+                            purged_count += 1
+                    else:
+                        logger.trace(f"Load skip missing wav_path: {stem}:{norm_key}")
+                        purged_count += 1
+                if not FUZZY_AUDIO_DICT[stem]:  # Empty after purge
+                    del FUZZY_AUDIO_DICT[stem]
+                    logger.trace(f"Load purged empty stem: {stem}")
+
+            if purged_count > 0:
+                logger.info(
+                    f"Loaded fuzzy cache: {total_entries} valid entries across {len(FUZZY_AUDIO_DICT)} stems (purged {purged_count} bad/invalid)")
+            else:
+                logger.info(f"Loaded fuzzy cache: {total_entries} entries across {len(FUZZY_AUDIO_DICT)} stems")
         except Exception as e:
             logger.warning(f"Load fuzzy cache failed: {e}")
             FUZZY_AUDIO_DICT = {}
+    else:
+        logger.debug("No fuzzy cache file – starting empty")
+
 
 # Export clear (for clear_cache)
 def clear_fuzzy_cache():
@@ -246,7 +369,17 @@ def _background_index_worker():
             min_length = CONFIG.get_value('fuzzy_min_length', default=3)
             if len(orig_text.strip()) < min_length:  # Optional: Skip indexing very short (e.g., "a" noise)
                 logger.debug(f"Skipped indexing short text (<{min_length}): {orig_text[:10]}...")
+                FUZZY_QUEUE.task_done()  # Clean up queue
                 continue
+
+            # Pre-index check for artifacts (skip bad WAVs; don't cache chirpy gens)
+            if ENABLE_ARTIFACT_PURGE and is_artifact_laden(wav_path):
+                artifact_threshold = CONFIG.get_value('fuzzy_artifact_threshold_hz', default=8000.0)
+                logger.warning(
+                    f"Skip fuzzy index: Artifacts in {wav_path} (centroid >{artifact_threshold}Hz) for '{orig_text[:20]}' (stem: {voice_stem})")
+                FUZZY_QUEUE.task_done()
+                continue
+
             norm_key = normalize_text(text)
             boost_words = CONFIG.get_value('fuzzy_boost_words', default=['ahh', 'mmm', 'ooh', 'throbb', 'moan', 'gasp'])
             boost_amount = CONFIG.get_value('fuzzy_boost_amount', default=0.1)
@@ -277,19 +410,27 @@ def _background_index_worker():
                         'time_indexed': time_indexed
                     }
                     _fuzzy_save_counter += 1
-                    logger.debug(f"Indexed fuzzy audio: {norm_key[:30]} -> {wav_path} (stem: {voice_stem}, boost={sim_boost})")
+                    logger.debug(
+                        f"Indexed fuzzy audio: {norm_key[:30]} -> {wav_path} (stem: {voice_stem}, boost={sim_boost})")
                 # Throttle saves: Every 10 adds, queue >20, or 30s idle
                 if (_fuzzy_save_counter >= 10 or FUZZY_QUEUE.qsize() > 20):
                     _save_fuzzy_audio_cache(save_all=False)  # Incremental
                     _fuzzy_save_counter = 0
-            _save_fuzzy_audio_cache()  # Persist (add if not exists; thread-safe)
-        except:
-            # Idle timeout: Save if dirty (e.g., >30s no queue, but entries > prev)
-            if FUZZY_QUEUE.empty() and FUZZY_AUDIO_DICT:  # Periodic full save
-                time_since_last = time.time() - _last_fuzzy_save
-                if time_since_last > 30:  # >30s idle → full safe save
-                    _save_fuzzy_audio_cache(save_all=True)
-            pass  # Continue loop
+            FUZZY_QUEUE.task_done()  # Always cleanup after get()
+
+        except Empty:  # FIXED: Correct exception (from queue.Empty import; handles timeout)
+            # Idle: Periodic full save if dirty (>30s since last)
+            time_since_last = time.time() - _last_fuzzy_save
+            if time_since_last > 30 and FUZZY_AUDIO_DICT:  # Entries exist but no activity
+                logger.trace(f"Fuzzy idle >30s – full save check")
+                _save_fuzzy_audio_cache(save_all=True)
+            pass  # Continue loop (no error log; expected idle)
+
+        except Exception as e:  # Broad catch for worker errors (e.g., bad path, lock)
+            logger.error(f"Fuzzy worker error indexing '{text[:20] if 'text' in locals() else 'unknown'}': {e}")
+            if 'FUZZY_QUEUE' in locals():  # Safe cleanup if queue item pending
+                FUZZY_QUEUE.task_done()
+            pass  # Continue (don't crash thread)
 
 
 # Start worker (call in main.py init)

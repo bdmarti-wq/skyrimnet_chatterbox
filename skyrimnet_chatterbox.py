@@ -26,6 +26,8 @@ from loguru import logger
 import warnings
 warnings.filterwarnings('ignore', message=r'.*torchaudio._backend.utils.info.*')
 warnings.filterwarnings('ignore', message=r'.*deprecated.*torchaudio.*')
+warnings.filterwarnings("ignore", category=UserWarning, module="torchaudio._backend")
+warnings.filterwarnings("ignore", message="torchaudio._backend.set_audio_backend has been deprecated")
 
 def load_model():
     global MODEL, MULTILINGUAL

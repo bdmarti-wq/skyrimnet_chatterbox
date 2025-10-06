@@ -261,61 +261,103 @@ class SkyrimNetConfig:
             return default_config, config_mode, global_flags
 
     # Sharable Helper: Load voice overrides from voices.json
+    # Enhanced: Multi-path load for voices.json (root/config/; log found/missing)
     def _load_voices_json(self) -> Dict[str, Dict]:
-        """Sharable: Load voices.json from root dir. Returns {voice: params} or {}."""
-        if not self._voices_file_path.exists():
-            logger.debug("voices.json not found – no per-voice overrides")
-            return {}
+        """Load voices.json from root or config/ dir. Returns {voice: params} or {}. FIXED: Multi-path, debug log."""
+        possible_paths = [
+            Path(__file__).parent.parent / "voices.json",  # Root (skyrimnet_chatterbox/voices.json)
+            Path(__file__).parent / "voices.json",         # config/voices.json (if src/config.py)
+            Path("voices.json"),                           # Current dir fallback
+            Path(__file__).parent.parent / "config" / "voices.json"  # config/ subdir
+        ]
+        self.voice_overrides = {}
+        loaded_path = None
+        for voices_path in possible_paths:
+            if voices_path.exists():
+                try:
+                    with open(voices_path, 'r') as f:
+                        voices_data = json.load(f)
+                    # Validate/Flatten if list (optional)
+                    if isinstance(voices_data, list):
+                        voices_data = {item.get('voice', f'voice_{i}'): item for i, item in enumerate(voices_data)}
+                    self.voice_overrides = voices_data
+                    loaded_path = voices_path
+                    logger.info(f"✓ Loaded voices.json: {loaded_path} ({len(self.voice_overrides)} voices: {list(self.voice_overrides.keys())})")
+                    return voices_data
+                except json.JSONDecodeError as e:
+                    logger.warning(f"Invalid voices.json {voices_path}: {e} – skipping")
+                except Exception as e:
+                    logger.error(f"Load voices.json {voices_path} failed: {e} – trying next")
+            else:
+                logger.trace(f"Tried voices.json path (not found): {voices_path}")
 
-        try:
-            with open(self._voices_file_path, 'r') as f:
-                voices_data = json.load(f)
-            # Validate/Flatten if list (optional)
-            if isinstance(voices_data, list):
-                voices_data = {item.get('voice', f'voice_{i}'): item for i, item in enumerate(voices_data)}
-            logger.debug(f"Voices.json loaded: {list(voices_data.keys())} voices")
-            return voices_data
-        except json.JSONDecodeError as e:
-            logger.warning(f"Invalid voices.json: {e} – no per-voice overrides")
-            return {}
-        except Exception as e:
-            logger.error(f"Voices.json load failed: {e} – empty dict")
-            return {}
+        logger.warning("voices.json not found in expected paths – no per-voice overrides (add to root for [dlc1seranavoice/femaleuniquelydia])")
+        self.voice_overrides = {'global': {}}  # Fallback
+        return {}
+
 
     def load_config(self):
-        """Load: Txt (globals/flags) → merge defaults → voices.json (overrides). Non-blocking; sharable via helpers."""
+        """Load: Txt (globals/flags) → merge defaults → voices.json (overrides). FIXED: Always call _load_voices_json; full debug logs (multi-path)."""
         global _CONFIG_CACHE, ENABLE_MEMORY_CACHE, ENABLE_DISK_CACHE
 
-        if _CONFIG_CACHE is not None:  # Cache hit
+        if _CONFIG_CACHE is not None:  # Cache hit (but re-load voices always for updates)
             defaults, modes, global_flags = _CONFIG_CACHE
-            self._defaults.update(defaults)  # Merge old
+            # Re-merge old cache with fresh voices (ensure always current)
+            self._defaults.update(defaults)  # Preserve existing
             self.enable_memory_cache = global_flags.get('enable_memory_cache', ENABLE_MEMORY_CACHE)
             self.enable_disk_cache = global_flags.get('enable_disk_cache', ENABLE_DISK_CACHE)
             ENABLE_MEMORY_CACHE = self.enable_memory_cache
             ENABLE_DISK_CACHE = self.enable_disk_cache
-            logger.debug("Config from cache (merged with class)")
+            # Always refresh voices (no cache skip)
+            self._load_voices_json()
+            logger.debug("Config from cache (txt + fresh voices.json)")
             return _CONFIG_CACHE
 
-        # Step 1: Load txt (globals/flags/modes; sharable)
+        # Step 1: Load txt (globals/flags/modes; existing logic)
         default_config, config_mode, global_flags = self._load_txt_config()
 
-        # Step 2: Merge defaults (input → _defaults; class DEFAULTS base)
-        self._merge_defaults(default_config, config_mode, global_flags)
+        # Step 2: Merge defaults (input → _defaults; sharable)
+        self._defaults.update({k: v for k, v in default_config.items() if k in self.DEFAULTS})
+        for k in self.DEFAULTS:
+            if k not in self._defaults:
+                self._defaults[k] = self.DEFAULTS[k]
 
-        # Step 3: Load voices.json (separate; overrides)
+        # Step 3: Load voices.json (enhanced: Multi-path, always fresh, log raw)
         self.voice_overrides = self._load_voices_json()
 
-        # Step 4: Sync flags/enables (from globals)
-        self.enable_memory_cache = global_flags.get('enable_memory_cache', ENABLE_MEMORY_CACHE)
-        self.enable_disk_cache = global_flags.get('enable_disk_cache', ENABLE_DISK_CACHE)
+        # Step 4: Sync flags/enables from globals (after txt)
+        self.enable_memory_cache = global_flags.get('enable_memory_cache', self.DEFAULTS['enable_memory_cache'])
+        self.enable_disk_cache = global_flags.get('enable_disk_cache', self.DEFAULTS['enable_disk_cache'])
         ENABLE_MEMORY_CACHE = self.enable_memory_cache
         ENABLE_DISK_CACHE = self.enable_disk_cache
 
-        voices_count = len(self.voice_overrides)
-        logger.info(f"Config loaded: {voices_count} voices, {len(self._defaults)} params (logging_level={self.logging_level})")
+        # Set self attrs from merged (easy access)
+        for attr, val in self._defaults.items():
+            if not hasattr(self, attr) or attr in ['device', 'dtype', 'model']:  # Avoid overwrite core
+                setattr(self, attr, val)
+        for attr, val in self._flags.items():
+            setattr(self, attr, val)
 
+        # Core sync (clamped where needed)
+        self.device = torch.device(DEVICE if self.device == "cuda" else "cpu")
+        dtype_str = self._defaults.get('dtype', 'bfloat16')
+        self.dtype = torch.bfloat16 if dtype_str == 'bfloat16' else torch.float32
+        DTYPE = self.dtype
+
+        # Log summary (with voices count/debug)
+        voices_count = len(self.voice_overrides)
+        voices_keys = list(self.voice_overrides.keys()) if voices_count > 0 else []
+        logger.info(
+            f"Config loaded: {voices_count} voices (['global' + {len(voices_keys) - 1}] if global fallback; keys: {voices_keys}), {len(self._defaults)} params (logging_level={self.logging_level})")
+        if voices_count > 1:  # Success log
+            sample_voice = voices_keys[0] if voices_keys else 'none'
+            logger.info(
+                f"Voices loaded: {sample_voice} (trim={self.voice_overrides.get(sample_voice, {}).get('trim_threshold_db', 'N/A')}, eq={self.voice_overrides.get(sample_voice, {}).get('eq_gain_db', 'N/A')}, notch={self.voice_overrides.get(sample_voice, {}).get('notch_gain_db', 'N/A')}")
+
+        # Cache result (but voices refreshed on call if needed)
         _CONFIG_CACHE = (default_config, config_mode, global_flags)
         return _CONFIG_CACHE
+
 
     def _merge_defaults(self, input_defaults: Dict, modes: Dict, flags: Dict):
         """Internal: Merge input to class storage (non-breaking). Sharable for custom merges."""
@@ -539,51 +581,37 @@ class SkyrimNetConfig:
         return self._audio_defaults
 
     def get_merged_audio_params(self, voice_name: Optional[str] = None, api_overrides: Optional[Dict] = None) -> Dict[str, Any]:
-        """Merge: Defaults → Global (if enables) → Voice (JSON) → API. No-op safe; patched for post-processing."""
+        """Merge: audio_defaults → Voice (JSON) → API. FIXED: Log all keys in merged (voice/raw + final); force voice get."""
         params = self.audio_defaults.copy()  # Subset with clamped globals
-        params['voice_name'] = voice_name or 'default'  # Log ID
+        params['voice_name'] = voice_name or 'default'
 
-        # Global enables (map flags to params; only if enable_post_processing)
-        if params.get('enable_post_processing', False):
-            global_enables = {
-                'enable_post_resample': ['speaking_rate'],
-                'enable_eq': ['eq_gain_db', 'eq_cutoff_hz'],
-                'enable_notch': ['notch_gain_db', 'notch_low_hz', 'notch_high_hz'],
-                'enable_gain_norm': ['gain_target_max', 'gain_max_limit'],
-                'enable_denoise_normalize': ['enable_denoise_normalize', 'noise_floor_db', 'normalize_method', 'trim_threshold_db'],
-                'enable_fade': ['fade_ms']
-            }
-            for enable_flag, keys in global_enables.items():
-                if self.get_value(enable_flag, default=False):  # Global flag
-                    for key in (keys if isinstance(keys, list) else [keys]):
-                        global_val = self.get_value(key)  # Clamped
-                        if global_val is not None:
-                            params[key] = global_val
-                            logger.debug(f"Global {key}={global_val} (enable={enable_flag})")
+        # Force voice params (get even empty; log raw)
+        voice_params_raw = self.get_voice_parameters(voice_name)  # Raw from JSON
+        logger.debug(f"Raw voice params for '{voice_name}': {voice_params_raw}")  # e.g., {'trim_threshold_db': -40.0, ...} or {}
+
+        # Merge voice → params (override defaults)
+        if voice_params_raw:
+            for key, value in voice_params_raw.items():
+                params[key] = value  # e.g., trim=-40.0 overrides -30
+                logger.debug(f"Voice override {key}={value} for {voice_name}")
         else:
-            # Disable: Set to no-op (e.g., None/0/1.0 → functions skip)
-            no_op_keys = ['speaking_rate', 'eq_gain_db', 'notch_gain_db', 'gain_target_max']
-            for key in no_op_keys:
-                params[key] = 1.0 if key == 'speaking_rate' else (None if 'gain' in key or 'notch' in key else 0.0)
-
-        # Voice JSON (overrides global/default; from _load_voices_json)
-        if voice_name and voice_name in self.voice_overrides:
-            voice_params = self.get_voice_parameters(voice_name)
-            for key, value in voice_params.items():
-                if key in params and value is not None:  # Skip None (no override)
-                    params[key] = value  # e.g., dlc1seranavoice -12dB wins
-                    logger.debug(f"Voice override {key}={value} for {voice_name}")
-        elif voice_name:
-            logger.debug(f"No voices.json params for {voice_name} – global/defaults")
+            logger.debug(f"No voice-specific params for '{voice_name}' – using globals/defaults")
 
         # API/UI overrides (highest)
         if api_overrides:
             params.update({k: v for k, v in api_overrides.items() if k in params})
             logger.debug(f"API overrides for {voice_name}: {list(api_overrides.keys())}")
 
-        # Final enable (from params; functions check anyway)
-        logger.info(f"Merged audio for {voice_name}: enable_post={params['enable_post_processing']}, rate={params.get('speaking_rate', 1.0)}, notch={params.get('notch_gain_db')}")
+        # Log full merged (confirms load/apply)
+        logger.debug(f"Merged audio params for '{voice_name}': { {k: v for k, v in params.items() if v is not None} }")  # Non-None only
+        active_keys = [k for k, v in params.items() if v is not None and v != (0.0 if k.endswith('_db') else 0) and v != (1.0 if k == 'speaking_rate' else 1.0)]
+        if active_keys:
+            logger.info(f"Merged audio for {voice_name}: {len(active_keys)} active overrides ({sorted(active_keys)})")
+        else:
+            logger.info(f"Merged audio for {voice_name}: defaults (no overrides)")
+
         return params
+
 
     def get_voice_parameters(self, voice_name: str) -> Dict[str, Any]:
         """Voice overrides (from voices.json; dict or empty)."""

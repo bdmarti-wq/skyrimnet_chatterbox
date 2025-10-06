@@ -2,12 +2,13 @@ import asyncio
 import os
 import time
 from typing import Optional
-
+import os
 import numba
 import numpy as np
 import librosa
 import torch
-from scipy.signal import sosfilt, butter
+import torchaudio
+import librosa
 import soundfile as sf
 import tempfile
 import asyncio
@@ -15,7 +16,7 @@ import os
 import time
 import numpy as np
 import librosa
-from scipy.signal import sosfilt, butter
+from scipy.signal import sosfilt, butter, iirnotch
 from pathlib import Path
 from loguru import logger
 
@@ -108,6 +109,33 @@ async def denoise_and_normalize_in_memory(
 
     audio = await loop.run_in_executor(None, simple_normalize, audio, normalize_method)
     return np.clip(audio, -1.0, 1.0)
+
+
+def is_artifact_laden(wav_path: str, threshold_hz: float = 7000.0, sr: int = 24000) -> bool:
+    """Detect gen artifacts (only; mean >7000Hz OR >50% high frames). Skip refs."""
+    try:
+        y, actual_sr = torchaudio.load(wav_path)
+        y = y.mean(dim=0).numpy()
+        if len(y) < sr * 0.5:  # <0.5s skip
+            return False
+
+        centroid = librosa.feature.spectral_centroid(y=y, sr=actual_sr, n_fft=2048, hop_length=512)[0]
+        mean_centroid = np.mean(centroid)
+        half_thresh = threshold_hz / 2  # 3500Hz
+        high_freq_ratio = np.mean(centroid > half_thresh)
+
+        # FIXED: Higher thresh/ratio (voice <6000Hz; purge only severe chirps)
+        is_bad = (mean_centroid > threshold_hz) or (high_freq_ratio > 0.5)  # 50% (sibilants ok <0.5)
+
+        reason = "high_mean" if mean_centroid > threshold_hz else "high_ratio"
+        logger.debug(
+            f"Artifact check {wav_path}: mean={mean_centroid:.0f}{' >' if mean_centroid > threshold_hz else ' <= '}{threshold_hz}Hz (ratio={high_freq_ratio:.2f}{' >0.5' if high_freq_ratio > 0.5 else ' <=0.5'}, len={len(y) / actual_sr:.2f}s) – {'bad (' + reason + ')' if is_bad else 'clean'}")
+
+        return is_bad
+    except Exception as e:
+        logger.trace(f"Check failed {wav_path}: {e} – clean")
+        return False
+
 
 
 # Modular Post-Processing Functions (extracted from generate) - Updated for no-op values
@@ -245,168 +273,130 @@ def apply_fade(audio: np.ndarray, sr: int, fade_ms: float | None = 20.0) -> np.n
     return audio
 
 
-# High-Level Wrapper for Voice-Specific Processing - Revised: Dict-based, no booleans
-async def apply_voice_specific_processing(
-        audio: np.ndarray, sr: int, voice_params: dict | None = None,
-        overrides: dict | None = None  # Bundled (None skips)
-) -> np.ndarray:
-    """Async chain: Denoise → Trim → EQ → Notch → Gain → Rate → Fade (offloads heavy; modular)."""
-    if overrides is None:
-        overrides = {}
 
-    # Legacy override (unchanged; add notch keys)
-    if voice_params:
-        overrides['trim_threshold_db'] = voice_params.get('trim_threshold_db', overrides.get('trim_threshold_db'))
-        overrides['eq_gain_db'] = voice_params.get('eq_gain_db', overrides.get('eq_gain_db'))
-        overrides['eq_cutoff_hz'] = voice_params.get('eq_cutoff_hz', overrides.get('eq_cutoff_hz'))
-        overrides['notch_low_hz'] = voice_params.get('notch_low', overrides.get('notch_low_hz', 8000))
-        overrides['notch_high_hz'] = voice_params.get('notch_high', overrides.get('notch_high_hz', 11000))
-        overrides['notch_gain_db'] = voice_params.get('notch_gain_db', overrides.get('notch_gain_db', -12))
-        overrides['gain_target_max'] = voice_params.get('target_max', overrides.get('gain_target_max', 0.5))
-        overrides['gain_max_limit'] = voice_params.get('max_gain', overrides.get('gain_max_limit', 2.0))
-        overrides['speaking_rate'] = voice_params.get('speaking_rate', overrides.get('speaking_rate', 1.0))
-        overrides['fade_ms'] = voice_params.get('fade_ms', overrides.get('fade_ms'))
-        overrides['noise_floor_db'] = voice_params.get('noise_floor_db', overrides.get('noise_floor_db'))
-        overrides['normalize_method'] = voice_params.get('normalize_method', overrides.get('normalize_method', 'peak'))
-        overrides['enable_denoise_normalize'] = voice_params.get('enable_denoise_normalize', False)
-
-    # Unpack (no-op defaults)
-    trim_threshold_db = overrides.get('trim_threshold_db', None)
-    eq_gain_db = overrides.get('eq_gain_db', None)
-    eq_cutoff_hz = overrides.get('eq_cutoff_hz', None)
-    notch_low_hz = overrides.get('notch_low_hz')
-    notch_high_hz = overrides.get('notch_high_hz')
-    notch_gain_db = overrides.get('notch_gain_db')
-    gain_target_max = overrides.get('gain_target_max', None)
-    gain_max_limit = overrides.get('gain_max_limit', 2.0)
-    speaking_rate = overrides.get('speaking_rate', 1.0)
-    fade_ms = overrides.get('fade_ms', None)
-    enable_denoise_normalize = overrides.get('enable_denoise_normalize', False)
-    normalize_method = overrides.get('normalize_method', 'peak') if enable_denoise_normalize else None
-    noise_floor_db = overrides.get('noise_floor_db', -60.0) if enable_denoise_normalize else None
-
-    logger.debug(f"Voice processing: { {k: v for k, v in locals().items() if k in overrides and v is not None} }")
-
-    loop = asyncio.get_running_loop()
-
-    # Chain: Offload heavy (denoise/stretch); light inline/async-possible
-    if enable_denoise_normalize:
-        audio = await denoise_and_normalize_in_memory(audio, sr, normalize_method, noise_floor_db)  # Already async offload
-
-    # Light sync (inline; <10ms each)
-    audio = trim_silence(audio, trim_threshold_db)
-    audio = apply_eq(audio, sr, eq_gain_db, eq_cutoff_hz)
-    audio = apply_notch(audio, sr, notch_low_hz, notch_high_hz, notch_gain_db)  # FIXED: New modular
-    audio = apply_gain_normalization(audio, gain_target_max, gain_max_limit)
-
-    # Offload stretch if rate !=1 (librosa ~50ms medium; heavy)
-    if abs(speaking_rate - 1.0) > 0.01:
-        def sync_stretch(audio, sr, rate):
-            return adjust_speaking_rate(audio, rate)  # Internal call
-        audio = await loop.run_in_executor(None, sync_stretch, audio, sr, speaking_rate)
-
-    audio = apply_fade(audio, sr, fade_ms)  # Light; inline
-
-    return np.clip(audio, -1.0, 1.0)
-
-
-async def apply_post_processing(wav: torch.Tensor, model_sr: int, audio_params: dict | None) -> np.ndarray:
-    """Post-processing: Applies merged params directly (no re-checks; Trusts merge for enables/defaults)."""
-    if not audio_params:
-        logger.debug("Post skipped: No params")
-        return wav.cpu().squeeze(0).numpy()  # Raw
-
-    """Sync/Async post-chain: Ensure 2D input → 1D mono output."""
-    if not audio_params.get('enable_post_processing', False):
-        # Passthru: Squeeze to 1D np
+def apply_post_processing(wav: torch.Tensor, sr: int, params: dict | None = None) -> np.ndarray:
+    """Merged post-processing: Trim → Denoise (if enabled) → EQ (if gain!=0) → Notch (if gain<0) → Normalize (if enabled) → Rate → Fade → Clamp.
+    Uses full params dict from merge (e.g., 'enable_denoising': True, 'eq_gain_db': -3.0). Logs each step. FIXED: No sub-call/kwargs (single pass, no redundancy)."""
+    if params is None:
+        params = {}
+        logger.debug("Post skipped: No params – raw output")
         return wav.cpu().squeeze().numpy() if wav.dim() > 1 else wav.cpu().numpy()
 
-    # FIXED: Ensure 2D mono input (Gradio/TTS may give 1D/3D)
-    if wav.dim() == 1:
-        wav_np = wav.cpu().squeeze().numpy()
-        wav = torch.from_numpy(wav_np).unsqueeze(0).unsqueeze(-1) if wav_np.ndim == 1 else torch.from_numpy(np.expand_dims(wav_np, -1))
-    elif wav.dim() > 2:
-        wav = torch.mean(wav, dim=-1)  # Avg channels → 2D
-    logger.debug(f"Post input ensured: {wav.shape} @ {model_sr}Hz")
+    if not params.get('enable_post_processing', False):
+        logger.debug("Post disabled – raw output")
+        return wav.cpu().squeeze().numpy() if wav.dim() > 1 else wav.cpu().numpy()
 
-    wav_np = wav.cpu().squeeze(-1).squeeze(0).numpy()  # Final 1D mono np
+    voice_name = params.get('voice_name', 'unknown')
+    logger.debug(f"Post params for {voice_name}: {params}")  # Full dict (confirms merge)
 
-    voice_name_log = audio_params.get('voice_name', 'Unknown')  # FIXED: From merge (no voice_name param needed)
-    enable_post = audio_params.get('enable_post_processing', True)
-    if not enable_post:
-        logger.info(f"Post disabled for {voice_name_log} – raw")
-        return wav_np
-    logger.debug(f"Post enabled for {voice_name_log}")  # FIXED: Consistent log (no None)
+    # Ensure 1D np (mono)
+    if wav.dim() > 1:
+        wav_np = wav.mean(dim=0).cpu().numpy()  # Avg channels if multi
+    else:
+        wav_np = wav.cpu().numpy()
+    logger.debug(f"Post input: {len(wav_np)} samples @ {sr}Hz ({len(wav_np)/sr:.2f}s)")
 
-    # FIXED: Direct apply from audio_params (merged: If key present/non-default, process; Else skip)
-    # Rate (resample if !=1.0 or present)
-    speaking_rate = audio_params.get('speaking_rate')
-    if speaking_rate is not None and speaking_rate != 1.0:
-        wav_np = adjust_speaking_rate(wav_np, speaking_rate)
-        logger.debug(f"Rate applied: {speaking_rate}x for {voice_name_log}")
+    # Trim (if threshold)
+    trim_db = params.get('trim_threshold_db', None)
+    if trim_db is not None:
+        wav_np, _ = librosa.effects.trim(wav_np, top_db=trim_db)
+        logger.debug(f"Trim applied ({trim_db}dB): {len(wav_np)/sr:.2f}s")
 
-    # EQ (if gain_db !=0.0 or present)
-    eq_gain_db = audio_params.get('eq_gain_db')
-    eq_cutoff_hz = audio_params.get('eq_cutoff_hz', 3000)
+    # Denoise (spectral if enabled)
+    enable_denoise = params.get('enable_denoising', False)
+    if enable_denoise:
+        noise_floor_db = params.get('noise_floor_db', -60.0)
+        n_fft = params.get('n_fft', 2048)
+        hop_length = params.get('hop_length', 512)
+        stft = librosa.stft(wav_np, n_fft=n_fft, hop_length=hop_length)
+        mag, phase = np.abs(stft), np.angle(stft)
+        noise_floor = 10 ** (noise_floor_db / 20.0)
+        clean_mag = np.maximum(mag - noise_floor, 0.0)
+        clean_stft = clean_mag * np.exp(1j * phase)
+        wav_np = librosa.istft(clean_stft, hop_length=hop_length, length=len(wav_np))
+        logger.debug(f"Denoise applied (spectral subtract, {noise_floor_db}dB, n_fft={n_fft}, hop={hop_length})")
+
+    # EQ (if gain !=0)
+    eq_gain_db = params.get('eq_gain_db', None)
+    eq_cutoff_hz = params.get('eq_cutoff_hz', 4000)
     if eq_gain_db is not None and eq_gain_db != 0.0:
-        wav_np = apply_eq(wav_np, model_sr, eq_gain_db, eq_cutoff_hz)
-        logger.debug(f"EQ applied: {eq_gain_db}dB @ {eq_cutoff_hz}Hz for {voice_name_log}")
+        nyquist = sr / 2.0
+        cutoff_norm = min(1.0, max(0.01, eq_cutoff_hz / nyquist))
+        sos = butter(4, cutoff_norm, btype='lowpass' if eq_gain_db < 0 else 'highpass', output='sos')
+        wav_np = sosfilt(sos, wav_np)
+        logger.debug(f"EQ applied ({eq_gain_db}dB {'low' if eq_gain_db < 0 else 'high'}-pass @ {eq_cutoff_hz}Hz)")
 
-    # Gain Norm (if target_max not None or limit !=1.0)
-    gain_target_max = audio_params.get('gain_target_max')
-    gain_max_limit = audio_params.get('gain_max_limit', 1.0)
-    if gain_target_max is not None or gain_max_limit != 1.0:
-        wav_np = apply_gain_normalization(wav_np, gain_target_max, gain_max_limit)
-        logger.debug(f"Gain norm: target={gain_target_max}, limit={gain_max_limit} for {voice_name_log}")
+    # Notch (if gain <0)
+    notch_gain_db = params.get('notch_gain_db', None)
+    notch_low_hz = params.get('notch_low_hz', 8000)
+    notch_high_hz = params.get('notch_high_hz', 11000)
+    if notch_gain_db is not None and notch_gain_db < 0:
+        # Use bandstop butter (sosfilt; iirnotch b,a needs lfilter)
+        # from scipy.signal import butter
+        nyquist = sr / 2.0
+        low_norm = max(0.01, min(0.99, notch_low_hz / nyquist))
+        high_norm = min(0.99, max(0.01, notch_high_hz / nyquist))
+        if low_norm < high_norm:
+            sos_notch = butter(4, [low_norm, high_norm], btype='bandstop', output='sos')
+            gain_factor = 10 ** (notch_gain_db / 20.0)
+            notched = sosfilt(sos_notch, wav_np)
+            wav_np = notched * gain_factor + wav_np * (1 - gain_factor)  # Blend attenuated
+            logger.debug(f"Notch applied ({notch_gain_db}dB @ {notch_low_hz}-{notch_high_hz}Hz, 4th-order bandstop)")
 
-    # JIT Clamp (always if enabled; From merged flag)
-    if audio_params.get('enable_post_jit_gain', True):
-        @numba.jit(nopython=True)
-        def apply_gain_jit(data, max_gain):
-            for i in range(len(data)):
-                data[i] = min(max(data[i] * max_gain, -1.0), 1.0)
-            return data
+    # Normalize (if enabled, post-denoise/EQ)
+    enable_normalize = params.get('enable_denoise_normalize', False)
+    norm_method = params.get('normalize_method', 'peak')
+    if enable_normalize:
+        if norm_method == 'peak':
+            peak = np.max(np.abs(wav_np))
+            if peak > 0:
+                wav_np /= peak
+                wav_np *= 0.95  # Headroom
+                logger.debug(f"Normalize applied ({norm_method}: peak -1dB)")
+        elif norm_method == 'rms':
+            rms = np.sqrt(np.mean(wav_np ** 2))
+            if rms > 0:
+                target_rms = 10 ** (-18 / 20)  # -18dB
+                wav_np *= target_rms / rms
+                logger.debug(f"Normalize applied ({norm_method}: RMS -18dB)")
 
-        max_gain_limit = audio_params.get('gain_max_limit', 1.0)  # From merged
-        wav_np = apply_gain_jit(wav_np.copy().astype(np.float32), max_gain_limit)
-        logger.debug(f"JIT clamp {max_gain_limit} for {voice_name_log}")
-
-    # Voice-Specific (if enable flag; Builds from merged keys)
-    if audio_params.get('enable_post_voice_processing', True):
-        voice_overrides = {
-            'trim_threshold_db': audio_params.get('trim_threshold_db', -28),
-            'eq_gain_db': 0.0,  # Already applied; Reset
-            'eq_cutoff_hz': eq_cutoff_hz,  # From above
-            'notch_low_hz': audio_params.get('notch_low_hz', 8000),
-            'notch_high_hz': audio_params.get('notch_high_hz', 11000),
-            'notch_gain_db': audio_params.get('notch_gain_db'),  # e.g., -12 for dlc1 (applies if not None)
-            'gain_max_limit': gain_max_limit,
-            'speaking_rate': 1.0,  # Already applied
-            'fade_ms': audio_params.get('fade_ms', 20),
-            'enable_denoise_normalize': audio_params.get('enable_denoise_normalize', False),
-            'normalize_method': audio_params.get('normalize_method', 'rms') if audio_params.get(
-                'enable_denoise_normalize', False) else None,
-            'noise_floor_db': audio_params.get('noise_floor_db', -60.0) if audio_params.get('enable_denoise_normalize',
-                                                                                            False) else None
-        }
-        # FIXED: Apply/log only if voice-specific (e.g., notch_gain_db not None)
-        applied_overrides = {k: v for k, v in voice_overrides.items() if
-                             v is not None and k in ['notch_gain_db', 'trim_threshold_db']}
-        if applied_overrides:
-            logger.debug(f"Voice overrides applied for {voice_name_log}: {applied_overrides}")
+    # Rate (time stretch if !=1.0)
+    rate = params.get('speaking_rate', 1.0)
+    if abs(rate - 1.0) > 0.05:
+        stretch_rate = 1.0 / rate
+        wav_np = librosa.effects.time_stretch(wav_np, rate=stretch_rate)
+        # Resample/trim to original length if stretch altered
+        target_len = int(len(wav_np) * rate)
+        if len(wav_np) > target_len:
+            wav_np = wav_np[:target_len]
         else:
-            logger.debug(f"Default processing for {voice_name_log}")
+            pad_len = target_len - len(wav_np)
+            wav_np = np.pad(wav_np, (0, pad_len), mode='constant')
+        logger.debug(f"Rate applied ({rate}x time-stretch)")
 
-        wav_np = await apply_voice_specific_processing(wav_np, model_sr, None,
-                                                                   overrides=voice_overrides)  # FIXED: No voice_params (merged in overrides)
+    # Fade (if ms >0)
+    fade_ms = params.get('fade_ms', None)
+    if fade_ms is not None and fade_ms > 0:
+        fade_samples = int(sr * (fade_ms / 1000.0))
+        if len(wav_np) > 2 * fade_samples:
+            fade_in = np.linspace(0.0, 1.0, fade_samples)
+            fade_out = np.linspace(1.0, 0.0, fade_samples)
+            wav_np[:fade_samples] *= fade_in
+            wav_np[-fade_samples:] *= fade_out
+            logger.debug(f"Fade applied ({fade_ms}ms in/out)")
 
-    return np.clip(wav_np, -1.0, 1.0)  # 1D output
+    # Clamp gain (limit max)
+    gain_limit = params.get('gain_max_limit', None)
+    if gain_limit is not None:
+        wav_np = np.clip(wav_np, -gain_limit, gain_limit)
+        logger.debug(f"Gain clamped to {gain_limit}")
+
+    # Final clip/return 1D np
+    wav_np = np.clip(wav_np, -1.0, 1.0)
+    logger.debug(f"Post complete for {voice_name}: {len(wav_np)/sr:.2f}s (applied: denoise={enable_denoise}, eq={eq_gain_db or 'no'}, notch={notch_gain_db or 'no'}, rate={rate}, etc.)")
+    return wav_np
 
 
-# Set torchaudio backend: Prefer 'sox' for speed/reliability, fallback to 'soundfile'
-import os
-import logging
-from loguru import logger as loguru_logger  # If using loguru
 
 
 def set_torchaudio_backend():

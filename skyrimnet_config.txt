@@ -74,3 +74,4 @@ COMPRESS_PT_SAVES=True
 
 fuzzy_min_length = 3
 fuzzy_boost_words = mmm,ooh,throbb,moan,gasp,cock,pussy,cunt,twat,tits,aah,yes,please,more,cunt,gods
+fuzzy_artifact_threshold_hz = 6000
