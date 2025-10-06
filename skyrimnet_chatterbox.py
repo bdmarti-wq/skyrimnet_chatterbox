@@ -1,6 +1,11 @@
 # skyrimnet_chatterbox.py (Imports and generate shell)
+import asyncio
 import functools
+import tempfile
 import warnings
+
+import torchaudio
+from pathlib import Path
 
 from config import DEVICE, DTYPE, _USE_API_MODE, load_skyrimnet_config, get_config_value, ENABLE_MEMORY_CACHE, \
     ENABLE_DISK_CACHE, MODEL, MULTILINGUAL
@@ -77,7 +82,7 @@ def cpp_uuid_to_seed(uuid_64: int) -> int:
     return abs(hash(uuid_64)) % (2 ** 32)
 
 
-def generate_audio_ui(
+def generate_audio_ui(  # REVERT/PATCH: Sync def (Gradio calls without await → no coroutine error)
         model_choice=None,
         text="On that first day from Saturalia, My missus gave for me, A big bowl of moon sugar!",
         language="en",
@@ -108,7 +113,7 @@ def generate_audio_ui(
         randomize_seed: bool = False,
         unconditional_keys: list = None
 ):
-    """Generate audio using configurable parameter system"""
+    """Generate audio using configurable parameter system (sync wrapper for inner async)"""
 
     if _USE_API_MODE:
         defaults, modes = {}, {}
@@ -136,24 +141,54 @@ def generate_audio_ui(
     # Important - use server supplied uuid for consistent seed
     seed_num = cpp_uuid_to_seed(uuid)
 
-    # Lazy import + call (via kwargs for sig safety; model=MODEL from global)
-    from src.generate_audio import generate_audio
-    result = generate_audio(
-        model=MODEL,
-        text=text,
-        audio_prompt_path=speaker_audio,  # None ok
-        seed_num=seed_num,
-        cache_uuid=uuid,
-        exaggeration=final_exaggeration,
-        temperature=final_temperature,
-        cfgw=final_cfg_weight,
-        min_p=final_min_p,
-        top_p=final_top_p,
-        repetition_penalty=final_repetition_penalty,
-        language_id=language  # kwarg-safe
-    )
-    return result, uuid  # Matches outputs
+    # NEW: Temp event loop for inner async (safe in sync Gradio context; ~0.01s overhead)
+    # Creates/runs/closes loop around generate_audio call (prepares for async generate_audio)
+    loop = None
+    try:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
 
+        # Lazy import + call (via kwargs for sig safety; model=MODEL from global)
+        from src.generate_audio import generate_audio  # Assume will be async (returns coroutine)
+        gen_coroutine = generate_audio(  # Call async fn → coroutine
+            model=MODEL,
+            text=text,
+            audio_prompt_path=speaker_audio,  # None ok (used internally for stem/post)
+            seed_num=seed_num,
+            cache_uuid=uuid,
+            exaggeration=final_exaggeration,
+            temperature=final_temperature,
+            cfgw=final_cfg_weight,
+            min_p=final_min_p,
+            top_p=final_top_p,
+            repetition_penalty=final_repetition_penalty,
+            language_id=language  # kwarg-safe
+        )
+
+        # Await in temp loop → gets actual result (tensor/path; no coroutine return to Gradio)
+        result = loop.run_until_complete(gen_coroutine)
+        logger.debug(
+            f"Inner async generate_audio complete via wrapper: result type {type(result)} | shape {getattr(result, 'shape', 'N/A') if hasattr(result, 'shape') else 'N/A'}")
+
+    except Exception as inner_e:
+        logger.error(f"Inner async wrapper error in generate_audio_ui: {inner_e} – fallback to silence path")
+        if loop:
+            loop.close()
+        # FIXED: 2D mono silence (Gradio-safe: [1, samples], float32 CPU) + save to temp path (str return like HIT)
+        from config import CONFIG  # Absolute for fallback (sr/dtype/device)
+        silence_2d = torch.zeros(1, CONFIG.sr * 2, dtype=torch.float32, device='cpu')  # 2D [1, 48000]; float32 CPU
+        # Temp save (mimic save_and_cache_output; sr=CONFIG.sr)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            fallback_path = Path(tmpdir) / f"fallback_silence_{uuid}.wav"
+            torchaudio.save(str(fallback_path), silence_2d, CONFIG.sr)
+            result = str(fallback_path)  # Str path (Gradio Audio handles; delete on close)
+            logger.warning(f"Fallback silence path created: {result} (2s; error: {str(inner_e)[:100]})")
+
+    finally:
+        if loop and not loop.is_closed():
+            loop.close()
+
+    return result, uuid  # Matches outputs (str path from inner/fallback + uuid; Gradio Audio ok)
 
 
 with gr.Blocks() as demo:

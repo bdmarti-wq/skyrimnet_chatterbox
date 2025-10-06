@@ -1,8 +1,12 @@
 import asyncio
 import os
 import time
+from typing import Optional
+
+import numba
 import numpy as np
 import librosa
+import torch
 from scipy.signal import sosfilt, butter
 import soundfile as sf
 import tempfile
@@ -165,17 +169,44 @@ def apply_eq(audio: np.ndarray, sr: int, gain_db: float | None = 0.0, cutoff_hz:
     return np.clip(audio, -1.0, 1.0)
 
 
-def apply_gain_normalization(audio: np.ndarray, target_max: float | None = 0.5,
-                             max_gain_limit: float = 2.0) -> np.ndarray:
-    """Apply gain to reach target max amplitude, limited by max_gain."""
-    if target_max is None:
-        logger.debug("Gain normalization skipped (target_max=None)")
+# ... (other imports/funcs unchanged: trim_silence, denoise..., eq, notch, etc.)
+
+def apply_gain_normalization(audio: np.ndarray, target_max: Optional[float] = None,
+                             max_gain_limit: float = 1.0) -> np.ndarray:
+    """Apply gain to reach target_max (clamps <= max_gain_limit). Jit-safe branch."""
+    if target_max is None or target_max <= 0:
         return audio  # No-op
-    current_max = np.max(np.abs(audio))
-    if current_max >= target_max or current_max <= 0:
+
+    current_max = np.max(np.abs(audio))  # Sync numpy (fast ~0.01ms)
+    if current_max <= 0 or current_max >= target_max:
+        return audio  # Already good/no need
+
+    max_gain = min(target_max / current_max, max_gain_limit)  # Compute once (scalar; no jit issue)
+    if max_gain <= 1.0:  # No boost needed
         return audio
-    gain_factor = min(target_max / current_max, max_gain_limit)
-    return np.clip(audio * gain_factor, -1.0, 1.0)
+
+    # FIXED: Jit loop with ifs (avoids max/min overload on scalar*float)
+    @numba.jit(nopython=True)
+    def apply_gain_jit(data, max_gain):
+        # Numba-friendly: Explicit if for clamp (no built-in max/min with float lit)
+        for i in range(len(data)):
+            amplified = data[i] * max_gain
+            if amplified > 1.0:
+                data[i] = 1.0
+            elif amplified < -1.0:
+                data[i] = -1.0
+            else:
+                data[i] = amplified
+        return data
+
+    # Call jit (audio.copy() to avoid mutating original; astype(np.float64) for Numba)
+    data_copy = audio.copy().astype(np.float64)  # Numba prefers float64 for precision
+    wav_np = apply_gain_jit(data_copy, max_gain)
+
+    logger.debug(f"Gain applied: {max_gain:.2f}x (target={target_max}, current_max={current_max:.3f})")
+    return wav_np  # Returns clipped [-1,1]
+
+
 
 
 def adjust_speaking_rate(audio: np.ndarray, rate: float = 1.0) -> np.ndarray:
@@ -279,30 +310,148 @@ async def apply_voice_specific_processing(
     return np.clip(audio, -1.0, 1.0)
 
 
-# Set torchaudio backend: Prefer 'sox' for speed/reliability, fallback to 'soundfile'
-def set_torchaudio_backend():
-    """Configure torchaudio backend with SOX preference (Windows-friendly)."""
-    # Set env var BEFORE importing torchaudio
-    preferred_backend = 'sox'
-    fallback_backend = 'soundfile'
+async def apply_post_processing(wav: torch.Tensor, model_sr: int, audio_params: dict | None) -> np.ndarray:
+    """Post-processing: Applies merged params directly (no re-checks; Trusts merge for enables/defaults)."""
+    if not audio_params:
+        logger.debug("Post skipped: No params")
+        return wav.cpu().squeeze(0).numpy()  # Raw
 
-    # Early set to env (torchaudio reads on import)
-    os.environ['TORCHAUDIO_BACKEND'] = fallback_backend  # Default fallback
+    """Sync/Async post-chain: Ensure 2D input → 1D mono output."""
+    if not audio_params.get('enable_post_processing', False):
+        # Passthru: Squeeze to 1D np
+        return wav.cpu().squeeze().numpy() if wav.dim() > 1 else wav.cpu().numpy()
+
+    # FIXED: Ensure 2D mono input (Gradio/TTS may give 1D/3D)
+    if wav.dim() == 1:
+        wav_np = wav.cpu().squeeze().numpy()
+        wav = torch.from_numpy(wav_np).unsqueeze(0).unsqueeze(-1) if wav_np.ndim == 1 else torch.from_numpy(np.expand_dims(wav_np, -1))
+    elif wav.dim() > 2:
+        wav = torch.mean(wav, dim=-1)  # Avg channels → 2D
+    logger.debug(f"Post input ensured: {wav.shape} @ {model_sr}Hz")
+
+    wav_np = wav.cpu().squeeze(-1).squeeze(0).numpy()  # Final 1D mono np
+
+    voice_name_log = audio_params.get('voice_name', 'Unknown')  # FIXED: From merge (no voice_name param needed)
+    enable_post = audio_params.get('enable_post_processing', True)
+    if not enable_post:
+        logger.info(f"Post disabled for {voice_name_log} – raw")
+        return wav_np
+    logger.debug(f"Post enabled for {voice_name_log}")  # FIXED: Consistent log (no None)
+
+    # FIXED: Direct apply from audio_params (merged: If key present/non-default, process; Else skip)
+    # Rate (resample if !=1.0 or present)
+    speaking_rate = audio_params.get('speaking_rate')
+    if speaking_rate is not None and speaking_rate != 1.0:
+        wav_np = adjust_speaking_rate(wav_np, speaking_rate)
+        logger.debug(f"Rate applied: {speaking_rate}x for {voice_name_log}")
+
+    # EQ (if gain_db !=0.0 or present)
+    eq_gain_db = audio_params.get('eq_gain_db')
+    eq_cutoff_hz = audio_params.get('eq_cutoff_hz', 3000)
+    if eq_gain_db is not None and eq_gain_db != 0.0:
+        wav_np = apply_eq(wav_np, model_sr, eq_gain_db, eq_cutoff_hz)
+        logger.debug(f"EQ applied: {eq_gain_db}dB @ {eq_cutoff_hz}Hz for {voice_name_log}")
+
+    # Gain Norm (if target_max not None or limit !=1.0)
+    gain_target_max = audio_params.get('gain_target_max')
+    gain_max_limit = audio_params.get('gain_max_limit', 1.0)
+    if gain_target_max is not None or gain_max_limit != 1.0:
+        wav_np = apply_gain_normalization(wav_np, gain_target_max, gain_max_limit)
+        logger.debug(f"Gain norm: target={gain_target_max}, limit={gain_max_limit} for {voice_name_log}")
+
+    # JIT Clamp (always if enabled; From merged flag)
+    if audio_params.get('enable_post_jit_gain', True):
+        @numba.jit(nopython=True)
+        def apply_gain_jit(data, max_gain):
+            for i in range(len(data)):
+                data[i] = min(max(data[i] * max_gain, -1.0), 1.0)
+            return data
+
+        max_gain_limit = audio_params.get('gain_max_limit', 1.0)  # From merged
+        wav_np = apply_gain_jit(wav_np.copy().astype(np.float32), max_gain_limit)
+        logger.debug(f"JIT clamp {max_gain_limit} for {voice_name_log}")
+
+    # Voice-Specific (if enable flag; Builds from merged keys)
+    if audio_params.get('enable_post_voice_processing', True):
+        voice_overrides = {
+            'trim_threshold_db': audio_params.get('trim_threshold_db', -28),
+            'eq_gain_db': 0.0,  # Already applied; Reset
+            'eq_cutoff_hz': eq_cutoff_hz,  # From above
+            'notch_low_hz': audio_params.get('notch_low_hz', 8000),
+            'notch_high_hz': audio_params.get('notch_high_hz', 11000),
+            'notch_gain_db': audio_params.get('notch_gain_db'),  # e.g., -12 for dlc1 (applies if not None)
+            'gain_max_limit': gain_max_limit,
+            'speaking_rate': 1.0,  # Already applied
+            'fade_ms': audio_params.get('fade_ms', 20),
+            'enable_denoise_normalize': audio_params.get('enable_denoise_normalize', False),
+            'normalize_method': audio_params.get('normalize_method', 'rms') if audio_params.get(
+                'enable_denoise_normalize', False) else None,
+            'noise_floor_db': audio_params.get('noise_floor_db', -60.0) if audio_params.get('enable_denoise_normalize',
+                                                                                            False) else None
+        }
+        # FIXED: Apply/log only if voice-specific (e.g., notch_gain_db not None)
+        applied_overrides = {k: v for k, v in voice_overrides.items() if
+                             v is not None and k in ['notch_gain_db', 'trim_threshold_db']}
+        if applied_overrides:
+            logger.debug(f"Voice overrides applied for {voice_name_log}: {applied_overrides}")
+        else:
+            logger.debug(f"Default processing for {voice_name_log}")
+
+        wav_np = await apply_voice_specific_processing(wav_np, model_sr, None,
+                                                                   overrides=voice_overrides)  # FIXED: No voice_params (merged in overrides)
+
+    return np.clip(wav_np, -1.0, 1.0)  # 1D output
+
+
+# Set torchaudio backend: Prefer 'sox' for speed/reliability, fallback to 'soundfile'
+import os
+import logging
+from loguru import logger as loguru_logger  # If using loguru
+
+
+def set_torchaudio_backend():
+    """Configure torchaudio backend with SOX preference (Windows-friendly; debug deps)."""
+    preferred_backend = 'sox_io'
+    fallback_backend = 'soundfile'
+    sox_exe = 'sox'
+
+    # Try pre-set env for SOX (helps detection)
+    if 'TORCHAUDIO_BACKEND' not in os.environ:
+        os.environ['TORCHAUDIO_BACKEND'] = preferred_backend
 
     try:
-        import torchaudio  # Temp import to check backends
+        import torchaudio
         available_backends = torchaudio.list_audio_backends()
+        logger.debug(f"Available torchaudio backends: {available_backends}")  # Or print
+
         if preferred_backend in available_backends:
-            os.environ['TORCHAUDIO_BACKEND'] = preferred_backend
-            print(f"✓ Using torchaudio backend: {preferred_backend} (faster resample/metadata)")
+            # Force load/test
+            old_backend = torchaudio.get_audio_backend()
+            if old_backend != preferred_backend:
+                torchaudio.set_audio_backend(preferred_backend)  # Explicit set
+                new_backend = torchaudio.get_audio_backend()
+                logger.info(f"✓ Switched to {preferred_backend} (from {old_backend})")
+            else:
+                logger.info(f"✓ Already on {preferred_backend}")
             return preferred_backend
         else:
-            print(f"⚠ SOX not available (install via 'choco install sox'). Using: {fallback_backend}")
+            logger.warning(f"⚠ {preferred_backend} not in backends ({available_backends}). Check SOX DLLs in PATH.")
+            logger.warning("Install full SOX: choco install sox, or conda install -c conda-forge torchaudio.")
+            torchaudio.set_audio_backend(fallback_backend)
             return fallback_backend
+
+    except RuntimeError as load_e:  # SOX load fail (DLL missing)
+        logger.error(f"❌ Failed to load {preferred_backend}: {load_e} – Using {fallback_backend}")
+        try:
+            import torchaudio
+            torchaudio.set_audio_backend(fallback_backend)
+        except:
+            logger.error("Torchaudio backend switch failed – audio ops may break")
+        return fallback_backend
     except ImportError:
-        print(f"❌ torchaudio not installed—audio ops will fail.")
+        logger.error("❌ Torchaudio not installed – install via pip/conda")
         return None
     except Exception as e:
-        print(f"❌ Backend check failed: {e}. Using fallback: {fallback_backend}")
+        logger.error(f"❌ Backend config failed: {e} – Fallback to {fallback_backend}")
         return fallback_backend
 

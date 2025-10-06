@@ -2,12 +2,15 @@
 import logging
 import threading
 
+import numpy as np
 from pathlib import Path
 import torch
-from time import perf_counter_ns
+from time import perf_counter_ns, time
 import torchaudio
 from typing import Optional, Dict, Any, Tuple
-from config import ENABLE_MEMORY_CACHE, ENABLE_DISK_CACHE, DEVICE, DTYPE, MULTILINGUAL  # Import actual globals (fixes ... placeholders)
+from config import ENABLE_MEMORY_CACHE, ENABLE_DISK_CACHE, DEVICE, DTYPE, MULTILINGUAL, \
+    CONFIG  # Import actual globals (fixes ... placeholders)
+from .audio_utils import apply_post_processing
 from .cache import (
     try_audio_cache, set_audio_cache, get_cache_key, get_or_queue_voice_process,
     validate_voice_path, create_dummy_conds, load_conditionals_cache, save_conditionals_cache,
@@ -18,12 +21,14 @@ from .fuzzy_cache import try_fuzzy_audio_cache, FUZZY_QUEUE
 logger = logging.getLogger(__name__)
 GEN_ACTIVE_LOCK = threading.RLock()  # Global for gen/prepare
 
+
 def set_seed(seed: int):
     """
     Set random seeds for reproducible generation.
     """
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
+
 
 def _generate_audio_core(model, generate_args: Dict[str, Any], t3_params: Dict[str, Any]) -> torch.Tensor:
     """Core: Just model.generate + graph retry. Returns wav; no del/cleanup."""
@@ -46,7 +51,9 @@ def _generate_audio_core(model, generate_args: Dict[str, Any], t3_params: Dict[s
                 raise
         return wav
 
-def try_reuse_audio(text: str, audio_prompt_path: Optional[str], exaggeration: float, params: Dict[str, Any]) -> Optional[Tuple[str, str]]:
+
+def try_reuse_audio(text: str, audio_prompt_path: Optional[str], exaggeration: float, params: Dict[str, Any]) -> \
+Optional[Tuple[str, str]]:
     """Try exact then fuzzy; return (path, hit_type) or None. Handles None path.
     Fixed: Pass audio_prompt_path as audio_path for stem extraction; text as text_input; explicit stem kwarg."""
     if not audio_prompt_path:
@@ -57,7 +64,8 @@ def try_reuse_audio(text: str, audio_prompt_path: Optional[str], exaggeration: f
         return exact_path, "Full audio"
     # Fuzzy: Extract stem explicitly (normalize, remove '_fixed' etc.)
     voice_stem = Path(audio_prompt_path).stem.replace('_fixed', '').split('_')[0]  # e.g., 'dlc1seranavoice' (robust)
-    fuzzy_path = try_fuzzy_audio_cache(audio_prompt_path, text, stem=voice_stem)  # Correct: audio_path=voice path (for fallback extract), text_input=text, stem=voice_stem
+    fuzzy_path = try_fuzzy_audio_cache(audio_prompt_path, text,
+                                       stem=voice_stem)  # Correct: audio_path=voice path (for fallback extract), text_input=text, stem=voice_stem
     if fuzzy_path:
         return fuzzy_path, "Fuzzy audio"
     return None
@@ -135,10 +143,16 @@ def save_and_cache_output(wav: torch.Tensor, model, audio_prompt_path: Optional[
         wave_file = str(save_torchaudio_wav(wav.cpu(), model.sr, audio_path=None, uuid=cache_uuid))
     return wave_file
 
-def generate_audio(model, text: str, audio_prompt_path: Optional[str], exaggeration: float = 0.5, cache_uuid: int = 0,
-                   temperature: float = 0.8, cfgw: float = 0, min_p: float = 0.05, top_p: float = 1.0,
-                   repetition_penalty: float = 1.2, language_id: str = "en", seed_num: int = 42,  # DEFAULT: Fixed 42 for consistency
-                   enable_memory_cache: bool = True, enable_disk_cache: bool = True) -> str:
+
+
+
+# ... (imports/prior code unchanged)
+
+async def generate_audio(model, text: str, audio_prompt_path: Optional[str], exaggeration: float = 0.5,
+                         cache_uuid: int = 0,
+                         temperature: float = 0.8, cfgw: float = 0, min_p: float = 0.05, top_p: float = 1.0,
+                         repetition_penalty: float = 1.2, language_id: str = "en", seed_num: int = 42,
+                         enable_memory_cache: bool = True, enable_disk_cache: bool = True) -> str:
     """
     Main orchestration: Validate, cache checks, prep, gen, post-process.
     Assumes model/device/dtype from globals; cleaned sig (no dead params).
@@ -146,7 +160,8 @@ def generate_audio(model, text: str, audio_prompt_path: Optional[str], exaggerat
     if not text:
         logger.warning("No text – using dummy")
         create_dummy_conds(model, DEVICE, DTYPE, "no_text")
-        return str(save_torchaudio_wav(torch.zeros(1, 24000), 24000, uuid=cache_uuid))  # Short dummy
+        dummy_path = str(save_torchaudio_wav(torch.zeros(1, 24000), 24000, uuid=cache_uuid))  # Short dummy path
+        return dummy_path
 
     # Float conversions
     exaggeration = float(exaggeration)
@@ -166,7 +181,8 @@ def generate_audio(model, text: str, audio_prompt_path: Optional[str], exaggerat
     # Logging (ONLY here—no dup in shell)
     stem = Path(audio_prompt_path).stem if audio_prompt_path else "No ref audio"
     logger.info(f"generate called for: \"{text}\", {stem}, uuid: {cache_uuid}, exaggeration: {exaggeration}")
-    logger.info(f"Parameters - temp: {temperature}, min_p: {min_p}, top_p: {top_p}, rep_penalty: {repetition_penalty}, cfg_weight: {cfgw}")
+    logger.info(
+        f"Parameters - temp: {temperature}, min_p: {min_p}, top_p: {top_p}, rep_penalty: {repetition_penalty}, cfg_weight: {cfgw}")
 
     # FIXED: Always set seed (default 42 if 0; ensures consistent accents)
     if seed_num == 0:
@@ -183,7 +199,8 @@ def generate_audio(model, text: str, audio_prompt_path: Optional[str], exaggerat
         # Load/log (local torchaudio)
         wav_reused, sr = torchaudio.load(audio_reuse_path)
         wav_length = wav_reused.shape[-1] / sr
-        logger.info(f"{hit_type} cache HIT: \"{text[:20]}\" ({hit_type.lower()}-match) for {Path(audio_prompt_path).stem} – skipping gen (uuid={cache_uuid}; reuse: {reuse_time_ms:.2f}ms)")
+        logger.info(
+            f"{hit_type} cache HIT: \"{text[:20]}\" ({hit_type.lower()}-match) for {Path(audio_prompt_path).stem} – skipping gen (uuid={cache_uuid}; reuse: {reuse_time_ms:.2f}ms)")
         logger.info(f"Reused {hit_type.lower()} audio: {wav_length:.2f}s in ~0s")
         # Enqueue fuzzy...
         if audio_prompt_path:
@@ -192,14 +209,15 @@ def generate_audio(model, text: str, audio_prompt_path: Optional[str], exaggerat
             FUZZY_QUEUE.put((text, audio_reuse_path, voice_stem))
         total_time_ms = (perf_counter_ns() - func_start_time) / 1_000_000
         logger.info(f"Full cycle: HIT in {total_time_ms:.2f}ms (infinite speed!)")
-        return audio_reuse_path
+        return audio_reuse_path  # Str path (early return)
 
     logger.debug(f"Reuse MISS (took {reuse_time_ms:.2f}ms) – proceeding to full gen")
 
     # Prep voice/conds (helper; handles None → dummy)
     prep_start = perf_counter_ns()
     valid_path = prepare_voice_and_conds(
-        model, audio_prompt_path, cache_uuid, exaggeration, language_id, enable_memory_cache, enable_disk_cache, DEVICE, DTYPE
+        model, audio_prompt_path, cache_uuid, exaggeration, language_id, enable_memory_cache, enable_disk_cache, DEVICE,
+        DTYPE
     )
     prep_time_ms = (perf_counter_ns() - prep_start) / 1_000_000
     logger.debug(f"Prep/conds: {prep_time_ms:.2f}ms")
@@ -233,25 +251,79 @@ def generate_audio(model, text: str, audio_prompt_path: Optional[str], exaggerat
     set_seed(int(seed_num))  # Re-set post-prep (safe)
     wav = _generate_audio_core(model, generate_args, t3_params)
     gen_time_s = (perf_counter_ns() - gen_start) / 1_000_000_000
-    logger.debug(f"Core gen time: {gen_time_s:.2f}s")
+    logger.debug(f"Core gen time: {gen_time_s:.2f}s | raw wav shape: {wav.shape if wav is not None else 'None'}")
 
-    # Post-gen timings/log
+    if wav is None or wav.numel() == 0:
+        logger.warning(f"Empty gen for '{text[:50]}...' – fallback silence")
+        wav = torch.zeros(1, CONFIG.sr * 2, dtype=DTYPE, device=DEVICE)  # 2D silence
+
+    # Post-gen timings/log (derive stem for voice-specific params)
+    stem = Path(audio_prompt_path).stem.replace('_fixed', '').split('_')[0] if audio_prompt_path else 'default'
+    merged_params = CONFIG.get_merged_audio_params(voice_name=stem)
+    post_start = perf_counter_ns()
+    # FIXED: Ensure 2D input for post ([1, samples] mono)
+    if wav.dim() == 1:
+        wav_tensor = torch.unsqueeze(wav, 0)  # [1, samples]
+    elif wav.dim() == 2 and wav.shape[0] == 1:
+        wav_tensor = wav  # Already good
+    else:
+        logger.warning(f"Unexpected wav shape {wav.shape} for post – squeezing to mono 2D")
+        if wav.dim() > 1:
+            wav = torch.mean(wav, dim=0)  # Avg channels → 1D
+        wav_tensor = torch.unsqueeze(wav, 0)  # [1, samples]
+    logger.debug(f"Post input shape: {wav_tensor.shape} (stem={stem})")
+
+    try:
+        wav_np = await apply_post_processing(wav_tensor, CONFIG.sr, merged_params)
+        # NEW: Ensure/convert post return to np (if torch, .numpy(); log type/shape)
+        if isinstance(wav_np, torch.Tensor):
+            logger.debug(f"Post returned torch.Tensor {wav_np.shape} – converting to np")
+            wav_np = wav_np.detach().cpu().numpy()
+        elif not isinstance(wav_np, np.ndarray):
+            logger.warning(f"Post returned unexpected type {type(wav_np)} – forcing np fallback")
+            wav_np = wav_tensor.squeeze(0).cpu().numpy()  # Raw 1D np
+    except Exception as post_e:
+        logger.error(f"Post-processing failed for {stem}: {post_e} – passthru raw")
+        wav_np = wav_tensor.squeeze(0).cpu().numpy()  # Raw 1D np fallback
+
+    # FIXED: Ensure 1D output np from post (squeeze/mean if needed)
+    if len(wav_np.shape) > 1:
+        if wav_np.shape[0] == 1:
+            wav_np = wav_np.squeeze(0)  # [samples]
+        else:
+            wav_np = np.mean(wav_np, axis=1 if wav_np.shape[1] > 1 else 0)  # Avg stereo → mono 1D
+    logger.debug(f"Post output shape: {wav_np.shape} (len={len(wav_np)}, type={type(wav_np).__name__})")
+
+    # Fallback if post empty
+    if wav_np is None or len(wav_np) == 0:
+        logger.warning(f"Post returned empty for {stem} – fallback silence")
+        wav_np = np.zeros(CONFIG.sr * 2)
+
+    # Convert back to tensor (match shape; for save/log)
+    processed_wav = torch.from_numpy(wav_np).unsqueeze(0).to(DEVICE, DTYPE)  # 2D for consistency
+    post_time_ms = (perf_counter_ns() - post_start) / 1_000_000
+    logger.info(
+        f"Post applied for {stem}: {post_time_ms:.2f}ms (enable={merged_params['enable_post_processing']}, rate={merged_params.get('speaking_rate', 1.0)}, notch={merged_params.get('notch_gain_db', 'N/A')}dB)")
+
     func_end_time = perf_counter_ns()
     total_duration_s = (func_end_time - func_start_time) / 1_000_000_000
-    wav_length = wav.shape[-1] / model.sr
+    wav_length = len(wav_np) / CONFIG.sr  # FIXED: Use post np length
     logger.info(
-        f"Generated audio: {wav_length:.2f}s {model.sr / 1000:.2f}kHz in {total_duration_s:.2f}s. Speed: {wav_length / total_duration_s:.2f}x (gen: {gen_time_s:.2f}s, seed: {seed_num})")
+        f"Processed audio: {wav_length:.2f}s {CONFIG.sr / 1000:.2f}kHz in {total_duration_s:.2f}s. Speed: {wav_length / total_duration_s:.2f}x (gen: {gen_time_s:.2f}s, post: {post_time_ms / 1000:.3f}s, seed: {seed_num})")
 
-    # Save/cache
+    # FIXED: Save/cache with processed_wav [1, samples] (2D mono for torchaudio/soundfile compat; no squeeze)
     save_start = perf_counter_ns()
+    # FIXED: Convert to float32 CPU (bfloat16 not supported; ~2ms) – KEEP 2D [1, samples]
+    save_wav = processed_wav.to(torch.float32).cpu()  # 2D float32 CPU; safe for save (mono channel=1)
     wave_file = save_and_cache_output(
-        wav, model, valid_path or audio_prompt_path, cache_uuid, text, exaggeration, params, enable_memory_cache, enable_disk_cache
+        save_wav, model, valid_path or audio_prompt_path, cache_uuid, text, exaggeration, params,
+        enable_memory_cache, enable_disk_cache  # 2D float32 CPU tensor
     )
     save_time_ms = (perf_counter_ns() - save_start) / 1_000_000
-    logger.debug(f"Save/cache: {save_time_ms:.2f}ms")
+    logger.debug(f"Save/cache (processed): {save_time_ms:.2f}ms → {wave_file}")
 
-    # Enqueue fuzzy (only on true MISS; use normalized stem from valid_path)
-    if not reuse_result and (valid_path or audio_prompt_path):
+    # FIXED: Enqueue fuzzy on MISS only (reuse_result is tuple/None)
+    if reuse_result is None and (valid_path or audio_prompt_path):
         voice_stem = Path(valid_path or audio_prompt_path).stem.replace('_fixed', '').split('_')[0]
         logger.debug(f"Enqueued for fuzzy index (MISS): \"{text[:20]}\" (norm stem={voice_stem})")
         FUZZY_QUEUE.put((text, wave_file, voice_stem))
@@ -262,8 +334,9 @@ def generate_audio(model, text: str, audio_prompt_path: Optional[str], exaggerat
         f"Cache stats post-gen: {stats['memory_cache_size']} mem, {stats['disk_files']} disk, {stats['audio_cache_size']} audio, fuzzy: {stats.get('fuzzy_size', 'N/A')}")
 
     # Cleanup (post-save)
-    del wav
+    del wav  # Raw only (processed safe)
     torch.cuda.empty_cache()
     total_time_ms = (perf_counter_ns() - func_start_time) / 1_000_000
-    logger.info(f"Full MISS cycle: {total_time_ms / 1000:.2f}s (reuse: {reuse_time_ms:.0f}ms, prep: {prep_time_ms:.0f}ms, gen: {gen_time_s:.2f}s, save: {save_time_ms:.0f}ms, seed: {seed_num})")
-    return wave_file
+    logger.info(
+        f"Full MISS cycle: {total_time_ms / 1000:.2f}s (reuse: {reuse_time_ms:.0f}ms, prep: {prep_time_ms:.0f}ms, gen: {gen_time_s:.2f}s, post: {post_time_ms:.0f}ms, save: {save_time_ms:.0f}ms, seed: {seed_num})")
+    return wave_file  # Always str path (Gradio safe)
