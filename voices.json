@@ -15,28 +15,19 @@
     "normalize_method": "peak"
   },
   "femaleuniquelydia": {
+    "enable_post_processing": true,
     "enable_denoising": true,
     "enable_denoise_normalize": true,
-    "trim_threshold_db": -40.0,
-    "noise_floor_db": -50.0,
-    "eq_gain_db": -3.0,
+    "trim_threshold_db": -35.0,
+    "noise_floor_db": -45.0,
+    "normalize_method": "peak",
+    "eq_gain_db": -2.0,
     "eq_cutoff_hz": 4000,
-    "notch_gain_db": -12.0,
-    "notch_low_hz": 8000,
+    "notch_gain_db": -8.0,
+    "notch_low_hz": 7000,
     "notch_high_hz": 11000,
-    "gain_max_limit": 0.9,
-    "speaking_rate": 1.1,
-    "fade_ms": 50
-  },
-  "global": {
-    "enable_denoising": false,
-    "enable_denoise_normalize": false,
-    "trim_threshold_db": -30.0,
-    "noise_floor_db": -60.0,
-    "eq_gain_db": 0.0,
-    "notch_gain_db": 0.0,
-    "gain_max_limit": 1.0,
     "speaking_rate": 1.0,
-    "fade_ms": 20
+    "fade_ms": 20,
+    "gain_max_limit": 0.9
   }
 }

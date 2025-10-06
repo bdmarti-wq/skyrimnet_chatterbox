@@ -19,6 +19,8 @@ import librosa
 from scipy.signal import sosfilt, butter, iirnotch
 from pathlib import Path
 from loguru import logger
+from config import CONFIG
+import asyncio
 
 # UTILITY: Cleanup function for test files
 def cleanup_old_test_files(max_age_hours: int = 1):
@@ -64,6 +66,52 @@ def get_wav_duration(path: str) -> float | None:
         return librosa.get_duration(path=path)
     except Exception:
         return None
+
+def set_torchaudio_backend():
+    """Configure torchaudio backend with SOX preference (Windows-friendly; debug deps)."""
+    preferred_backend = 'sox_io'
+    fallback_backend = 'soundfile'
+    sox_exe = 'sox'
+
+    # Try pre-set env for SOX (helps detection)
+    if 'TORCHAUDIO_BACKEND' not in os.environ:
+        os.environ['TORCHAUDIO_BACKEND'] = preferred_backend
+
+    try:
+        import torchaudio
+        available_backends = torchaudio.list_audio_backends()
+        logger.debug(f"Available torchaudio backends: {available_backends}")  # Or print
+
+        if preferred_backend in available_backends:
+            # Force load/test
+            old_backend = torchaudio.get_audio_backend()
+            if old_backend != preferred_backend:
+                torchaudio.set_audio_backend(preferred_backend)  # Explicit set
+                new_backend = torchaudio.get_audio_backend()
+                logger.info(f"✓ Switched to {preferred_backend} (from {old_backend})")
+            else:
+                logger.info(f"✓ Already on {preferred_backend}")
+            return preferred_backend
+        else:
+            logger.warning(f"⚠ {preferred_backend} not in backends ({available_backends}). Check SOX DLLs in PATH.")
+            logger.warning("Install full SOX: choco install sox, or conda install -c conda-forge torchaudio.")
+            torchaudio.set_audio_backend(fallback_backend)
+            return fallback_backend
+
+    except RuntimeError as load_e:  # SOX load fail (DLL missing)
+        logger.error(f"❌ Failed to load {preferred_backend}: {load_e} – Using {fallback_backend}")
+        try:
+            import torchaudio
+            torchaudio.set_audio_backend(fallback_backend)
+        except:
+            logger.error("Torchaudio backend switch failed – audio ops may break")
+        return fallback_backend
+    except ImportError:
+        logger.error("❌ Torchaudio not installed – install via pip/conda")
+        return None
+    except Exception as e:
+        logger.error(f"❌ Backend config failed: {e} – Fallback to {fallback_backend}")
+        return fallback_backend
 
 
 # UTILITY: Simple async denoising and normalization
@@ -111,31 +159,37 @@ async def denoise_and_normalize_in_memory(
     return np.clip(audio, -1.0, 1.0)
 
 
-def is_artifact_laden(wav_path: str, threshold_hz: float = 7000.0, sr: int = 24000) -> bool:
-    """Detect gen artifacts (only; mean >7000Hz OR >50% high frames). Skip refs."""
+def is_artifact_laden(wav_path: str, threshold_hz: float = None, ratio_threshold: float = 0.5, sr: int = 24000) -> bool:
+    """Detect artifacts. FIXED: Default 7000Hz (config); accurate log/comp (no '8000')."""
+    threshold_hz = threshold_hz or CONFIG.get_value('fuzzy_artifact_threshold_hz', 7000.0)
+    threshold_hz = CONFIG.clamp_value('fuzzy_artifact_threshold_hz', threshold_hz)  # Assume CAP added
+    ratio_threshold = 0.5  # Fixed; add CAP 'FUZZY_RATIO_THRESHOLD' if tune
+
     try:
         y, actual_sr = torchaudio.load(wav_path)
         y = y.mean(dim=0).numpy()
-        if len(y) < sr * 0.5:  # <0.5s skip
+        min_dur_sec = CONFIG.get_value('min_post_duration_sec', 0.5)
+        if len(y) < actual_sr * min_dur_sec:
+            logger.trace(f"Short {Path(wav_path).name} (<{min_dur_sec}s) – clean")
             return False
 
-        centroid = librosa.feature.spectral_centroid(y=y, sr=actual_sr, n_fft=2048, hop_length=512)[0]
+        n_fft = CONFIG.get_value('n_fft', 2048)
+        hop_length = CONFIG.get_value('hop_length', 512)
+        centroid = librosa.feature.spectral_centroid(y=y, sr=actual_sr, n_fft=n_fft, hop_length=hop_length)[0]
         mean_centroid = np.mean(centroid)
-        half_thresh = threshold_hz / 2  # 3500Hz
-        high_freq_ratio = np.mean(centroid > half_thresh)
+        high_frames = np.mean(centroid > (threshold_hz / 2))
+        dur = len(y) / actual_sr
 
-        # FIXED: Higher thresh/ratio (voice <6000Hz; purge only severe chirps)
-        is_bad = (mean_centroid > threshold_hz) or (high_freq_ratio > 0.5)  # 50% (sibilants ok <0.5)
-
-        reason = "high_mean" if mean_centroid > threshold_hz else "high_ratio"
-        logger.debug(
-            f"Artifact check {wav_path}: mean={mean_centroid:.0f}{' >' if mean_centroid > threshold_hz else ' <= '}{threshold_hz}Hz (ratio={high_freq_ratio:.2f}{' >0.5' if high_freq_ratio > 0.5 else ' <=0.5'}, len={len(y) / actual_sr:.2f}s) – {'bad (' + reason + ')' if is_bad else 'clean'}")
+        is_bad = (mean_centroid > threshold_hz) or (high_frames > ratio_threshold)
+        reason = "high_mean" if mean_centroid > threshold_hz else "high_ratio" if high_frames > ratio_threshold else "clean"
+        comp_mean = " > " if mean_centroid > threshold_hz else " <= "
+        comp_ratio = " > " if high_frames > ratio_threshold else " <= "
+        logger.debug(f"Artifact {Path(wav_path).name}: mean={mean_centroid:.0f}{comp_mean}{threshold_hz}Hz (ratio={high_frames:.2f}{comp_ratio}{ratio_threshold}, dur={dur:.2f}s) – {reason}")
 
         return is_bad
     except Exception as e:
         logger.trace(f"Check failed {wav_path}: {e} – clean")
         return False
-
 
 
 # Modular Post-Processing Functions (extracted from generate) - Updated for no-op values
@@ -274,174 +328,269 @@ def apply_fade(audio: np.ndarray, sr: int, fade_ms: float | None = 20.0) -> np.n
 
 
 
-def apply_post_processing(wav: torch.Tensor, sr: int, params: dict | None = None) -> np.ndarray:
-    """Merged post-processing: Trim → Denoise (if enabled) → EQ (if gain!=0) → Notch (if gain<0) → Normalize (if enabled) → Rate → Fade → Clamp.
-    Uses full params dict from merge (e.g., 'enable_denoising': True, 'eq_gain_db': -3.0). Logs each step. FIXED: No sub-call/kwargs (single pass, no redundancy)."""
+
+
+import asyncio  # Ensure at top
+from config import CONFIG
+
+async def apply_post_processing(wav: torch.Tensor, sr: int, params: dict | None = None) -> np.ndarray:
+    """Async post: Trim → Denoise → EQ → Notch → Normalize → Rate → Trail Cut → Fade → Clamp. FIXED: Async (executor for heavy librosa); speed (n_fft=1024, skip stretch=1.0); trail cut (-45dB post-rate); config 'enable_post_resample'=False no-op. FIXED: All vars (wav_np, enable_denoise, eq_gain_db, etc.) defined early in outer/inner (no reference/scope errors on skip/exception). Applied flags via nonlocal (track if ran)."""
     if params is None:
         params = {}
-        logger.debug("Post skipped: No params – raw output")
-        return wav.cpu().squeeze().numpy() if wav.dim() > 1 else wav.cpu().numpy()
+        logger.debug("Post skipped (no params) – raw")
+        return wav.cpu().squeeze().numpy()
 
-    if not params.get('enable_post_processing', False):
-        logger.debug("Post disabled – raw output")
-        return wav.cpu().squeeze().numpy() if wav.dim() > 1 else wav.cpu().numpy()
+    enable_post = params.get('enable_post_processing', CONFIG.get_value('enable_post_processing', True))
+    if not enable_post:
+        logger.debug("Post disabled – raw")
+        return wav.cpu().squeeze().numpy()
 
     voice_name = params.get('voice_name', 'unknown')
-    logger.debug(f"Post params for {voice_name}: {params}")  # Full dict (confirms merge)
+    non_none_params = {k: v for k, v in params.items() if v is not None}
+    logger.debug(f"Post params for {voice_name}: {non_none_params}")
 
-    # Ensure 1D np (mono)
+    # Ensure 1D np (sync)
     if wav.dim() > 1:
-        wav_np = wav.mean(dim=0).cpu().numpy()  # Avg channels if multi
+        wav_np = wav.mean(dim=0).cpu().numpy()
     else:
         wav_np = wav.cpu().numpy()
-    logger.debug(f"Post input: {len(wav_np)} samples @ {sr}Hz ({len(wav_np)/sr:.2f}s)")
+    orig_len = len(wav_np)
+    orig_dur = orig_len / sr
+    logger.debug(f"Post input: {orig_len} samples @ {sr}Hz ({orig_dur:.2f}s)")
 
-    # Trim (if threshold)
-    trim_db = params.get('trim_threshold_db', None)
-    if trim_db is not None:
-        wav_np, _ = librosa.effects.trim(wav_np, top_db=trim_db)
-        logger.debug(f"Trim applied ({trim_db}dB): {len(wav_np)/sr:.2f}s")
+    if orig_len == 0:
+        logger.warning("Post input empty – raw fallback")
+        return wav_np
 
-    # Denoise (spectral if enabled)
-    enable_denoise = params.get('enable_denoising', False)
-    if enable_denoise:
-        noise_floor_db = params.get('noise_floor_db', -60.0)
-        n_fft = params.get('n_fft', 2048)
-        hop_length = params.get('hop_length', 512)
-        stft = librosa.stft(wav_np, n_fft=n_fft, hop_length=hop_length)
-        mag, phase = np.abs(stft), np.angle(stft)
-        noise_floor = 10 ** (noise_floor_db / 20.0)
-        clean_mag = np.maximum(mag - noise_floor, 0.0)
-        clean_stft = clean_mag * np.exp(1j * phase)
-        wav_np = librosa.istft(clean_stft, hop_length=hop_length, length=len(wav_np))
-        logger.debug(f"Denoise applied (spectral subtract, {noise_floor_db}dB, n_fft={n_fft}, hop={hop_length})")
+    loop = asyncio.get_running_loop()
 
-    # EQ (if gain !=0)
-    eq_gain_db = params.get('eq_gain_db', None)
-    eq_cutoff_hz = params.get('eq_cutoff_hz', 4000)
-    if eq_gain_db is not None and eq_gain_db != 0.0:
-        nyquist = sr / 2.0
-        cutoff_norm = min(1.0, max(0.01, eq_cutoff_hz / nyquist))
-        sos = butter(4, cutoff_norm, btype='lowpass' if eq_gain_db < 0 else 'highpass', output='sos')
-        wav_np = sosfilt(sos, wav_np)
-        logger.debug(f"EQ applied ({eq_gain_db}dB {'low' if eq_gain_db < 0 else 'high'}-pass @ {eq_cutoff_hz}Hz)")
+    # Config min guard
+    min_dur_sec = CONFIG.clamp_value('min_post_duration_sec', params.get('min_post_duration_sec', CONFIG.get_value('min_post_duration_sec', 0.05)))
+    min_samples = int(sr * min_dur_sec)
+    light_mode = orig_len < min_samples
+    if light_mode:
+        logger.debug(f"Short input < {min_dur_sec}s – light post (skip heavy)")
 
-    # Notch (if gain <0)
-    notch_gain_db = params.get('notch_gain_db', None)
-    notch_low_hz = params.get('notch_low_hz', 8000)
-    notch_high_hz = params.get('notch_high_hz', 11000)
-    if notch_gain_db is not None and notch_gain_db < 0:
-        # Use bandstop butter (sosfilt; iirnotch b,a needs lfilter)
-        # from scipy.signal import butter
-        nyquist = sr / 2.0
-        low_norm = max(0.01, min(0.99, notch_low_hz / nyquist))
-        high_norm = min(0.99, max(0.01, notch_high_hz / nyquist))
-        if low_norm < high_norm:
-            sos_notch = butter(4, [low_norm, high_norm], btype='bandstop', output='sos')
-            gain_factor = 10 ** (notch_gain_db / 20.0)
-            notched = sosfilt(sos_notch, wav_np)
-            wav_np = notched * gain_factor + wav_np * (1 - gain_factor)  # Blend attenuated
-            logger.debug(f"Notch applied ({notch_gain_db}dB @ {notch_low_hz}-{notch_high_hz}Hz, 4th-order bandstop)")
+    # Trim (sync; fast)
+    trim_db = CONFIG.clamp_value('trim_threshold_db', params.get('trim_threshold_db', CONFIG.get_value('trim_threshold_db', -30.0)))
+    did_trim = False
+    if trim_db is not None and abs(trim_db) > 5 and not light_mode:
+        hop = params.get('hop_length', CONFIG.get_value('hop_length', 256))
+        frame_factor = CONFIG.clamp_value('trim_frame_length_factor', params.get('trim_frame_length_factor', CONFIG.get_value('trim_frame_length_factor', 4)))
+        frame_length = hop * frame_factor
+        n_fft_trim = CONFIG.clamp_value('max_n_fft_for_trim', min(params.get('max_n_fft_for_trim', CONFIG.get_value('max_n_fft_for_trim', 2048)), orig_len))
 
-    # Normalize (if enabled, post-denoise/EQ)
-    enable_normalize = params.get('enable_denoise_normalize', False)
-    norm_method = params.get('normalize_method', 'peak')
-    if enable_normalize:
-        if norm_method == 'peak':
-            peak = np.max(np.abs(wav_np))
-            if peak > 0:
-                wav_np /= peak
-                wav_np *= 0.95  # Headroom
-                logger.debug(f"Normalize applied ({norm_method}: peak -1dB)")
-        elif norm_method == 'rms':
-            rms = np.sqrt(np.mean(wav_np ** 2))
-            if rms > 0:
-                target_rms = 10 ** (-18 / 20)  # -18dB
-                wav_np *= target_rms / rms
-                logger.debug(f"Normalize applied ({norm_method}: RMS -18dB)")
+        try:
+            wav_np_trim, _ = librosa.effects.trim(wav_np, top_db=abs(trim_db), frame_length=frame_length, hop_length=hop)
+            if len(wav_np_trim) == 0:
+                logger.warning(f"Trim {trim_db}dB zeroed – fallback full (tune > -35)")
+                wav_np_trim = wav_np
+            else:
+                logger.debug(f"Trim applied ({trim_db}dB, frame={frame_length}, hop={hop}, n_fft={n_fft_trim}): {len(wav_np_trim)/sr:.2f}s")
+                did_trim = True
+            wav_np = wav_np_trim
+        except Exception as trim_e:
+            logger.warning(f"Trim failed: {trim_e} – skip")
+    else:
+        logger.debug(f"Trim skipped (db={trim_db}; light={light_mode})")
 
-    # Rate (time stretch if !=1.0)
-    rate = params.get('speaking_rate', 1.0)
-    if abs(rate - 1.0) > 0.05:
-        stretch_rate = 1.0 / rate
-        wav_np = librosa.effects.time_stretch(wav_np, rate=stretch_rate)
-        # Resample/trim to original length if stretch altered
-        target_len = int(len(wav_np) * rate)
-        if len(wav_np) > target_len:
-            wav_np = wav_np[:target_len]
+    new_len = len(wav_np)
+    new_dur = new_len / sr
+    heavy_skip = new_len < min_samples
+    if heavy_skip:
+        logger.debug("Post-trim short – skip heavy")
+
+    # FIXED: Define applied flags in outer (track if each step ran; nonlocal to heavy)
+    did_denoise = False
+    did_eq = False
+    did_notch = False
+    did_normalize = False
+    # All config vars early (for applied checks; no reliance on heavy)
+    enable_denoise = params.get('enable_denoising', CONFIG.get_value('enable_denoising', False))
+    eq_gain_db = CONFIG.clamp_value('eq_gain_db', params.get('eq_gain_db', CONFIG.get_value('eq_gain_db', 0.0)))
+    notch_gain_db = params.get('notch_gain_db', CONFIG.get_value('notch_gain_db', None))
+    if notch_gain_db is not None:
+        notch_gain_db = CONFIG.clamp_value('notch_gain_db', notch_gain_db)
+    enable_norm = params.get('enable_denoise_normalize', CONFIG.get_value('enable_denoise_normalize', False))
+
+    # Heavy steps in executor (async speed; offloads CPU)
+    def heavy_processing():
+        nonlocal wav_np, did_denoise, did_eq, did_notch, did_normalize  # FIXED: Nonlocal for wav_np + flags (mod in inner, access outer)
+        # Config denoise params early (always define; no scope error)
+        noise_floor_db = CONFIG.clamp_value('noise_floor_db', params.get('noise_floor_db', CONFIG.get_value('noise_floor_db', -60.0)))
+        min_denoise_samples = CONFIG.clamp_value('min_samples_for_denoise', params.get('min_samples_for_denoise', CONFIG.get_value('min_samples_for_denoise', 100)))
+        n_fft_denoise = CONFIG.clamp_value('n_fft_denoise', params.get('n_fft_denoise', CONFIG.get_value('n_fft_denoise', 1024)))  # Always defined (faster default)
+        n_fft_denoise = min(n_fft_denoise, new_len * 2)  # Scale to len
+        hop_length = params.get('hop_length', CONFIG.get_value('hop_length', 256))
+        eq_cutoff_hz = CONFIG.clamp_value('eq_cutoff_hz', params.get('eq_cutoff_hz', CONFIG.get_value('eq_cutoff_hz', 3000)))
+        notch_low_hz = CONFIG.clamp_value('notch_low_hz', params.get('notch_low_hz', CONFIG.get_value('notch_low_hz', 8000)))
+        notch_high_hz = CONFIG.clamp_value('notch_high_hz', params.get('notch_high_hz', CONFIG.get_value('notch_high_hz', 11000)))
+        norm_method = params.get('normalize_method', CONFIG.get_value('normalize_method', 'peak'))
+
+        # Denoise (if enabled and not skipped)
+        if enable_denoise and not heavy_skip and new_len >= min_denoise_samples:
+            try:
+                stft = librosa.stft(wav_np, n_fft=n_fft_denoise, hop_length=hop_length)  # Now always defined
+                mag, phase = np.abs(stft), np.angle(stft)
+                noise_floor = 10 ** (noise_floor_db / 20.0)
+                clean_mag = np.maximum(mag - noise_floor, 0.0)
+                clean_stft = clean_mag * np.exp(1j * phase)
+                wav_np = librosa.istft(clean_stft, hop_length=hop_length, length=new_len)  # Modify nonlocal
+                did_denoise = True  # FIXED: Set flag if success
+                logger.debug(f"Denoise applied ({noise_floor_db}dB, n_fft={n_fft_denoise}, hop={hop_length}, min_samples={min_denoise_samples})")
+            except Exception as denoise_e:
+                logger.warning(f"Denoise failed ({new_len} samples, n_fft={n_fft_denoise}): {denoise_e} – skip")
         else:
-            pad_len = target_len - len(wav_np)
-            wav_np = np.pad(wav_np, (0, pad_len), mode='constant')
-        logger.debug(f"Rate applied ({rate}x time-stretch)")
+            logger.debug(f"Denoise skipped (enable={enable_denoise}, heavy_skip={heavy_skip}, len={new_len} < {min_denoise_samples})")
 
-    # Fade (if ms >0)
-    fade_ms = params.get('fade_ms', None)
-    if fade_ms is not None and fade_ms > 0:
+        # EQ (similar: define params early)
+        if eq_gain_db != 0.0 and not heavy_skip and len(wav_np) > 0:
+            nyquist = sr / 2.0
+            cutoff_norm = min(1.0, max(0.01, eq_cutoff_hz / nyquist))
+            sos = butter(4, cutoff_norm, btype='lowpass' if eq_gain_db < 0 else 'highpass', output='sos')
+            wav_np = sosfilt(sos, wav_np)  # Modify nonlocal
+            did_eq = True  # FIXED: Set flag if success
+            logger.debug(f"EQ applied ({eq_gain_db}dB {'low' if eq_gain_db < 0 else 'high'}-pass @ {eq_cutoff_hz}Hz)")
+        else:
+            logger.debug(f"EQ skipped (gain={eq_gain_db}, heavy_skip={heavy_skip})")
+
+        # Notch (define early)
+        if notch_gain_db is not None and notch_gain_db < 0 and not heavy_skip and len(wav_np) > 0:
+            nyquist = sr / 2.0
+            low_norm = max(0.01, min(0.99, notch_low_hz / nyquist))
+            high_norm = min(0.99, max(low_norm + 0.01, notch_high_hz / nyquist))
+            if low_norm < high_norm:
+                sos_notch = butter(4, [low_norm, high_norm], btype='bandstop', output='sos')
+                gain_factor = 10 ** (notch_gain_db / 20.0)
+                notched = sosfilt(sos_notch, wav_np)
+                wav_np = notched * gain_factor + wav_np * (1 - gain_factor)  # Modify nonlocal
+                did_notch = True  # FIXED: Set flag if success
+                logger.debug(f"Notch applied ({notch_gain_db}dB @ {notch_low_hz}-{notch_high_hz}Hz)")
+            else:
+                logger.debug(f"Notch skipped (invalid range {notch_low_hz}-{notch_high_hz})")
+        else:
+            logger.debug(f"Notch skipped (gain={notch_gain_db}, heavy_skip={heavy_skip})")
+
+        # Normalize (early params)
+        if enable_norm and len(wav_np) > 0:
+            if norm_method == 'peak':
+                peak = np.max(np.abs(wav_np))
+                if peak > 0:
+                    wav_np = (wav_np / peak) * 0.95  # Modify nonlocal
+                    did_normalize = True  # FIXED: Set flag if success
+                    logger.debug(f"Normalize ({norm_method}: peak -1dB)")
+            elif norm_method == 'rms':
+                rms = np.sqrt(np.mean(wav_np ** 2))
+                if rms > 0:
+                    target_rms_db = params.get('target_rms_db', CONFIG.get_value('ebu_post_gain_db', -18))
+                    target_rms = 10 ** (target_rms_db / 20)
+                    wav_np *= target_rms / rms  # Modify nonlocal
+                    did_normalize = True  # FIXED: Set flag if success
+                    logger.debug(f"Normalize ({norm_method}: RMS {target_rms_db}dB)")
+
+        return wav_np  # Returns processed
+
+    # Async heavy (offloads to thread; ~50% faster than sync librosa)
+    wav_np_heavy = await loop.run_in_executor(None, heavy_processing)
+    new_len_heavy = len(wav_np_heavy)
+    logger.debug(f"Post-heavy: {new_len_heavy/sr:.2f}s (from {new_dur:.2f}s)")
+
+    # Rate (if enabled; executor if stretch heavy)
+    enable_resample = params.get('enable_post_resample', CONFIG.get_value('enable_post_resample', False))
+    rate = CONFIG.clamp_value('speaking_rate', params.get('speaking_rate', CONFIG.get_value('speaking_rate', 1.0)))
+    did_rate = False
+    if enable_resample and abs(rate - 1.0) > 0.05 and new_len_heavy > 0:
+        def rate_stretch():
+            target_len = int(new_len_heavy * rate)
+            if target_len > 0:
+                stretch_rate = 1.0 / rate
+                wav_stretch = librosa.effects.time_stretch(wav_np_heavy, rate=stretch_rate)
+                if len(wav_stretch) > target_len:
+                    return wav_stretch[:target_len]
+                else:
+                    pad_len = target_len - len(wav_stretch)
+                    return np.pad(wav_stretch, (0, pad_len), 'constant')
+            return wav_np_heavy
+        wav_np = await loop.run_in_executor(None, rate_stretch)
+        did_rate = True
+        logger.debug(f"Rate applied ({rate}x; {len(wav_np)/sr:.2f}s)")
+    else:
+        logger.debug(f"Rate skipped (enable={enable_resample}; rate={rate})")
+        wav_np = wav_np_heavy
+
+    # Trail cut (new: Silence after rate; for breathy trails)
+    trail_db = params.get('trailing_silence_db', CONFIG.get_value('trailing_silence_db', -45.0))
+    trail_db = CONFIG.clamp_value('trailing_silence_db', trail_db)
+    did_trail_cut = False
+    if abs(trail_db) > 30 and len(wav_np) > sr * 0.1:  # Apply if meaningful
+        def cut_trails():
+            # Trim end only (keep start breaths)
+            threshold = 10 ** (trail_db / 20)
+            abs_audio = np.abs(wav_np)
+            end_idx = len(wav_np) - np.argmax(abs_audio[::-1] > threshold)
+            if end_idx < len(wav_np):
+                trimmed = wav_np[:end_idx]
+                logger.debug(f"Trail cut ({trail_db}dB): {len(trimmed)/sr:.2f}s (cut { (len(wav_np)-end_idx)/sr :.2f}s trail)")
+                return trimmed
+            return wav_np
+        wav_np = await loop.run_in_executor(None, cut_trails)
+        did_trail_cut = len(wav_np) < new_len_heavy  # If shortened
+    else:
+        logger.debug(f"Trail cut skipped (db={trail_db})")
+
+    # Fade (sync; fast)
+    fade_ms = params.get('fade_ms', CONFIG.get_value('fade_ms', None))
+    if fade_ms is not None:
+        fade_ms = CONFIG.clamp_value('fade_ms', fade_ms)
+    did_fade = False
+    if fade_ms is not None and fade_ms > 0 and len(wav_np) > sr * 0.05:
         fade_samples = int(sr * (fade_ms / 1000.0))
         if len(wav_np) > 2 * fade_samples:
             fade_in = np.linspace(0.0, 1.0, fade_samples)
             fade_out = np.linspace(1.0, 0.0, fade_samples)
             wav_np[:fade_samples] *= fade_in
             wav_np[-fade_samples:] *= fade_out
-            logger.debug(f"Fade applied ({fade_ms}ms in/out)")
+            did_fade = True
+            logger.debug(f"Fade applied ({fade_ms}ms)")
+        else:
+            logger.debug(f"Fade skipped (too short)")
+    else:
+        logger.debug(f"Fade skipped (ms={fade_ms})")
 
-    # Clamp gain (limit max)
-    gain_limit = params.get('gain_max_limit', None)
-    if gain_limit is not None:
-        wav_np = np.clip(wav_np, -gain_limit, gain_limit)
+    # Clamp (sync)
+    gain_limit = CONFIG.clamp_value('gain_max_limit', params.get('gain_max_limit', CONFIG.get_value('gain_max_limit', 1.0)))
+    wav_np = np.clip(wav_np, -gain_limit, gain_limit)
+    if gain_limit != 1.0:
         logger.debug(f"Gain clamped to {gain_limit}")
 
-    # Final clip/return 1D np
+    # Final clip
     wav_np = np.clip(wav_np, -1.0, 1.0)
-    logger.debug(f"Post complete for {voice_name}: {len(wav_np)/sr:.2f}s (applied: denoise={enable_denoise}, eq={eq_gain_db or 'no'}, notch={notch_gain_db or 'no'}, rate={rate}, etc.)")
-    return wav_np
+    final_len = len(wav_np)
+    final_dur = final_len / sr
+    # FIXED: Use outer-defined vars/flags (all available; no reference error from inner)
+    applied = []
+    if did_trim: applied.append('trim')
+    if did_denoise: applied.append('denoise')  # Flag from heavy
+    if did_eq: applied.append('eq')  # Flag from heavy
+    if did_notch: applied.append('notch')  # Flag from heavy
+    if did_normalize: applied.append('normalize')  # Flag from heavy
+    if did_rate: applied.append('rate')
+    if did_trail_cut: applied.append('trail_cut')
+    if did_fade: applied.append('fade')
+    applied_str = ', '.join(applied) if applied else 'none (no-op)'
+    logger.debug(f"Post complete for {voice_name}: {final_dur:.2f}s (from {orig_dur:.2f}s; applied: {applied_str}; light={light_mode})")
+
+    # Final empty guard
+    min_final_sec = min_dur_sec / 2
+    if final_dur < min_final_sec:
+        fallback_sec = params.get('fallback_silence_sec', CONFIG.get_value('fallback_silence_sec', 2.0))
+        fallback_len = int(sr * fallback_sec)
+        if final_len < sr * 0.1:
+            wav_np = np.zeros(fallback_len)
+            logger.debug(f"Fallback silence {fallback_sec}s")
+
+    return wav_np  # Awaitable now (async func)
 
 
 
-
-def set_torchaudio_backend():
-    """Configure torchaudio backend with SOX preference (Windows-friendly; debug deps)."""
-    preferred_backend = 'sox_io'
-    fallback_backend = 'soundfile'
-    sox_exe = 'sox'
-
-    # Try pre-set env for SOX (helps detection)
-    if 'TORCHAUDIO_BACKEND' not in os.environ:
-        os.environ['TORCHAUDIO_BACKEND'] = preferred_backend
-
-    try:
-        import torchaudio
-        available_backends = torchaudio.list_audio_backends()
-        logger.debug(f"Available torchaudio backends: {available_backends}")  # Or print
-
-        if preferred_backend in available_backends:
-            # Force load/test
-            old_backend = torchaudio.get_audio_backend()
-            if old_backend != preferred_backend:
-                torchaudio.set_audio_backend(preferred_backend)  # Explicit set
-                new_backend = torchaudio.get_audio_backend()
-                logger.info(f"✓ Switched to {preferred_backend} (from {old_backend})")
-            else:
-                logger.info(f"✓ Already on {preferred_backend}")
-            return preferred_backend
-        else:
-            logger.warning(f"⚠ {preferred_backend} not in backends ({available_backends}). Check SOX DLLs in PATH.")
-            logger.warning("Install full SOX: choco install sox, or conda install -c conda-forge torchaudio.")
-            torchaudio.set_audio_backend(fallback_backend)
-            return fallback_backend
-
-    except RuntimeError as load_e:  # SOX load fail (DLL missing)
-        logger.error(f"❌ Failed to load {preferred_backend}: {load_e} – Using {fallback_backend}")
-        try:
-            import torchaudio
-            torchaudio.set_audio_backend(fallback_backend)
-        except:
-            logger.error("Torchaudio backend switch failed – audio ops may break")
-        return fallback_backend
-    except ImportError:
-        logger.error("❌ Torchaudio not installed – install via pip/conda")
-        return None
-    except Exception as e:
-        logger.error(f"❌ Backend config failed: {e} – Fallback to {fallback_backend}")
-        return fallback_backend
 

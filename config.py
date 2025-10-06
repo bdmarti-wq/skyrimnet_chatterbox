@@ -40,26 +40,26 @@ class SkyrimNetConfig:
         'cfg_weight': 0.0,
         'exaggeration': 0.7,
 
-        # Audio Defaults (enhanced: No-ops explicit; match func checks)
-        'speaking_rate': 1.0,  # No-op
-        'eq_gain_db': 0.0,     # No-op (0=pass)
-        'eq_cutoff_hz': 3000,  # Default if eq_gain !=0
-        'notch_gain_db': None, # No-op (None=skip)
-        'notch_low_hz': 8000,  # Added (your 'notch_low' → rename)
-        'notch_high_hz': 11000, # Added
-        'gain_target_max': None, # No-op (None=skip; e.g., 0.707 if apply)
-        'gain_max_limit': 1.0, # No-op (1.0=pass)
-        'trim_threshold_db': -30.0,  # Default if denoise
-        'fade_ms': 20,         # Default if >0
-        'enable_denoise_normalize': False, # Gate denoise/trim/norm
-        'noise_floor_db': -60.0, # Default if enable_denoise
-        'normalize_method': 'peak', # Default if enable_denoise
+        # Audio No-Ops: Skip/Identity (most voices pass-through; override per-voice)
+        'speaking_rate': 1.0,  # Identity
+        'eq_gain_db': 0.0,  # Skip EQ
+        'eq_cutoff_hz': 3000,  # Default (skipped)
+        'notch_gain_db': None,  # Skip notch (None in apply_notch)
+        'notch_low_hz': 8000,
+        'notch_high_hz': 11000,
+        'gain_target_max': None,  # Skip normalize target
+        'gain_max_limit': 1.0,  # Identity clamp
+        'trim_threshold_db': None,  # Skip trim (None in trim_silence)
+        'fade_ms': None,  # Skip fade
+        'enable_denoise_normalize': False,  # Skip normalize
+        'noise_floor_db': -60.0,  # Default (skipped)
+        'normalize_method': 'peak',  # Default (skipped)
+        'n_fft': 2048,
+        'hop_length': 256,
 
         'max_gain': 2.0,
         'target_max': 0.6,
-        'n_fft': 2048,  # New: For mel/STFT (alt)
         'n_mels': 80,
-        'hop_length': 256,  # New: For mel/step (alt)
         'ebu_post_gain_db': 0,
         'ebu_true_peak': 0,
 
@@ -69,11 +69,12 @@ class SkyrimNetConfig:
         'dtype': 'bfloat16',
 
         # Booleans (adjustable flags; new from alt)
-        'enable_pre_adjustment': False,  # New: Opt-in pad/mel align (alt; default False for non-breaking)
+        'enable_pre_adjustment': True,  # New: Opt-in pad/mel align (alt; default False for non-breaking)
         'enable_post_processing': True,  # New (gate for post; set False for slowly)
         'enable_denoising': False,  # New
         'enable_smoothing': False,  # New
         'enable_quantization': True,  # New
+        'enable_resample': False,
         'enable_spectral_gating': True,  # New
         'notch_enabled': False,  # New
         'hp_enabled': False,  # New
@@ -83,7 +84,7 @@ class SkyrimNetConfig:
         'auto_update_refs': True,  # New: Alt flag
         'timings_enabled': False,  # New
         'auto_reset_timings': False,  # New
-        'enable_post_resample': True,  # New: Alt (review)
+        'enable_post_resample': False,  # New: Alt (review)
         'enable_post_jit_gain': True,  # New: Alt (review)
         'enable_post_voice_processing': True,  # New: Alt (review)
         'enable_deferred_cleanup': True,  # New
@@ -98,6 +99,10 @@ class SkyrimNetConfig:
         'fuzzy_enable': True,       # Toggle fuzzy audio cache
         'compress_pt_saves': True,  # Toggle gzip compression on .pt files
         'compress_level': 6,        # Gzip compression level (1=fast, 9=max small)
+        'n_fft_denoise': 1024,               # Faster STFT (half 2048)
+        'fade_ms_trail': 50,                 # Longer for breath trails (use if fade_ms=None)
+        'trailing_silence_db': -45.0,        # Cut post-rate trails below this (new step)
+        'fuzzy_artifact_threshold_hz': 7000.0,  # For is_artifact_laden
     }
 
     # CAPS: Hard constants/immutable limits for clamping (numerics only; from alt; used in get_value)
@@ -116,23 +121,33 @@ class SkyrimNetConfig:
         'CFG_WEIGHT_MIN': 0.0, 'CFG_WEIGHT_MAX': 1.0,
         'EXAGGERATION_MIN': 0.0, 'EXAGGERATION_MAX': 2.0,
 
-        # Audio Caps (added/renamed for post)
+        # Audio Caps (existing + new guards)
         'SPEAKING_RATE_MIN': 0.5, 'SPEAKING_RATE_MAX': 2.0,
         'EQ_GAIN_DB_MIN': -12, 'EQ_GAIN_DB_MAX': 6,
         'EQ_CUTOFF_HZ_MIN': 2000, 'EQ_CUTOFF_HZ_MAX': 5000,
         'NOTCH_GAIN_DB_MIN': -24, 'NOTCH_GAIN_DB_MAX': 0,
-        'NOTCH_LOW_HZ_MIN': 4000, 'NOTCH_LOW_HZ_MAX': 10000,  # Renamed from notch_low
-        'NOTCH_HIGH_HZ_MIN': 8000, 'NOTCH_HIGH_HZ_MAX': 16000,  # Renamed
+        'NOTCH_LOW_HZ_MIN': 4000, 'NOTCH_LOW_HZ_MAX': 10000,
+        'NOTCH_HIGH_HZ_MIN': 8000, 'NOTCH_HIGH_HZ_MAX': 16000,
         'GAIN_TARGET_MAX_MIN': 0.1, 'GAIN_TARGET_MAX_MAX': 1.0,
         'GAIN_MAX_LIMIT_MIN': 0.5, 'GAIN_MAX_LIMIT_MAX': 3.0,
-        'TRIM_THRESHOLD_DB_MIN': -50, 'TRIM_THRESHOLD_DB_MAX': -10,
-        'FADE_MS_MIN': 10, 'FADE_MS_MAX': 50,
-        'NOISE_FLOOR_DB_MIN': -60, 'NOISE_FLOOR_DB_MAX': -10,
+        'TRIM_THRESHOLD_DB_MIN': -60, 'TRIM_THRESHOLD_DB_MAX': -20,  # Wider for mild/no-op (-30 center)
+        'FADE_MS_MIN': 0, 'FADE_MS_MAX': 100,  # 0=no-op
+        'NOISE_FLOOR_DB_MIN': -80, 'NOISE_FLOOR_DB_MAX': -20,  # -60 center (mild)
+        'MIN_POST_DURATION_SEC': 0.01, 'MAX_POST_DURATION_SEC': 10.0,  # Guards (0.05 default)
+        'TRIM_FRAME_LENGTH_FACTOR_MIN': 2, 'TRIM_FRAME_LENGTH_FACTOR_MAX': 8,  # 4 default
+        'MAX_N_FFT_FOR_TRIM_MIN': 512, 'MAX_N_FFT_FOR_TRIM_MAX': 4096,  # Cap for shorts
+        'MIN_SAMPLES_FOR_DENOISE_MIN': 50, 'MIN_SAMPLES_FOR_DENOISE_MAX': 1000,  # 100 default
+
+        'N_FFT_DENOISE_MIN': 512, 'N_FFT_DENOISE_MAX': 2048,
+        'FADE_MS_TRAIL_MIN': 20, 'FADE_MS_TRAIL_MAX': 200,
+        'TRAILING_SILENCE_DB_MIN': -60, 'TRAILING_SILENCE_DB_MAX': -30,
+        'FUZZY_ARTIFACT_THRESHOLD_HZ_MIN': 5000, 'FUZZY_ARTIFACT_THRESHOLD_HZ_MAX': 10000,
 
         # Cache Caps (new from alt)
         'COND_CACHE_MAX_ENTRIES_MIN': 10, 'COND_CACHE_MAX_ENTRIES_MAX': 100,
         'FUZZY_CACHE_LIMIT_MIN': 100, 'FUZZY_CACHE_LIMIT_MAX': 5000,
         'FUZZY_THRESHOLD_MIN': 0.50, 'FUZZY_THRESHOLD_MAX': 0.95,
+
     }
 
     _instance = None

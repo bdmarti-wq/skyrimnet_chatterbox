@@ -146,8 +146,6 @@ def save_and_cache_output(wav: torch.Tensor, model, audio_prompt_path: Optional[
 
 
 
-# ... (imports/prior code unchanged)
-
 async def generate_audio(model, text: str, audio_prompt_path: Optional[str], exaggeration: float = 0.5,
                          cache_uuid: int = 0,
                          temperature: float = 0.8, cfgw: float = 0, min_p: float = 0.05, top_p: float = 1.0,
@@ -274,69 +272,65 @@ async def generate_audio(model, text: str, audio_prompt_path: Optional[str], exa
     logger.debug(f"Post input shape: {wav_tensor.shape} (stem={stem})")
 
     try:
-        wav_np = await apply_post_processing(wav_tensor, CONFIG.sr, merged_params)
-        # NEW: Ensure/convert post return to np (if torch, .numpy(); log type/shape)
-        if isinstance(wav_np, torch.Tensor):
-            logger.debug(f"Post returned torch.Tensor {wav_np.shape} – converting to np")
-            wav_np = wav_np.detach().cpu().numpy()
-        elif not isinstance(wav_np, np.ndarray):
-            logger.warning(f"Post returned unexpected type {type(wav_np)} – forcing np fallback")
-            wav_np = wav_tensor.squeeze(0).cpu().numpy()  # Raw 1D np
+        # FIXED: Await async post; handle np/torch return
+        post_result = await apply_post_processing(wav_tensor, CONFIG.sr, merged_params)
+        if isinstance(post_result, torch.Tensor):
+            logger.debug(f"Post returned tensor {post_result.shape} – to np")
+            wav_np = post_result.detach().cpu().numpy().squeeze() if post_result.dim() > 1 else post_result.cpu().numpy()
+        elif isinstance(post_result, np.ndarray):
+            wav_np = post_result
+        else:
+            raise ValueError(f"Post returned invalid type {type(post_result)}")
+        logger.debug(f"Post np: {wav_np.shape} (dtype={wav_np.dtype})")
     except Exception as post_e:
-        logger.error(f"Post-processing failed for {stem}: {post_e} – passthru raw")
-        wav_np = wav_tensor.squeeze(0).cpu().numpy()  # Raw 1D np fallback
+        logger.error(f"Post failed for {stem}: {post_e} – raw passthru")
+        wav_np = wav_tensor.squeeze(0).cpu().numpy()  # Raw 1D fallback
 
-    # FIXED: Ensure 1D output np from post (squeeze/mean if needed)
+    # Ensure 1D np
     if len(wav_np.shape) > 1:
         if wav_np.shape[0] == 1:
-            wav_np = wav_np.squeeze(0)  # [samples]
+            wav_np = wav_np.squeeze(0)
         else:
-            wav_np = np.mean(wav_np, axis=1 if wav_np.shape[1] > 1 else 0)  # Avg stereo → mono 1D
-    logger.debug(f"Post output shape: {wav_np.shape} (len={len(wav_np)}, type={type(wav_np).__name__})")
+            wav_np = np.mean(wav_np, axis=1 if wav_np.shape[1] > 1 else 0)  # Stereo to mono
+    logger.debug(f"Final wav_np: {wav_np.shape} (len={len(wav_np)})")
 
-    # Fallback if post empty
-    if wav_np is None or len(wav_np) == 0:
-        logger.warning(f"Post returned empty for {stem} – fallback silence")
+    # Fallback empty
+    if len(wav_np) == 0:
+        logger.warning(f"Post empty for {stem} – silence fallback")
         wav_np = np.zeros(CONFIG.sr * 2)
 
-    # Convert back to tensor (match shape; for save/log)
-    processed_wav = torch.from_numpy(wav_np).unsqueeze(0).to(DEVICE, DTYPE)  # 2D for consistency
+    # To tensor (2D for save)
+    processed_wav = torch.from_numpy(wav_np).unsqueeze(0).to(DEVICE, DTYPE)
     post_time_ms = (perf_counter_ns() - post_start) / 1_000_000
-    logger.info(
-        f"Post applied for {stem}: {post_time_ms:.2f}ms (enable={merged_params['enable_post_processing']}, rate={merged_params.get('speaking_rate', 1.0)}, notch={merged_params.get('notch_gain_db', 'N/A')}dB)")
+    logger.info(f"Post for {stem}: {post_time_ms:.2f}ms (rate={merged_params.get('speaking_rate', 1.0)}, notch={merged_params.get('notch_gain_db', 'N/A')}dB)")
 
     func_end_time = perf_counter_ns()
     total_duration_s = (func_end_time - func_start_time) / 1_000_000_000
-    wav_length = len(wav_np) / CONFIG.sr  # FIXED: Use post np length
-    logger.info(
-        f"Processed audio: {wav_length:.2f}s {CONFIG.sr / 1000:.2f}kHz in {total_duration_s:.2f}s. Speed: {wav_length / total_duration_s:.2f}x (gen: {gen_time_s:.2f}s, post: {post_time_ms / 1000:.3f}s, seed: {seed_num})")
+    wav_length = len(wav_np) / CONFIG.sr
+    logger.info(f"Processed: {wav_length:.2f}s {CONFIG.sr/1000:.0f}kHz in {total_duration_s:.2f}s (speed: {wav_length/total_duration_s:.2f}x; gen: {gen_time_s:.2f}s, post: {post_time_ms/1000:.3f}s)")
 
-    # FIXED: Save/cache with processed_wav [1, samples] (2D mono for torchaudio/soundfile compat; no squeeze)
+    # Save/cache (2D float32 CPU)
     save_start = perf_counter_ns()
-    # FIXED: Convert to float32 CPU (bfloat16 not supported; ~2ms) – KEEP 2D [1, samples]
-    save_wav = processed_wav.to(torch.float32).cpu()  # 2D float32 CPU; safe for save (mono channel=1)
-    wave_file = save_and_cache_output(
-        save_wav, model, valid_path or audio_prompt_path, cache_uuid, text, exaggeration, params,
-        enable_memory_cache, enable_disk_cache  # 2D float32 CPU tensor
-    )
+    save_wav = processed_wav.to(torch.float32).cpu()  # 2D mono
+    wave_file = save_and_cache_output(save_wav, model, valid_path or audio_prompt_path, cache_uuid, text, exaggeration, params, enable_memory_cache, enable_disk_cache)
     save_time_ms = (perf_counter_ns() - save_start) / 1_000_000
     logger.debug(f"Save/cache (processed): {save_time_ms:.2f}ms → {wave_file}")
 
-    # FIXED: Enqueue fuzzy on MISS only (reuse_result is tuple/None)
+    # Enqueue fuzzy (MISS only)
     if reuse_result is None and (valid_path or audio_prompt_path):
         voice_stem = Path(valid_path or audio_prompt_path).stem.replace('_fixed', '').split('_')[0]
-        logger.debug(f"Enqueued for fuzzy index (MISS): \"{text[:20]}\" (norm stem={voice_stem})")
+        logger.debug(f"Enqueued fuzzy MISS: \"{text[:20]}\" (stem={voice_stem})")
         FUZZY_QUEUE.put((text, wave_file, voice_stem))
 
     # Stats
     stats = get_cache_stats()
-    logger.info(
-        f"Cache stats post-gen: {stats['memory_cache_size']} mem, {stats['disk_files']} disk, {stats['audio_cache_size']} audio, fuzzy: {stats.get('fuzzy_size', 'N/A')}")
+    logger.info(f"Cache post-gen: mem={stats['memory_cache_size']}, disk={stats['disk_files']}, audio={stats['audio_cache_size']}, fuzzy={stats.get('fuzzy_size', 'N/A')}")
 
-    # Cleanup (post-save)
-    del wav  # Raw only (processed safe)
+    # Cleanup
+    del wav
     torch.cuda.empty_cache()
     total_time_ms = (perf_counter_ns() - func_start_time) / 1_000_000
-    logger.info(
-        f"Full MISS cycle: {total_time_ms / 1000:.2f}s (reuse: {reuse_time_ms:.0f}ms, prep: {prep_time_ms:.0f}ms, gen: {gen_time_s:.2f}s, post: {post_time_ms:.0f}ms, save: {save_time_ms:.0f}ms, seed: {seed_num})")
-    return wave_file  # Always str path (Gradio safe)
+    logger.info(f"MISS cycle: {total_time_ms/1000:.2f}s (reuse={reuse_time_ms:.0f}ms, prep={prep_time_ms:.0f}ms, gen={gen_time_s:.2f}s, post={post_time_ms:.0f}ms, save={save_time_ms:.0f}ms)")
+
+    return wave_file  # Str path
+
