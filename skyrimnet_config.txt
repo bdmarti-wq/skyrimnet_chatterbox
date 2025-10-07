@@ -12,12 +12,12 @@
 # Lower = more predictable, Higher = more varied/expressive
 # Range: 0.00 to 2.00, Recommended: 0.8
 # Note: This uses the "linear" slider in SkyrimNet UI when set to "api"
-temperature = default
+temperature = 0.7
 
 # MIN_P: Modern way to control speech quality (newer method)  
 # Lower = safer/stable speech, Higher = more creative but risky
 # Range: 0.00 to 1.00, Recommended: 0.07, Set to 0.00 to disable
-min_p = default
+min_p = 0.07
 
 # TOP_P: Classic way to control speech variety (older method)
 # Lower = more focused, Higher = more varied, 1.00 = disabled (recommended)
@@ -72,6 +72,7 @@ MAX_MEMORY_ENTRIES=100
 COND_CACHE_MAX_ENTRIES=200
 COMPRESS_PT_SAVES=True
 
+fuzzy_enable = false
 fuzzy_min_length = 3
-fuzzy_boost_words = mmm,ooh,throbb,moan,gasp,cock,pussy,cunt,twat,tits,aah,yes,please,more,cunt,gods
+fuzzy_boost_words = mmm,ooh,moan,gasp,cock,pussy,cunt,twat,tits,aah,yes,please,more,gods
 fuzzy_artifact_threshold_hz = 6000

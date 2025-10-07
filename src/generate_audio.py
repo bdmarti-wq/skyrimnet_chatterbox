@@ -74,7 +74,7 @@ def _generate_audio_core(model, generate_args: Dict[str, Any], t3_params: Dict[s
         return wav
 
 
-def try_reuse_audio(text: str, audio_prompt_path: Optional[str], exaggeration: float, params: Dict[str, Any]) -> \
+def try_reuse_audio(text: str, audio_prompt_path: Optional[str], exaggeration: float, params: Dict[str, Any], try_fuzzy=True) -> \
 Optional[Tuple[str, str]]:
     """Try exact then fuzzy; return (path, hit_type) or None. Handles None path.
     Fixed: Pass audio_prompt_path as audio_path for stem extraction; text as text_input; explicit stem kwarg."""
@@ -85,8 +85,10 @@ Optional[Tuple[str, str]]:
     if exact_path:
         return exact_path, "Full audio"
     # Fuzzy: Extract stem explicitly (normalize, remove '_fixed' etc.)
-    voice_stem = Path(audio_prompt_path).stem.replace('_fixed', '').split('_')[0]  # e.g., 'dlc1seranavoice' (robust)
-    fuzzy_path = try_fuzzy_audio_cache(audio_prompt_path, text,
+    fuzzy_path = None
+    if try_fuzzy:
+        voice_stem = Path(audio_prompt_path).stem.replace('_fixed', '').split('_')[0]  # e.g., 'dlc1seranavoice' (robust)
+        fuzzy_path = try_fuzzy_audio_cache(audio_prompt_path, text,
                                        stem=voice_stem)  # Correct: audio_path=voice path (for fallback extract), text_input=text, stem=voice_stem
     if fuzzy_path:
         return fuzzy_path, "Fuzzy audio"
@@ -218,7 +220,8 @@ async def generate_audio(model, text: str, audio_prompt_path: Optional[str], exa
 
     reuse_start = perf_counter_ns()  # Time reuse check
     # Reuse check (updated helper)
-    reuse_result = try_reuse_audio(text, audio_prompt_path, exaggeration, params) if audio_prompt_path else None
+    try_fuzzy = CONFIG.get_value('fuzzy_enable', False)
+    reuse_result = try_reuse_audio(text, audio_prompt_path, exaggeration, params, try_fuzzy) if audio_prompt_path else None
     reuse_time_ms = (perf_counter_ns() - reuse_start) / 1_000_000
     if reuse_result:
         audio_reuse_path, hit_type = reuse_result

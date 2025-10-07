@@ -33,7 +33,7 @@ class SkyrimNetConfig:
         'stride_length': 8,
 
         # TTS Params (adjustable)
-        'temperature': 0.8,
+        'temperature': 0.7,
         'min_p': 0.07,
         'top_p': 1.0,
         'repetition_penalty': 2.0,
@@ -106,7 +106,7 @@ class SkyrimNetConfig:
         'fuzzy_threshold': 0.70,    # level of string match required to use audio cache
         'memory_cache_enable': True, # Toggle memory cache (instead of env)
         'disk_cache_enable': True,  # Toggle disk cache
-        'fuzzy_enable': True,       # Toggle fuzzy audio cache
+        'fuzzy_enable': False,       # Toggle fuzzy audio cache TODO fix load?
         'compress_pt_saves': True,  # Toggle gzip compression on .pt files
         'compress_level': 6,        # Gzip compression level (1=fast, 9=max small)
         'n_fft_denoise': 1024,               # Faster STFT (half 2048)

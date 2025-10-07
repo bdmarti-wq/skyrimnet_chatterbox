@@ -16,6 +16,7 @@ from pathlib import Path
 from loguru import logger
 
 from config import CONFIG
+from .audio_utils import is_artifact_laden
 from .cache import ROOT_DIR, CACHE_AUDIO_DIR  # Import shared paths only
 
 # Globals
@@ -29,41 +30,6 @@ MAX_INDEX_SIZE = CONFIG.get_value('fuzzy_index_size', default=1000)  # For fuzzy
 ENABLE_FUZZY = CONFIG.get_value('fuzzy_enable', default=True)  # New: Toggle fuzzy
 ENABLE_ARTIFACT_PURGE = CONFIG.get_value('fuzzy_artifact_purge_enable', default=True)  # NEW: Config toggle for purging
 
-
-def is_artifact_laden(wav_path: str, threshold_hz: float = 8000.0, sr: int = 24000) -> bool:
-    """
-    Detect artifacts via spectral centroid (high = chirpy highs > threshold_hz avg).
-    Quick: Loads WAV, computes librosa.feature.spectral_centroid (mean < threshold = clean).
-    Returns True if likely bad (high centroid, e.g., chirps/noise).
-    """
-    try:
-        # Fast load (torchaudio; mono squeeze)
-        y, actual_sr = torchaudio.load(wav_path)
-        y = y.mean(dim=0).numpy()  # Mono np; ~1-10ms
-        if len(y) < 1024:  # Too short: Skip or assume clean (e.g., <50ms noise ok)
-            return False
-
-        # Spectral centroid (freq center of mass; high = artifacts/chirps)
-        # Params: n_fft=2048/hop=512 for ~10-50ms compute (shorts fast)
-        centroid = librosa.feature.spectral_centroid(
-            y=y, sr=actual_sr, n_fft=2048, hop_length=512
-        )[0]  # [frames] Hz
-
-        mean_centroid = np.mean(centroid)
-        high_freq_ratio = np.mean(centroid > threshold_hz / 2)  # Energy > half thresh?
-
-        is_bad = mean_centroid > threshold_hz or high_freq_ratio > 0.2  # 20% frames high
-
-        if is_bad:
-            logger.debug(
-                f"Artifact detected in {wav_path}: mean_centroid={mean_centroid:.0f}Hz > {threshold_hz}Hz (ratio={high_freq_ratio:.2f})")
-        else:
-            logger.trace(f"Clean check: {wav_path} centroid={mean_centroid:.0f}Hz")
-
-        return is_bad
-    except Exception as e:
-        logger.trace(f"Artifact check failed for {wav_path}: {e} – assuming clean")
-        return False  # Fail-safe: Don't purge on errors
 
 
 def normalize_text(text: str) -> str:
