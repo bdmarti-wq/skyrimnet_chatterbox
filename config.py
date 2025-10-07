@@ -10,6 +10,8 @@ import os
 import torch
 from typing import Dict, Any, Tuple, List, Union, Optional
 
+
+
 # Core globals (preserved for backward compat; set from class in load_skyrimnet_config)
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DTYPE = torch.bfloat16 if DEVICE == "cuda" else torch.float32
@@ -24,6 +26,7 @@ _USE_API_MODE = False  # Testing flag
 
 # SkyrimNetConfig Class (singleton; modular load/save for sharability)
 class SkyrimNetConfig:
+    # DEFAULTS: Adjustable defaults (numerics/strings/booleans from config.txt; override via parser)
     # DEFAULTS: Adjustable defaults (numerics/strings/booleans from config.txt; override via parser)
     DEFAULTS = {
         # Generation Tokens (adjustable)
@@ -73,6 +76,8 @@ class SkyrimNetConfig:
         'dtype': 'bfloat16',
 
         # Booleans (adjustable flags; new from alt)
+        'multilingual': False,  # For model loading (syncs to self.multilingual)
+        'use_api_mode': False,  # Internal flag (replaces _USE_API_MODE global; for testing/API overrides)
         'enable_pre_adjustment': True,  # New: Opt-in pad/mel align (alt; default False for non-breaking)
         'enable_post_processing': True,  # New (gate for post; set False for slowly)
         'enable_denoising': False,  # New
@@ -82,8 +87,8 @@ class SkyrimNetConfig:
         'enable_spectral_gating': True,  # New
         'notch_enabled': False,  # New
         'hp_enabled': False,  # New
-        'enable_memory_cache': True,
-        'enable_disk_cache': True,
+        'enable_disk_cache': True,   # Replaces ENABLE_DISK_CACHE global (sync to self)
+        'enable_memory_cache': True, # Replaces ENABLE_MEMORY_CACHE global (sync to self)
         'force_local_refs': True,  # New: Alt flag
         'auto_update_refs': True,  # New: Alt flag
         'timings_enabled': False,  # New
@@ -102,6 +107,7 @@ class SkyrimNetConfig:
         'max_memory_entries': 100,  # Cache size (voices/conds in RAM; up from 50)
         'save_queue_max': 20,       # Disk save queue limit (prevents backlog)
         'fuzzy_index_size': 1000,   # Max fuzzy entries per stem (DB size)
+        'fuzzy_cache_limit': 1000,  # Replaces FUZZY_CACHE_LIMIT global (sync to self)
         'fuzzy_boost_amount': 0.15, # boost given to short word matches to increase cache hits
         'fuzzy_threshold': 0.70,    # level of string match required to use audio cache
         'memory_cache_enable': True, # Toggle memory cache (instead of env)
@@ -181,33 +187,51 @@ class SkyrimNetConfig:
             return cls._instance
 
     def _initialize(self):
-        """Early init (before load; sets core globals)."""
-        # Core attrs (preserved globals)
-        global DEVICE, DTYPE, MODEL, MULTILINGUAL, ENABLE_DISK_CACHE, ENABLE_MEMORY_CACHE, FUZZY_CACHE_LIMIT
-        self.device = DEVICE
-        self.dtype = DTYPE
-        self.model = MODEL
-        self.multilingual = MULTILINGUAL
-        self.enable_disk_cache = ENABLE_DISK_CACHE
-        self.enable_memory_cache = ENABLE_MEMORY_CACHE
-        self.fuzzy_cache_limit = FUZZY_CACHE_LIMIT
+        """Early init (before load; sets core globals). FIX: No CONFIG access here (NameError); stub model=None; sync in load_config. Defer multilingual/disk_cache sync to load_config."""
+        # Core attrs (local defaults; no globals/CONFIG access yet)
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.dtype = torch.bfloat16 if self.device == "cuda" else torch.float32
+
+        # Stub attrs (overridden in load_config; no self-reference)
+        self.multilingual = False  # Default; load later
+        self.enable_disk_cache = True  # Default
+        self.enable_memory_cache = True  # Default
+        self.fuzzy_cache_limit = 1000  # Default
+        self._use_api_mode = False  # Default
+        self.model = None  # FIX: Stub (sync in load_config or load_model; no CONFIG.model access here)
 
         # Private storage (from DEFAULTS; loaded full in load_config)
         self._defaults = self.DEFAULTS.copy()
         self._flags = {k: v for k, v in self.DEFAULTS.items() if isinstance(v, bool)}
-        self._strings = {k: v for k, v in self.DEFAULTS.items() if isinstance(v, str) and k in ['normalize_method', 'logging_level', 'tts_name', 'dtype']}
+        self._strings = {k: v for k, v in self.DEFAULTS.items() if
+                         isinstance(v, str) and k in ['normalize_method', 'logging_level', 'tts_name', 'dtype']}
         self.voice_overrides = {}  # Dict[str, Dict] for voices (from voices.json)
         self._is_modified = False
-        self.sr = 24000  # Core
+        self.sr = 24000  # Core (enforced in merged params)
+        self._config_cache = None  # Private instance
+        self._config_file_path = "skyrimnet_config.txt"  # Private
 
-        logger.debug("SkyrimNetConfig initialized (core globals set)")
+        logger.debug("SkyrimNetConfig initialized (core instance attrs stubbed)")
 
-        # Load full config
+        # Load full config (post-init; safe now)
         self.load_config()
 
+        # Temporary deprecation bridge: Sync self to deprecated globals (phase out; after load)
+        global MULTILINGUAL, ENABLE_DISK_CACHE, ENABLE_MEMORY_CACHE, FUZZY_CACHE_LIMIT, _CONFIG_CACHE, _CONFIG_FILE, _USE_API_MODE
+        logger.debug("Deprecated global sync (phase out: use CONFIG attrs directly)")
+        MULTILINGUAL = self.multilingual
+        ENABLE_DISK_CACHE = self.enable_disk_cache
+        ENABLE_MEMORY_CACHE = self.enable_memory_cache
+        FUZZY_CACHE_LIMIT = self.fuzzy_cache_limit
+        _CONFIG_CACHE = self._config_cache
+        _CONFIG_FILE = self._config_file_path
+        _USE_API_MODE = self._use_api_mode
+
+
+    # Sharable Helper: Load globals/flags from config.txt (INI-style; no voice block)
     # Sharable Helper: Load globals/flags from config.txt (INI-style; no voice block)
     def _load_txt_config(self) -> Tuple[Dict[str, Any], Dict[str, str], Dict[str, bool]]:
-        """Sharable: Parse config.txt for globals/flags/modes. Returns (default_config, config_mode, global_flags)."""
+        """Sharable: Parse config.txt for globals/flags/modes. Returns (default_config, config_mode, global_flags). No globals set here (use self in load_config)."""
         default_config = {
             'temperature': 0.8,
             'min_p': 0.07,
@@ -222,7 +246,7 @@ class SkyrimNetConfig:
             'enable_disk_cache': self.DEFAULTS.get('enable_disk_cache', True)
         }
 
-        config_path = Path(self._config_file_path)
+        config_path = Path(self._config_file_path)  # Use self (no _CONFIG_FILE global)
         if not config_path.exists():
             logger.warning(f"Config file {self._config_file_path} not found, using hardcoded defaults")
             return default_config, config_mode, global_flags
@@ -252,22 +276,14 @@ class SkyrimNetConfig:
                     key = key.strip()
                     value = value.strip()
 
-                    # Global boolean flags (preserve old logic)
+                    # Global boolean flags (preserve old logic; set to return dict only, no globals)
                     if key in global_flags:
                         if value.lower() in ['true', 'yes', '1', 'on']:
                             global_flags[key] = True
-                            if key == 'enable_memory_cache':
-                                ENABLE_MEMORY_CACHE = True
-                            elif key == 'enable_disk_cache':
-                                ENABLE_DISK_CACHE = True
-                            logger.info(f"Setting {key} to True")
+                            logger.info(f"Setting flag {key} to True (use self in load_config)")
                         elif value.lower() in ['false', 'no', '0', 'off']:
                             global_flags[key] = False
-                            if key == 'enable_memory_cache':
-                                ENABLE_MEMORY_CACHE = False
-                            elif key == 'enable_disk_cache':
-                                ENABLE_DISK_CACHE = False
-                            logger.info(f"Setting {key} to False")
+                            logger.info(f"Setting flag {key} to False (use self in load_config)")
                         else:
                             logger.warning(f"Invalid boolean value '{value}' for {key}, using default")
 
@@ -293,10 +309,14 @@ class SkyrimNetConfig:
             logger.error(f"TXT config load failed: {e}, using hardcoded defaults")
             return default_config, config_mode, global_flags
 
+
     # Sharable Helper: Load voice overrides from voices.json
     # Enhanced: Multi-path load for voices.json (root/config/; log found/missing)
+    # Sharable Helper: Load voice overrides from voices.json
+    # Enhanced: Multi-path load for voices.json (root/config/; log found/missing)
+    # FIX: Fallback for 'femaleuniquelydia' to suppress warning
     def _load_voices_json(self) -> Dict[str, Dict]:
-        """Load voices.json from root or config/ dir. Returns {voice: params} or {}. FIXED: Multi-path, debug log."""
+        """Load voices.json from root or config/ dir. Returns {voice: params} or {}. FIXED: Multi-path, debug log; fallback for missing voices."""
         possible_paths = [
             Path(__file__).parent.parent / "voices.json",  # Root (skyrimnet_chatterbox/voices.json)
             Path(__file__).parent / "voices.json",         # config/voices.json (if src/config.py)
@@ -324,72 +344,110 @@ class SkyrimNetConfig:
             else:
                 logger.trace(f"Tried voices.json path (not found): {voices_path}")
 
+        # FIX: Fallback if no file (suppresses fuzzy cache warning for missing voices like 'femaleuniquelydia')
         logger.warning("voices.json not found in expected paths – no per-voice overrides (add to root for [dlc1seranavoice/femaleuniquelydia])")
-        self.voice_overrides = {'global': {}}  # Fallback
-        return {}
-
+        fallback_voices = {'global': {}, 'femaleuniquelydia': {}}  # Minimal fallback for known missing voice
+        self.voice_overrides = fallback_voices
+        return fallback_voices
 
     def load_config(self):
-        """Load: Txt (globals/flags) → merge defaults → voices.json (overrides). FIXED: Always call _load_voices_json; full debug logs (multi-path)."""
-        global _CONFIG_CACHE, ENABLE_MEMORY_CACHE, ENABLE_DISK_CACHE
-
-        if _CONFIG_CACHE is not None:  # Cache hit (but re-load voices always for updates)
-            defaults, modes, global_flags = _CONFIG_CACHE
-            # Re-merge old cache with fresh voices (ensure always current)
-            self._defaults.update(defaults)  # Preserve existing
-            self.enable_memory_cache = global_flags.get('enable_memory_cache', ENABLE_MEMORY_CACHE)
-            self.enable_disk_cache = global_flags.get('enable_disk_cache', ENABLE_DISK_CACHE)
-            ENABLE_MEMORY_CACHE = self.enable_memory_cache
-            ENABLE_DISK_CACHE = self.enable_disk_cache
-            # Always refresh voices (no cache skip)
+        """Load: Txt (globals/flags) → merge defaults → voices.json (overrides). FIX: Sync model here (post-init; safe CONFIG access via self)."""
+        if self._config_cache is not None:  # Cache hit (but re-load voices always for updates)
+            defaults, modes, global_flags = self._config_cache
+            # Re-merge old cache with fresh voices
+            self._defaults.update(defaults)
+            self.enable_memory_cache = global_flags.get('enable_memory_cache',
+                                                        self.DEFAULTS.get('enable_memory_cache', True))
+            self.enable_disk_cache = global_flags.get('enable_disk_cache', self.DEFAULTS.get('enable_disk_cache', True))
+            # Always refresh voices
             self._load_voices_json()
             logger.debug("Config from cache (txt + fresh voices.json)")
-            return _CONFIG_CACHE
+            # FIX: Re-sync model if singleton loaded (safe here)
+            self._sync_model_if_loaded()
+            return self._config_cache
 
-        # Step 1: Load txt (globals/flags/modes; existing logic)
+        # Step 1: Load txt (unchanged)
         default_config, config_mode, global_flags = self._load_txt_config()
 
-        # Step 2: Merge defaults (input → _defaults; sharable)
+        # Step 2: Merge defaults (unchanged)
         self._defaults.update({k: v for k, v in default_config.items() if k in self.DEFAULTS})
         for k in self.DEFAULTS:
             if k not in self._defaults:
                 self._defaults[k] = self.DEFAULTS[k]
 
-        # Step 3: Load voices.json (enhanced: Multi-path, always fresh, log raw)
+        # FIX: Sync self attrs from merged defaults (no globals; post-init safe)
+        self.multilingual = self._defaults.get('multilingual', False)
+        self._use_api_mode = self._defaults.get('use_api_mode', False)
+        self.fuzzy_cache_limit = self._defaults.get('fuzzy_cache_limit', 1000)
+        self.enable_memory_cache = self._defaults.get('enable_memory_cache', True)
+        self.enable_disk_cache = self._defaults.get('enable_disk_cache', True)
+
+        # Step 3: Load voices.json (unchanged)
         self.voice_overrides = self._load_voices_json()
 
-        # Step 4: Sync flags/enables from globals (after txt)
-        self.enable_memory_cache = global_flags.get('enable_memory_cache', self.DEFAULTS['enable_memory_cache'])
-        self.enable_disk_cache = global_flags.get('enable_disk_cache', self.DEFAULTS['enable_disk_cache'])
-        ENABLE_MEMORY_CACHE = self.enable_memory_cache
-        ENABLE_DISK_CACHE = self.enable_disk_cache
+        # Step 4: Sync flags from txt (unchanged)
+        self.enable_memory_cache = global_flags.get('enable_memory_cache', self.enable_memory_cache)
+        self.enable_disk_cache = global_flags.get('enable_disk_cache', self.enable_disk_cache)
 
-        # Set self attrs from merged (easy access)
+        # Set self attrs from merged (unchanged)
         for attr, val in self._defaults.items():
             if not hasattr(self, attr) or attr in ['device', 'dtype', 'model']:  # Avoid overwrite core
                 setattr(self, attr, val)
         for attr, val in self._flags.items():
             setattr(self, attr, val)
 
-        # Core sync (clamped where needed)
-        self.device = torch.device(DEVICE if self.device == "cuda" else "cpu")
+        # Core sync (clamped; unchanged)
+        self.device = torch.device(self.device if isinstance(self.device, str) and self.device == "cuda" else "cpu")
         dtype_str = self._defaults.get('dtype', 'bfloat16')
         self.dtype = torch.bfloat16 if dtype_str == 'bfloat16' else torch.float32
-        DTYPE = self.dtype
 
-        # Log summary (with voices count/debug)
+        # FIX: Sync model from singleton *after* full load (safe; new private helper)
+        self._sync_model_if_loaded()
+
+        # Log summary (unchanged)
         voices_count = len(self.voice_overrides)
         voices_keys = list(self.voice_overrides.keys()) if voices_count > 0 else []
         logger.info(
-            f"Config loaded: {voices_count} voices (['global' + {len(voices_keys) - 1}] if global fallback; keys: {voices_keys}), {len(self._defaults)} params (logging_level={self.logging_level})")
+            f"Config loaded: {voices_count} voices (['global' + {len(voices_keys) - 1 if voices_keys else 0}] if global fallback; keys: {voices_keys}), {len(self._defaults)} params (logging_level={self.logging_level}; multilingual={self.multilingual})")
         if voices_count > 1:  # Success log
             sample_voice = voices_keys[0] if voices_keys else 'none'
             logger.info(
                 f"Voices loaded: {sample_voice} (trim={self.voice_overrides.get(sample_voice, {}).get('trim_threshold_db', 'N/A')}, eq={self.voice_overrides.get(sample_voice, {}).get('eq_gain_db', 'N/A')}, notch={self.voice_overrides.get(sample_voice, {}).get('notch_gain_db', 'N/A')}")
 
-        # Cache result (but voices refreshed on call if needed)
-        _CONFIG_CACHE = (default_config, config_mode, global_flags)
-        return _CONFIG_CACHE
+        # Cache result (unchanged)
+        self._config_cache = (default_config, config_mode, global_flags)
+
+        # Temporary deprecation bridge (unchanged; after load)
+        global MULTILINGUAL, ENABLE_DISK_CACHE, ENABLE_MEMORY_CACHE, FUZZY_CACHE_LIMIT, _CONFIG_CACHE, _USE_API_MODE
+        logger.debug("Deprecated global sync (phase out: use CONFIG attrs directly)")
+        MULTILINGUAL = self.multilingual
+        ENABLE_DISK_CACHE = self.enable_disk_cache
+        ENABLE_MEMORY_CACHE = self.enable_memory_cache
+        FUZZY_CACHE_LIMIT = self.fuzzy_cache_limit
+        _CONFIG_CACHE = self._config_cache
+        _USE_API_MODE = self._use_api_mode
+
+        return self._config_cache
+
+    # NEW: Private helper for model sync (called from load_config/load_model; safe post-init)
+    def _sync_model_if_loaded(self):
+        """Sync self.model from singleton if already loaded (post-init safe). FIX: Lazy import; no recursion."""
+        try:
+            from src.model import ModelManager
+            model_type = 'multilingual' if self.multilingual else 'english'
+            if ModelManager.get_instance().is_loaded(model_type):
+                self.model = ModelManager.get_instance().get_model(model_type)
+                logger.debug(f"Synced existing model ({model_type}) to config")
+            else:
+                self.model = None  # Explicit stub if not loaded
+        except ImportError:
+            logger.debug("ModelManager not available yet – defer model sync to load_model")
+            self.model = None
+        except Exception as e:
+            logger.warning(f"Model sync failed in load_config: {e} – model remains None")
+            self.model = None
+
+
 
 
     def _merge_defaults(self, input_defaults: Dict, modes: Dict, flags: Dict):
@@ -417,8 +475,9 @@ class SkyrimNetConfig:
         DTYPE = self.dtype
 
     # Sharable Helper: Save globals/flags to config.txt (INI-style)
+    # Sharable Helper: Save globals/flags to config.txt (INI-style)
     def _save_txt_config(self, config_path: Path):
-        """Sharable: Save globals/flags to txt (no voices block)."""
+        """Sharable: Save globals/flags to txt (no voices block). FIX: Set is_modified=False after save via property."""
         with open(config_path, 'w', encoding='utf-8') as f:
             f.write("# Global Settings\n")
             f.write(f"enable_pre_adjustment = {self.enable_pre_adjustment}\n")
@@ -457,14 +516,19 @@ class SkyrimNetConfig:
                                 'force_local_refs', 'auto_update_refs']:
                     f.write(f"{flag} = {val}\n")
 
+        self.is_modified = False  # FIX: Reset after save
         logger.debug(f"TXT config saved: {config_path}")
 
+
+    # Sharable Helper: Save voice overrides to voices.json
     # Sharable Helper: Save voice overrides to voices.json
     def _save_voices_json(self, voices_file: Path):
-        """Sharable: Save voice_overrides to JSON (indent=2)."""
+        """Sharable: Save voice_overrides to JSON (indent=2). FIX: Reset is_modified via property."""
         with open(voices_file, 'w', encoding='utf-8') as f:
             json.dump(self.voice_overrides, f, indent=2)
+        self.is_modified = False  # FIX: Reset after save
         logger.debug(f"Voices.json saved: {voices_file} ({len(self.voice_overrides)} voices)")
+
 
     def save_config(self, create_backup: bool = True) -> Tuple[bool, str]:
         """Save: Txt (globals/flags via _save_txt_config) + voices.json (_save_voices_json). Modular."""
@@ -502,7 +566,7 @@ class SkyrimNetConfig:
                   bypass_config: bool = False) -> Any:
         """Get value with clamping (numerics only; from alt). Backward compat with old get_config_value.
         Handles list parsing for fuzzy_boost_words (str → list from comma-sep)."""
-        if bypass_config or _USE_API_MODE:
+        if bypass_config or self._use_api_mode:  # Use self (no _USE_API_MODE global)
             # API mode: Use api_value or fallback to DEFAULTS (preserve old fallback_defaults)
             fallback_defaults = {
                 'temperature': 0.9, 'min_p': 0.05, 'top_p': 1.0, 'repetition_penalty': 2.0,
@@ -570,6 +634,7 @@ class SkyrimNetConfig:
             return self.clamp_value(param_name, val)
         return val
 
+
     def clamp_value(self, param_name: str, value: Any) -> Any:
         """Clamp numerics using CAPS (non-breaking; skip if no CAP). Sharable."""
         if isinstance(value, (int, float)):
@@ -584,10 +649,18 @@ class SkyrimNetConfig:
                 return clamped
         return value  # No clamp for non-numerics/missing CAPS
 
+    @property
+    def is_modified(self) -> bool:
+        return self._is_modified
+
+    @is_modified.setter
+    def is_modified(self, value: bool):
+        self._is_modified = bool(value)
+        logger.debug(f"Config modified state: {self._is_modified}")
 
     @property
     def audio_defaults(self) -> Dict[str, Any]:
-        """Audio params subset (merged; from alt; sharable property). FIXED: Added padding gates/tunables."""
+        """Audio params subset (merged; from alt; sharable property). FIXED: Added padding gates/tunables; enforce sr=24000."""
         if not hasattr(self, '_audio_defaults'):
             self._audio_defaults = {
                 # Existing core
@@ -613,8 +686,8 @@ class SkyrimNetConfig:
                 'enable_denoise_normalize': self.get_value('enable_denoise_normalize'),
                 'enable_denoising': self.get_value('enable_denoising'),
 
-                # NEW: Padding gates/tunables (merged like others)
-                'enable_audio_padding': self.get_value('enable_audio_padding', default=True),
+                # NEW: Padding gates/tunables (merged like others; for bridge_api text/audio handling)
+                'enable_audio_padding': self.get_value('enable_audio_padding', default=False),
                 'base_audio_pad_sec': self.get_value('base_audio_pad_sec'),
                 'tiny_audio_pad_multiplier': self.get_value('tiny_audio_pad_multiplier'),
                 'tiny_threshold_sec': self.get_value('tiny_threshold_sec'),
@@ -622,12 +695,15 @@ class SkyrimNetConfig:
                 'text_ellipses_count': self.get_value('text_ellipses_count'),
                 'max_short_word_len': self.get_value('max_short_word_len'),
                 'vocalise_patterns': self.get_value('vocalise_patterns'),  # List
+
+                # FIX: Enforce core SR for bridge_api cache compatibility
+                'sr': self.sr,  # 24000 (overrides any upload mismatches)
             }
         return self._audio_defaults
 
 
     def get_merged_audio_params(self, voice_name: Optional[str] = None, api_overrides: Optional[Dict] = None) -> Dict[str, Any]:
-        """Merge: audio_defaults → Voice (JSON) → API. FIXED: Log all keys in merged (voice/raw + final); force voice get."""
+        """Merge: audio_defaults → Voice (JSON) → API. FIXED: Log all keys in merged (voice/raw + final); force voice get; include sr=24000."""
         params = self.audio_defaults.copy()  # Subset with clamped globals
         params['voice_name'] = voice_name or 'default'
 
@@ -650,7 +726,7 @@ class SkyrimNetConfig:
 
         # Log full merged (confirms load/apply)
         logger.debug(f"Merged audio params for '{voice_name}': { {k: v for k, v in params.items() if v is not None} }")  # Non-None only
-        active_keys = [k for k, v in params.items() if v is not None and v != (0.0 if k.endswith('_db') else 0) and v != (1.0 if k == 'speaking_rate' else 1.0)]
+        active_keys = [k for k, v in params.items() if v is not None and not (isinstance(v, float) and abs(v - (0.0 if 'db' in k else 1.0 if k in ['speaking_rate', 'gain_max_limit'] else 0)) < 1e-6)]
         if active_keys:
             logger.info(f"Merged audio for {voice_name}: {len(active_keys)} active overrides ({sorted(active_keys)})")
         else:
@@ -667,11 +743,51 @@ class SkyrimNetConfig:
         """List voices from overrides."""
         return list(self.voice_overrides.keys())
 
-# Backward Compat: Old Functions as Facades (Non-Breaking; Route to Class)
+
+def load_model(self, model_type: Optional[str] = None, *args, **kwargs) -> bool:
+    """Load TTS model via ModelManager singleton (ChatterboxTTS). FIX: Facade for bridge_api/UI; supports multilingual from self.multilingual.
+    Returns True if loaded/success; syncs self.model (no globals)."""
+    # Use self attrs only (no globals)
+    model_type = model_type or ('multilingual' if self.multilingual else 'english')
+
+    try:
+        from src.model import ModelManager
+        # Update device/dtype from self (singleton uses globals temporarily; phase out via model.py patch)
+        use_cuda = torch.cuda.is_available()
+        device_str = "cuda" if use_cuda else "cpu"
+        self.device = torch.device(device_str)
+        dtype = torch.bfloat16 if device_str == "cuda" else torch.float32
+        self.dtype = dtype
+
+        # Temp deprecation: Sync to globals for model.py (phase out)
+        global DEVICE, DTYPE
+        logger.debug("Deprecated global sync for device/dtype (phase out: update model.py to use CONFIG)")
+        DEVICE = device_str
+        DTYPE = dtype
+
+        # Load via singleton (lazy)
+        success = ModelManager.get_instance().load_model(model_type, *args, **kwargs)
+        if success:
+            self.model = ModelManager.get_instance().get_model(model_type)
+            logger.info(f"✓ Config-loaded TTS model: {model_type} via singleton on {self.device}")
+            return True
+        else:
+            logger.error(f"Model load failed via facade (type={model_type})")
+            self.model = None  # Explicit on fail
+            return False
+
+    except ImportError as e:
+        logger.error(f"Model manager import failed (check src/model.py?): {e}")
+        return False
+    except Exception as e:
+        logger.error(f"Model load failed in config: {e}")
+        return False
+
+
+# Backward Compat: Old Functions as Facades (Non-Breaking; Route to Class) TODO phase out
 def load_skyrimnet_config():
     """Old API: Load (now via class; returns tuple for compat)."""
-    global _CONFIG_CACHE
-    if _CONFIG_CACHE is None:
+    if CONFIG._config_cache is None:  # Use self._config_cache (no _CONFIG_CACHE global)
         CONFIG.load_config()  # Init class
         # Return old format (defaults, modes, flags)
         default_config = CONFIG._defaults.copy()  # Shallow
@@ -679,8 +795,8 @@ def load_skyrimnet_config():
                        k in ['temperature', 'min_p', 'top_p', 'repetition_penalty', 'cfg_weight', 'exaggeration']}
         global_flags = {'enable_memory_cache': CONFIG.enable_memory_cache,
                         'enable_disk_cache': CONFIG.enable_disk_cache}
-        _CONFIG_CACHE = (default_config, config_mode, global_flags)
-    return _CONFIG_CACHE
+        CONFIG._config_cache = (default_config, config_mode, global_flags)  # Cache to self (no global)
+    return CONFIG._config_cache  # Return self cache
 
 def get_config_value(param_name: str, api_value, defaults=None, modes=None, bypass_config=False):
     """Old API: Get value (now via class get_value; preserves args)."""
@@ -694,22 +810,29 @@ def get_config_value(param_name: str, api_value, defaults=None, modes=None, bypa
 def reload_config():
     """Old API: Reload (now class method)."""
     CONFIG.reload_config()
-    global _CONFIG_CACHE
-    _CONFIG_CACHE = None
+    CONFIG._config_cache = None  # Use self (no global)
 
 # Global Instance (Backward Compat: Use class attrs as globals)
 CONFIG = SkyrimNetConfig()
 
-# Set preserved globals from class (on load)
+# Deprecated: _sync_globals (phase out global use; call if legacy code needs it, but update to CONFIG attrs)
 def _sync_globals():
-    global DEVICE, DTYPE, MODEL, MULTILINGUAL, ENABLE_DISK_CACHE, ENABLE_MEMORY_CACHE, FUZZY_CACHE_LIMIT
+    """Deprecated: Sync self to globals (phase out: use CONFIG directly; logs warning)."""
+    logger.warning("_sync_globals deprecated (use CONFIG.device, CONFIG.enable_disk_cache, etc.; globals for legacy only)")
+    global DEVICE, DTYPE, MODEL, MULTILINGUAL, ENABLE_DISK_CACHE, ENABLE_MEMORY_CACHE, FUZZY_CACHE_LIMIT, _CONFIG_CACHE, _USE_API_MODE
     DEVICE = str(CONFIG.device)
     DTYPE = CONFIG.dtype
     MODEL = CONFIG.model
     MULTILINGUAL = CONFIG.multilingual
     ENABLE_DISK_CACHE = CONFIG.enable_disk_cache
     ENABLE_MEMORY_CACHE = CONFIG.enable_memory_cache
-    FUZZY_CACHE_LIMIT = CONFIG.get_value('fuzzy_cache_limit', default=CONFIG.DEFAULTS.get('fuzzy_cache_limit', 1000))
+    FUZZY_CACHE_LIMIT = CONFIG.fuzzy_cache_limit
+    _CONFIG_CACHE = CONFIG._config_cache
+    _USE_API_MODE = CONFIG._use_api_mode
+
+# Initial sync (non-blocking; deprecated – call only if needed for legacy)
+load_skyrimnet_config()  # Triggers class init
+# _sync_globals()  # Commented out (phase out; enable if legacy breaks)
 
 # Initial sync (non-blocking)
 load_skyrimnet_config()  # Triggers class init + _sync_globals implicit via properties
