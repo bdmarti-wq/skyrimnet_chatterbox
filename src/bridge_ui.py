@@ -18,7 +18,7 @@ import gradio as gr
 import torch
 import torchaudio
 from loguru import logger
-from config import CONFIG, _USE_API_MODE, load_skyrimnet_config, get_config_value  # Direct import for self-contained CONFIG
+from .config import CONFIG, _USE_API_MODE, load_skyrimnet_config, get_config_value  # Direct import for self-contained CONFIG
 
 # FIX: Load TTS via singleton (essential; supports multilingual)
 from src.model import ModelManager
@@ -100,7 +100,7 @@ def generate_audio_ui(  # REVERT/PATCH: Sync def (Gradio calls without await →
 
         # Lazy import + call (via kwargs for sig safety; model=MODEL from global)
         from src.generate_audio import generate_audio  # Assume will be async (returns coroutine)
-        from config import CONFIG
+        from .config import CONFIG
         gen_coroutine = generate_audio(  # Call async fn → coroutine
             model=CONFIG.model,
             text=text,
@@ -126,7 +126,7 @@ def generate_audio_ui(  # REVERT/PATCH: Sync def (Gradio calls without await →
         if loop:
             loop.close()
         # FIXED: 2D mono silence (Gradio-safe: [1, samples], float32 CPU) + save to temp path (str return like HIT)
-        from config import CONFIG  # Absolute for fallback (sr/dtype/device)
+        from .config import CONFIG  # Absolute for fallback (sr/dtype/device)
         silence_2d = torch.zeros(1, CONFIG.sr * 2, dtype=torch.float32, device='cpu')  # 2D [1, 48000]; float32 CPU
         # Temp save (mimic save_and_cache_output; sr=CONFIG.sr)
         with tempfile.TemporaryDirectory() as tmpdir:

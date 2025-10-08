@@ -35,7 +35,7 @@ from collections import OrderedDict
 from typing import Dict, Any, Optional, Tuple, Union, List
 from loguru import logger  # Assume available; fallback to print if not
 import threading  # Ensure imported (likely already is)
-from config import CONFIG
+from .config import CONFIG
 from src.audio_utils import is_artifact_laden  # Import for artifact check
 
 # Suppress torchaudio deprecations precisely (exact message/module for backend utils)

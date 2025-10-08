@@ -19,8 +19,8 @@ import torchaudio
 from pathlib import Path
 import tempfile
 import torch  # For stub_wav_path (if needed for tensor)
-from config import CONFIG, SkyrimNetConfig
-CONFIG = SkyrimNetConfig()  # Safe: Singleton initializes once (load_config() auto-runs)
+from .config import CONFIG
+
 
 
 # NEW: Safe helpers for scalar conversion (fixes list/None issues in sliders) - prop-based

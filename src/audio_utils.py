@@ -19,7 +19,7 @@ import librosa
 from scipy.signal import sosfilt, butter, iirnotch
 from pathlib import Path
 from loguru import logger
-from config import CONFIG
+from .config import CONFIG
 import asyncio
 
 # UTILITY: Cleanup function for test files
@@ -195,7 +195,7 @@ def is_artifact_laden(wav_path: str, threshold_hz: float = None, ratio_threshold
 # Modular Post-Processing Functions (extracted from generate) - Updated for no-op values
 def trim_silence(audio: np.ndarray, threshold_db: float | None = -25.0) -> np.ndarray:
     """Trim leading/trailing silence based on threshold."""
-    if threshold_db is None:
+    if threshold_db > -99:
         logger.debug("Trim skipped (threshold_db=None)")
         return audio  # No-op
     threshold = 10 ** (threshold_db / 20)

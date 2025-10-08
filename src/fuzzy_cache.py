@@ -15,7 +15,7 @@ from pathlib import Path
 
 from loguru import logger
 
-from config import CONFIG
+from .config import CONFIG
 from .audio_utils import is_artifact_laden
 from .cache import ROOT_DIR, CACHE_AUDIO_DIR  # Import shared paths only
 

@@ -7,8 +7,9 @@ import warnings
 import torchaudio
 from pathlib import Path
 
-from config import DEVICE, DTYPE, _USE_API_MODE, load_skyrimnet_config, get_config_value, ENABLE_MEMORY_CACHE, \
-    ENABLE_DISK_CACHE, MODEL, MULTILINGUAL, SkyrimNetConfig
+
+from src.config import DEVICE, DTYPE, _USE_API_MODE, load_skyrimnet_config, get_config_value, ENABLE_MEMORY_CACHE, \
+    ENABLE_DISK_CACHE, MODEL, MULTILINGUAL, CONFIG
 # Lazy import inside generate (avoids global Gradio scan/inference)
 from src.audio_utils import set_torchaudio_backend
 from src.fuzzy_cache import load_fuzzy_cache

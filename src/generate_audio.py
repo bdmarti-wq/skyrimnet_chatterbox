@@ -10,7 +10,7 @@ from time import perf_counter_ns, time
 import torchaudio
 from typing import Optional, Dict, Any, Tuple
 
-from config import CONFIG
+from .config import CONFIG
 from .audio_utils import apply_post_processing
 from .cache import (
     try_audio_cache, set_audio_cache, get_cache_key, get_or_queue_voice_process,

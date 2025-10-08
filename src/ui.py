@@ -9,11 +9,10 @@ from loguru import logger
 from pathlib import Path
 
 # CONFIG singleton
-from config import SkyrimNetConfig, ENABLE_DISK_CACHE
+from src.config import CONFIG, ENABLE_DISK_CACHE
 from src.cache import ENABLE_MEMORY_CACHE
 from src.model import load_model
 
-CONFIG = SkyrimNetConfig()
 
 # ui_helpers (full: safe_*, handlers, stub_wav_path exclusive for fallbacks)
 from src.ui_helpers import (
