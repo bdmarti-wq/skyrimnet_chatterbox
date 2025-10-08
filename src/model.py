@@ -21,7 +21,6 @@ class SimpleModelState:
 
     def load(self, model_type: str, device: torch.device, dtype: torch.dtype, *args, **kwargs) -> Optional[Any]:
         """Load and set model. FIX: No dtype in from_pretrained; apply .to(dtype) post-load (original pattern)."""
-        clear_cache_files()  # Clear prior cache
         if model_type == 'multilingual':
             logger.info("Loading Multilingual Model")
             from src.chatterbox.mtl_tts import ChatterboxMultilingualTTS as Chatterbox
