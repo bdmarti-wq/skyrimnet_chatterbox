@@ -67,14 +67,15 @@ def try_fuzzy_audio_cache(audio_path: str = None, text_input: str = None, exagge
 
     # Extract/fix stem (required; fallback if swapped)
     if stem is None:
-        if stem is None:
-            if audio_path:
-                full_stem = Path(audio_path).stem.replace('_fixed', '')  # e.g., 'ba_beatricevoice'
-                split_stem = full_stem.split('_')
-                stem = split_stem[0] if len(split_stem) > 1 else full_stem  # Fallback to full if short
-                if len(stem) < 3:  # Still short → warn but use full
-                    stem = full_stem
-                    logger.warning(f"Fuzzy stem fallback to full '{stem}' from '{audio_path}' (short prefix)")
+        if audio_path:
+            full_stem = Path(audio_path).stem.replace('_fixed', '').replace('_padded', '').replace('_resampled',
+                                                                                                   '').replace(
+                '_ui_resampled', '')  # e.g., 'cs_coralyn_voice'
+            if full_stem.endswith('_voice'):
+                stem = full_stem[:-6]  # Remove '_voice' (e.g., "cs_coralyn_voice" → "cs_coralyn")
+            else:
+                stem = full_stem  # Already clean
+            logger.debug(f"Full stem derived: '{stem}' from path '{audio_path}'")
         else:
             logger.warning(
                 "Fuzzy: No audio_path or stem – cannot filter per-voice; using global fallback (inefficient)")
@@ -85,8 +86,10 @@ def try_fuzzy_audio_cache(audio_path: str = None, text_input: str = None, exagge
         full_stem = Path(audio_path).stem.replace('_fixed', '').replace('_padded', '').replace('_resampled',
                                                                                                '').replace(
             '_ui_resampled', '')
-        match_full = re.match(r'^([a-zA-Z0-9_]+)_?([0-9a-f]{32,})?$', full_stem)
-        candidate_stem = match_full.group(1) if match_full else full_stem
+        if full_stem.endswith('_voice'):
+            candidate_stem = full_stem[:-6]  # Remove '_voice' (e.g., "cs_coralyn_voice" → "cs_coralyn")
+        else:
+            candidate_stem = full_stem  # Already clean
         if len(candidate_stem) >= 3 and candidate_stem not in ['global', 'audio_reuse']:
             stem = candidate_stem  # Use full if valid
             logger.debug(f"Fuzzy: Extended short stem '{old_stem}' to '{stem}' from path")
@@ -100,7 +103,15 @@ def try_fuzzy_audio_cache(audio_path: str = None, text_input: str = None, exagge
         logger.warning(
             f"Fuzzy detect: Possible arg swap (text_input='{text_input}' too stem-like) – auto-fixing (use correct: audio_path, text_input=text, stem=voice)")
         text_input, audio_path = audio_path, text_input  # Swap back
-        stem = Path(audio_path).stem.split('_')[0] if audio_path else stem  # Re-extract
+        full_stem = Path(audio_path).stem.replace('_fixed', '').replace('_padded', '').replace('_resampled',
+                                                                                               '').replace(
+            '_ui_resampled', '')
+        if full_stem.endswith('_voice'):
+            stem = full_stem[:-6]  # Remove '_voice'
+        else:
+            stem = full_stem
+        if len(stem) < 3:
+            stem = stem  # Ensure full
         if len(text_input.strip()) < min_length:
             if not quiet:
                 logger.debug(f"Fuzzy skip after swap: Text too short (<{min_length} chars)")
@@ -129,8 +140,8 @@ def try_fuzzy_audio_cache(audio_path: str = None, text_input: str = None, exagge
         return None
 
     boost_words = CONFIG.get_value('fuzzy_boost_words',
-                                   default=['ahh', 'mmm', 'ooh', 'yes'])  # Extended for your RP logs
-    boost_amount = CONFIG.get_value('fuzzy_boost_amount', default=0.1)
+                                   default=['ahh', 'mmm', 'ooh', 'throbb', 'moan', 'gasp', 'oh', 'fuck', 'yes', 'aah', 'gods'])  # Or CONFIG
+    boost_amount = CONFIG.get_value('fuzzy_boost_amount', default=0.15)
 
     for entry in candidates:
         clean_entry = re.sub(r'[^\w\s]', '', entry['orig_text'].lower()).strip()
@@ -155,7 +166,7 @@ def try_fuzzy_audio_cache(audio_path: str = None, text_input: str = None, exagge
                     f"  Candidate: '{clean_entry[:30]}...' raw={raw_ratio:.3f} +boost={sim_boost:.3f} = {adjusted_sim:.3f}")
 
     if best_sim >= threshold and best_path:
-        # NEW: Validate HIT for artifacts (purge if bad; log fallback)
+        # NEW: Validate HIT for artifacts (purge if bad; fallback MISS)
         if ENABLE_ARTIFACT_PURGE:
             artifact_threshold = CONFIG.get_value('fuzzy_artifact_threshold_hz', default=8000.0)
             if is_artifact_laden(best_path, threshold_hz=artifact_threshold):
@@ -186,6 +197,8 @@ def try_fuzzy_audio_cache(audio_path: str = None, text_input: str = None, exagge
             if best_match:
                 logger.debug(f"  Closest: '{best_match[:30]}...' (sim={best_sim:.3f})")
         return None
+
+
 
 
 def _save_fuzzy_audio_cache(save_all: bool = False):

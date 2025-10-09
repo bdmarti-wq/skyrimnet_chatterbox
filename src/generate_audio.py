@@ -1,4 +1,3 @@
-# src/generate_audio.py
 import functools
 import logging
 import threading
@@ -17,7 +16,7 @@ from .cache import (
     validate_voice_path, create_dummy_conds, load_conditionals_cache, save_conditionals_cache,
     get_cache_stats, check_and_update_ref, save_torchaudio_wav
 )
-from .fuzzy_cache import try_fuzzy_audio_cache, FUZZY_QUEUE
+from .fuzzy_cache import try_fuzzy_audio_cache, FUZZY_QUEUE  # Added missing import
 
 logger = logging.getLogger(__name__)
 GEN_ACTIVE_LOCK = threading.RLock()  # Global for gen/prepare
@@ -120,7 +119,12 @@ def try_reuse_audio(
     # Fuzzy: Extract stem explicitly (normalize, remove '_fixed' etc.)
     fuzzy_path = None
     if try_fuzzy:
-        voice_stem = Path(audio_prompt_path).stem.replace('_fixed', '').split('_')[0]  # e.g., 'dlc1seranavoice' (robust)
+        # FIXED: Derive full_stem consistently (strip '_voice' suffix without split for full base)
+        full_stem = Path(audio_prompt_path).stem.replace('_fixed', '').replace('_padded', '').replace('_resampled', '').replace('_ui_resampled', '')  # e.g., 'cs_coralyn_voice'
+        voice_stem = full_stem[:-6] if full_stem.endswith('_voice') else full_stem  # Strip '_voice' suffix (e.g., "cs_coralyn_voice" → "cs_coralyn")
+        if len(voice_stem) < 3:
+            voice_stem = full_stem  # Ensure full
+        logger.debug(f"Query stem derived: '{voice_stem}' from path '{audio_prompt_path}'")  # FIXED: Added debug log
         fuzzy_path = try_fuzzy_audio_cache(audio_prompt_path, text, stem=voice_stem)  # audio_path=voice path, text_input=text, stem=voice_stem
     if fuzzy_path:
         return fuzzy_path, "Fuzzy audio"
@@ -250,8 +254,6 @@ def save_and_cache_output(
     return wave_file
 
 
-
-
 async def generate_audio(model, text: str, audio_prompt_path: Optional[str], exaggeration: float = 0.5,
                          cache_uuid: int = 0,
                          temperature: float = 0.8, cfgw: float = 0, min_p: float = 0.05, top_p: float = 1.0,
@@ -265,7 +267,12 @@ async def generate_audio(model, text: str, audio_prompt_path: Optional[str], exa
     dtype = CONFIG.dtype
     sr = CONFIG.sr  # 24000 from config.py
     multilingual = CONFIG.multilingual  # False by default
-    voice_stem = Path(audio_prompt_path).stem.replace('_fixed', '').split('_')[0]
+    # FIXED: Derive full_stem consistently (strip '_voice' suffix without split for full base)
+    full_stem = Path(audio_prompt_path).stem.replace('_fixed', '').replace('_padded', '').replace('_resampled', '').replace('_ui_resampled', '')  # e.g., 'cs_coralyn_voice'
+    voice_stem = full_stem[:-6] if full_stem.endswith('_voice') else full_stem  # Strip '_voice' suffix (e.g., "cs_coralyn_voice" → "cs_coralyn")
+    if len(voice_stem) < 3:
+        voice_stem = full_stem  # Ensure full
+    logger.debug(f"Main: Derived voice_stem: '{voice_stem}' from path '{audio_prompt_path}'")  # FIXED: Added debug log
 
     if not text:
         logger.warning("No text – using dummy")
@@ -294,9 +301,9 @@ async def generate_audio(model, text: str, audio_prompt_path: Optional[str], exa
     logger.info(
         f"Parameters - temp: {temperature}, min_p: {min_p}, top_p: {top_p}, rep_penalty: {repetition_penalty}, cfg_weight: {cfgw}")
 
-    # In generate_audio, after if not text: ... else:
+    # FIXED: Use consistent voice_stem for params (full base, no split[0])
     original_text = text
-    text = pad_short_text(text, CONFIG.get_merged_audio_params(voice_name=Path(audio_prompt_path).stem.replace('_fixed', '').split('_')[0] if audio_prompt_path else 'default'))
+    text = pad_short_text(text, CONFIG.get_merged_audio_params(voice_name=voice_stem))  # Was split[0] → 'cs'; now 'cs_coralyn'
     logger.debug(
         f"TTS text: '{text}' (padded={len(text) > len(original_text) if 'original_text' in locals() else False})")
 
@@ -319,10 +326,10 @@ async def generate_audio(model, text: str, audio_prompt_path: Optional[str], exa
         logger.info(
             f"{hit_type} cache HIT: \"{text[:20]}\" ({hit_type.lower()}-match) for {Path(audio_prompt_path).stem} – skipping gen (uuid={cache_uuid}; reuse: {reuse_time_ms:.2f}ms)")
         logger.info(f"Reused {hit_type.lower()} audio: {wav_length:.2f}s in ~0s")
-        # Enqueue fuzzy...
+        # FIXED: Enqueue fuzzy with consistent voice_stem (matching query derivation)
         if audio_prompt_path:
             logger.debug(f"Enqueued for fuzzy enrich (HIT): \"{text[:20]}\" (norm stem={voice_stem})")
-            FUZZY_QUEUE.put((text, audio_reuse_path, voice_stem))
+            FUZZY_QUEUE.put((text, audio_reuse_path, voice_stem))  # Now uses full 'cs_coralyn'
         total_time_ms = (perf_counter_ns() - func_start_time) / 1_000_000
         logger.info(f"Full cycle: HIT in {total_time_ms:.2f}ms (infinite speed!)")
         return audio_reuse_path  # Str path (early return)
@@ -333,7 +340,7 @@ async def generate_audio(model, text: str, audio_prompt_path: Optional[str], exa
     prep_start = perf_counter_ns()
     valid_path = prepare_voice_and_conds(
         model, audio_prompt_path, cache_uuid, exaggeration, language_id,
-        enable_memory_cache, enable_disk_cache, device, dtype, sr, multilingual, voice_stem
+        enable_memory_cache, enable_disk_cache, device, dtype, sr, multilingual, voice_stem  # Pass consistent voice_stem
     )
     prep_time_ms = (perf_counter_ns() - prep_start) / 1_000_000
     logger.debug(f"Prep/conds: {prep_time_ms:.2f}ms")
@@ -374,8 +381,9 @@ async def generate_audio(model, text: str, audio_prompt_path: Optional[str], exa
         wav = torch.zeros(1, CONFIG.sr * 2, dtype=CONFIG.dtype, device=CONFIG.device)  # 2D silence
 
     # Post-gen timings/log (derive stem for voice-specific params)
-    stem = Path(audio_prompt_path).stem.replace('_fixed', '').split('_')[0] if audio_prompt_path else 'default'
-    merged_params = CONFIG.get_merged_audio_params(voice_name=stem)
+    # FIXED: Use consistent voice_stem for params (full base, no split[0])
+    stem = voice_stem  # Reuse the derived voice_stem
+    merged_params = CONFIG.get_merged_audio_params(voice_name=stem)  # Now 'cs_coralyn', not 'cs'
     post_start = perf_counter_ns()
     # FIXED: Ensure 2D input for post ([1, samples] mono)
     if wav.dim() == 1:
@@ -410,7 +418,8 @@ async def generate_audio(model, text: str, audio_prompt_path: Optional[str], exa
             wav_np = wav_np.squeeze(0)
         else:
             wav_np = np.mean(wav_np, axis=1 if wav_np.shape[1] > 1 else 0)  # Stereo to mono
-    logger.debug(f"Final wav_np: {wav_np.shape} (len={len(wav_np)})")
+
+    logger.debug(f"Final wav_np: {wav_np.shape} (len={len(wav_np)})" )
 
     # Fallback empty
     if len(wav_np) == 0:
@@ -436,7 +445,7 @@ async def generate_audio(model, text: str, audio_prompt_path: Optional[str], exa
 
     # Enqueue fuzzy (MISS only)
     if reuse_result is None and (valid_path or audio_prompt_path):
-        voice_stem = Path(valid_path or audio_prompt_path).stem.replace('_fixed', '').split('_')[0]
+        # FIXED: Enqueue fuzzy with consistent voice_stem (matching query derivation)
         logger.debug(f"Enqueued fuzzy MISS: \"{text[:20]}\" (stem={voice_stem})")
         FUZZY_QUEUE.put((text, wave_file, voice_stem))
 
@@ -451,4 +460,3 @@ async def generate_audio(model, text: str, audio_prompt_path: Optional[str], exa
     logger.info(f"MISS cycle: {total_time_ms/1000:.2f}s (reuse={reuse_time_ms:.0f}ms, prep={prep_time_ms:.0f}ms, gen={gen_time_s:.2f}s, post={post_time_ms:.0f}ms, save={save_time_ms:.0f}ms)")
 
     return wave_file  # Str path
-
