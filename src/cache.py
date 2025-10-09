@@ -429,16 +429,26 @@ class ConditionalsCacheManager:
         logger.info(f"Evicted {evicted} LRU conds")
         return evicted
 
-    def get_cache_stats(self):
-        with self._cache_lock:
-            disk_count = len(list(CACHE_DIR.glob("*.pt")))
-            return {
-                'memory_cache_size': len(self._memory_cache),
-                'current_loaded_key': self._current_loaded_cache_key,
-                'pending_disk_saves': len(self._disk_save_queue),
-                'memory_cache_keys': list(self._memory_cache.keys()),
-                'disk_files': disk_count
-            }
+    def get_cache_stats(self) -> Dict[str, Any]:
+        """Class method: Conditionals stats only (simple, locked; no external calls/merging – avoids recursion)."""
+        # Recursion guard (catches bind/self-call errors)
+        if hasattr(self, '_stats_guard_active'):
+            logger.error("Conds stats self-recursion detected – return empty")
+            return {'memory_cache_size': 0, 'current_loaded_key': None, 'pending_disk_saves': 0, 'memory_cache_keys': [], 'disk_files': 0}
+        self._stats_guard_active = True  # Temp flag
+        try:
+            with self._cache_lock:
+                disk_count = len(list(CACHE_DIR.glob("*.pt")))  # Quick glob
+                return {
+                    'memory_cache_size': len(self._memory_cache),
+                    'current_loaded_key': self._current_loaded_cache_key,
+                    'pending_disk_saves': len(self._disk_save_queue),
+                    'memory_cache_keys': list(self._memory_cache.keys())[:10],  # Limit for perf (full in debug)
+                    'disk_files': disk_count
+                }
+        finally:
+            if hasattr(self, '_stats_guard_active'):
+                del self._stats_guard_active  # Cleanup
 
 
 # Global manager
@@ -446,31 +456,130 @@ _cache_manager = ConditionalsCacheManager()
 
 
 class AudioCacheManager:
-    """Memory-only LRU cache for generated audio paths."""
+    """Memory-only LRU cache for generated audio paths with optional JSON persistence."""
 
-    def __init__(self):
+    def __init__(self, enable_disk_cache: bool = ENABLE_DISK_CACHE):
         self._audio_cache = {}
         self._lock = threading.RLock()
-        self._max_size = 100
+        self._max_size = CONFIG.get_value('max_cache_len', default=100)  # Configurable
+        self._enable_disk_cache = enable_disk_cache
+        self._dirty_keys = set()  # Track changes for batch save
+        self._last_save_time = 0  # Throttle timer (prevent flood)
+        if self._enable_disk_cache:
+            self._load_from_json()
 
     def get(self, key):
         with self._lock:
-            return self._audio_cache.get(key)
+            path = self._audio_cache.get(key)
+            if path:
+                path = Path(path) if isinstance(path, str) else path  # Ensure Path
+                if path.exists():
+                    logger.trace(f"Audio cache get HIT: {key[:8]}... → {path}")
+                    return str(path)  # Return str for compat (e.g., bridge_ui expects str path)
+                else:
+                    logger.debug(f"Audio cache path missing: {path} – evict")
+                    self._audio_cache.pop(key, None)  # Clean invalid
+            logger.trace(f"Audio cache MISS: {key[:8]}...")
+            return None
 
     def set(self, key, path):
+        if not path:
+            logger.warning(f"Set invalid path for {key[:8]}... – skipped")
+            return
+        # FIXED: Robust Path conversion (handle str from callers like str(save_wav))
+        if isinstance(path, str):
+            path = Path(path)
+        elif not isinstance(path, Path):
+            path = Path(str(path))  # Fallback
+        if not path.exists():
+            logger.warning(f"Set non-existent path for {key[:8]}...: {path} – skipped")
+            return
         with self._lock:
-            self._audio_cache[key] = path
+            self._audio_cache[key] = path  # Store as Path
+            if self._enable_disk_cache:
+                self._dirty_keys.add(key)
             if len(self._audio_cache) > self._max_size:
-                oldest = next(iter(self._audio_cache))
-                del self._audio_cache[oldest]
-                logger.debug(f"Evicted audio: {oldest}")
+                oldest_key = next(iter(self._audio_cache))
+                oldest_path = self._audio_cache.pop(oldest_key)
+                self._dirty_keys.discard(oldest_key)
+                logger.trace(f"Evicted oldest audio cache: {oldest_key[:8]}... ({oldest_path})")
+            # FIXED: Throttle async (check time + dirty; reduce spam on rapid sets like batch gen)
+            if self._enable_disk_cache and len(self._dirty_keys) >= 10:
+                now = time.time()
+                if now - self._last_save_time > 2.0:  # Min 2s between saves (anti-flood)
+                    self._last_save_time = now
+                    threading.Thread(target=self._async_save_if_dirty, daemon=True, name=f"CacheSave-{key[:8]}").start()
+                    logger.trace(f"Throttled async save queued: {len(self._dirty_keys)} dirty (time ok)")
 
     def clear(self):
         with self._lock:
             self._audio_cache.clear()
+            if self._enable_disk_cache:
+                self._dirty_keys.clear()
+                self._save_to_json(force_empty=True)  # Save cleared state
 
     def stats(self):
-        return {'audio_cache_size': len(self._audio_cache), 'max_size': self._max_size}
+        with self._lock:  # Safe count
+            return {'audio_cache_size': len(self._audio_cache), 'max_size': self._max_size, 'dirty': len(self._dirty_keys) if self._enable_disk_cache else 0}
+
+    def _load_from_json(self):
+        """Load audio cache from JSON on init (relative str → absolute Path)."""
+        cache_json = CACHE_AUDIO_DIR / "audio_cache.json"
+        if cache_json.exists():
+            try:
+                with open(cache_json, 'r') as f:
+                    data = json.load(f)
+                loaded = 0
+                with self._lock:
+                    for key, rel_str in data.items():
+                        abs_path = ROOT_DIR / rel_str  # str → Path
+                        if abs_path.exists():
+                            self._audio_cache[key] = abs_path  # Store Path
+                            loaded += 1
+                        else:
+                            logger.warning(f"Loaded invalid path for {key[:8]}...: {abs_path} – skipped")
+                logger.info(f"Loaded audio cache from JSON: {loaded}/{len(data)} entries (as Path objects)")
+            except (json.JSONDecodeError, OSError) as e:
+                logger.warning(f"Load audio cache JSON failed: {e} – fresh cache")
+                with self._lock:
+                    self._audio_cache.clear()
+
+    def _save_to_json(self, force_empty: bool = False):
+        """Save current audio cache to JSON (Path → relative str; skip invalids). FIXED: Handle str if any slip through."""
+        with self._lock:
+            if force_empty:
+                temp_cache = {}
+            else:
+                temp_cache = {}
+                for key, abs_path in self._audio_cache.items():
+                    abs_path = Path(abs_path) if isinstance(abs_path, str) else abs_path  # FIXED: Robust Path
+                    if not abs_path.exists():
+                        logger.debug(f"Save skip invalid path for {key[:8]}...: {abs_path}")
+                        continue
+                    try:
+                        rel_path = abs_path.relative_to(ROOT_DIR)
+                        temp_cache[key] = str(rel_path)  # str(rel_path) for JSON
+                    except ValueError as ve:
+                        logger.debug(f"Save skip non-relative path for {key[:8]}...: {abs_path} ({ve})")
+                        continue
+            cache_json = CACHE_AUDIO_DIR / "audio_cache.json"
+            try:
+                with open(cache_json, 'w') as f:
+                    json.dump(temp_cache, f, indent=2)
+                self._dirty_keys.clear()
+                logger.debug(f"Saved audio cache JSON: {len(temp_cache)} entries (dirty cleared; no str errors)")
+                self._last_save_time = time.time()  # Update throttle
+            except OSError as e:
+                logger.error(f"Save audio cache JSON failed: {e} – memory only")
+
+    def _async_save_if_dirty(self):
+        """Async batch save if dirty (throttled; FIXED: Lock + check to prevent overlap/spam)."""
+        time.sleep(1.0)  # Initial defer (1s)
+        with self._lock:  # FIXED: Lock to serialize with other ops (prevent concurrent saves)
+            if len(self._dirty_keys) < 5 or time.time() - self._last_save_time < 2.0:
+                logger.trace(f"Async save skipped: {len(self._dirty_keys)} dirty (throttle)")
+                return
+        self._save_to_json()  # Now safe (locked check passed)
 
 
 _audio_manager = AudioCacheManager()
@@ -556,10 +665,9 @@ def save_torchaudio_wav(wav_tensor, sr, audio_path, uuid):
     return path.resolve()
 
 
-def _get_or_cache_audio_info(stem: str = None, audio_path: str = None, force_refresh: bool = False) -> Optional[Tuple[int, int, int]]:
-    """Cached wrapper: Get info for stem/path; stem optional (extracts from path if None).
-    Backward-compatible: Works if called as _get_or_cache_audio_info(audio_path).
-    Always verify cache vs fresh info (invalidate on SR mismatch); log discrepancies."""
+def _get_or_cache_audio_info(stem: str = None, audio_path: str = None, force_refresh: bool = False) -> Optional[
+    Tuple[int, int, int]]:
+    """Cached wrapper: Get info for stem/path. IMPROVED: Disk JSON persistence (TTL 1hr); verifies vs fresh."""
     if not audio_path:
         return None
 
@@ -567,32 +675,65 @@ def _get_or_cache_audio_info(stem: str = None, audio_path: str = None, force_ref
     if stem is None:
         full_stem = Path(audio_path).stem.replace('_fixed', '')  # e.g., 'vayne_csvp_voice' → 'vayne_csvp_voice'
         split_stem = full_stem.split('_')
-        stem = split_stem[0] if len(split_stem) > 1 and len(split_stem[0]) >= 2 else full_stem  # Robust: min 2 chars, fallback full
+        stem = split_stem[0] if len(split_stem) > 1 and len(
+            split_stem[0]) >= 2 else full_stem  # Robust: min 2 chars, fallback full
 
-    # Compute fresh always for verify, or if force/invalid
-    fresh_info = _get_audio_info_robust(audio_path)
-    if not fresh_info:
-        logger.warning(f"Fresh info failed for {audio_path} – cannot cache/verify")
-        return None
+    # IMPROVED: Disk JSON path (persistent meta)
+    meta_path = Path(audio_path).with_suffix('.meta.json')
+    fresh_needed = force_refresh or not meta_path.exists()
 
-    # If cached, check vs fresh (invalidate on mismatch, esp SR/channels)
-    if not force_refresh and stem in _voice_info_cache:
-        cached_info = _voice_info_cache[stem]
-        if Path(audio_path).exists() and Path(audio_path).stat().st_size > 0:
-            if cached_info[:2] != fresh_info[:2]:  # SR + channels mismatch → stale cache
-                logger.warning(f"Cache invalid for {stem}: cached SR/ch={cached_info[:2]} vs fresh={fresh_info[:2]} – refresh")
-                force_refresh = True  # Proceed to update
-            else:
-                logger.trace(f"Info: Reused verified cached for '{stem}' (SR={cached_info[0]})")
-                return cached_info
-        else:
-            logger.trace(f"Info: Invalidated cache for '{stem}' (file issue)")
+    cached_info = None
+    if not fresh_needed:
+        try:
+            with open(meta_path, 'r') as f:
+                meta = json.load(f)
+            if meta.get('stem') == stem and meta.get('valid_until', 0) > time.time():  # TTL 1hr
+                cached_info = (meta['sr'], meta['channels'], meta['frames'])
+                logger.trace(f"Meta loaded from JSON: {audio_path} (cached for {stem})")
+        except (json.JSONDecodeError, KeyError, OSError) as e:
+            fresh_needed = True
+            logger.debug(f"Meta JSON invalid/missing for {audio_path} ({e}) – fresh probe")
 
-    # Update cache with fresh (if valid)
-    with _voice_info_lock:
-        _voice_info_cache[stem] = fresh_info
-    logger.debug(f"Info: Cached/updated for '{stem}': SR={fresh_info[0]}, ch={fresh_info[1]}, frames={fresh_info[2]}")
-    return fresh_info
+    # If no valid cache, compute fresh always for verify, or if force/invalid
+    if fresh_needed or cached_info is None:
+        fresh_info = _get_audio_info_robust(audio_path)
+        if not fresh_info:
+            logger.warning(f"Fresh info failed for {audio_path} – cannot cache/verify")
+            return None
+
+        # Verify vs cached if available (invalidate on mismatch, esp SR/channels)
+        if cached_info and cached_info[:2] != fresh_info[:2]:  # SR + channels mismatch → stale
+            logger.warning(
+                f"Cache invalid for {stem}: cached SR/ch={cached_info[:2]} vs fresh={fresh_info[:2]} – refresh")
+            cached_info = None  # Force update
+
+        # Update in-mem cache with fresh
+        # Update in-mem cache with fresh
+        with _voice_info_lock:
+            _voice_info_cache[stem] = fresh_info
+
+        # IMPROVED: Save to JSON (persistent lazy)
+        meta = {
+            'stem': stem,
+            'sr': fresh_info[0],
+            'channels': fresh_info[1],
+            'frames': fresh_info[2],
+            'valid_until': time.time() + 3600,  # 1hr TTL
+            'probed_at': datetime.datetime.now().isoformat()
+        }
+        try:
+            with open(meta_path, 'w') as f:
+                json.dump(meta, f)
+            logger.debug(f"Saved meta JSON: {audio_path} (info={fresh_info})")
+        except OSError as e:
+            logger.warning(f"Meta save failed for {audio_path}: {e}")
+
+        return fresh_info
+
+    # Use cached if valid
+    logger.trace(f"Info: Reused verified cached for '{stem}' (SR={cached_info[0]})")
+    return cached_info
+
 
 
 # Helper: Robust torchaudio info fetch (used everywhere; logs branch)
@@ -1393,11 +1534,37 @@ def is_cache_key_loaded(cache_key):
 
 
 def get_cache_stats() -> Dict[str, Any]:
-    from src.fuzzy_cache import FUZZY_AUDIO_DICT
-    cond_stats = _cache_manager.get_cache_stats()
+    """Global facade: Merge conditionals + audio + fuzzy stats (guarded, no recursion)."""
+    from src.fuzzy_cache import FUZZY_AUDIO_DICT, FUZZY_LOCK  # Safe import; fallback if missing
+
+    # Call class method safely (now conds-only, no self-loop)
+    try:
+        cond_stats = _cache_manager.get_cache_stats()  # Calls fixed class method (non-recursive)
+    except (RecursionError, AttributeError) as e:  # Guard expansions
+        logger.warning(f"Conds stats call failed ({e}) – fallback empty")
+        cond_stats = {'memory_cache_size': 0, 'current_loaded_key': None, 'pending_disk_saves': 0, 'memory_cache_keys': [], 'disk_files': 0}
+
+    # Audio manager stats (direct, no recursion)
     audio_stats = _audio_manager.stats()
-    fuzzy_total = sum(len(entries) for entries in FUZZY_AUDIO_DICT.values()) if FUZZY_AUDIO_DICT else 0  # NEW: Total entries (not stems)
-    return {**cond_stats, **audio_stats, 'fuzzy_size': fuzzy_total, 'fuzzy_stems': len(FUZZY_AUDIO_DICT)}  # Accurate
+
+    # Fuzzy stats (locked read, safe)
+    fuzzy_stems = 0
+    fuzzy_total = 0
+    try:
+        if 'FUZZY_AUDIO_DICT' in globals() and FUZZY_AUDIO_DICT:  # Safe check
+            with FUZZY_LOCK:
+                fuzzy_stems = len(FUZZY_AUDIO_DICT)
+                fuzzy_total = sum(len(entries) for entries in FUZZY_AUDIO_DICT.values())
+    except (NameError, AttributeError):
+        logger.debug("Fuzzy stats skipped (import/missing)")
+
+    # Merge (no self-calls; simple dicts)
+    return {
+        **cond_stats,
+        **audio_stats,
+        'fuzzy_size': fuzzy_total,
+        'fuzzy_stems': fuzzy_stems
+    }
 
 
 # Clears (merged; rooted paths)
@@ -1431,21 +1598,44 @@ def clear_cache_files():
     except Exception as e:
         logger.error(f"Clear cache failed: {e}")
 
-    # Clear memory/audio
+    # Clear memory caches (all managers)
     with _cache_manager._cache_lock:
         _cache_manager._memory_cache.clear()
         _cache_manager._current_loaded_cache_key = None
         _cache_manager._disk_save_queue.clear()
     with _voice_info_lock:
         _voice_info_cache.clear()
-        logger.debug("Cleared voice info cache")
+        logger.debug("Cleared voice info memory")
     with FUZZY_LOCK:
-        FUZZY_AUDIO_DICT.clear()
-        logger.debug("Cleared voice/info/fuzzy caches")
-        _fuzzy_save_counter = 0
+        if 'FUZZY_AUDIO_DICT' in globals():
+            FUZZY_AUDIO_DICT.clear()
+        logger.debug("Cleared fuzzy caches")
+        # Note: _fuzzy_save_counter reset if defined
     _audio_manager.clear()
-    logger.info(f"Cleared {removed_count} .pt + memory/audio")
+
+    # FIXED: Clear global audio cache JSON if exists (persistence cleanup)
+    if ENABLE_DISK_CACHE:
+        audio_cache_json = CACHE_AUDIO_DIR / "audio_cache.json"
+        if audio_cache_json.exists():
+            audio_cache_json.unlink()
+            logger.info(f"Cleared audio cache JSON: {audio_cache_json}")
+            removed_count += 1
+
+    # FIXED: Clear per-file meta JSONs (recursive in cache/output/voices dirs; persistence reset)
+    meta_pattern = "**/*.meta.json"
+    for dir_path in [CACHE_AUDIO_DIR, WAV_OUTPUT_DIR, voices_dir]:
+        for meta_file in dir_path.rglob(meta_pattern):
+            try:
+                meta_file.unlink()
+                removed_count += 1
+                logger.debug(f"Cleared meta JSON: {meta_file}")
+            except OSError as e:  # Skip locked/missing
+                logger.trace(f"Meta clear skip {meta_file}: {e}")
+                pass
+
+    logger.info(f"Cleared {removed_count} files (PTs + JSONs/meta + memory/audio/fuzzy)")
     return removed_count
+
 
 
 def clear_cache(voice: Optional[str] = None, full: bool = False):
@@ -1609,7 +1799,12 @@ def pre_extract_fixed_voices(model, device, dtype, top_voices: List[str] = ['nws
 def init_conditional_memory_cache(model=None, device=None, dtype=None, quiet: bool = False,
                                   pre_extract: bool = False, pre_validate_voices: bool = False) -> Tuple[bool, bool]:
     _load_voice_cache()  # Existing: Load persistent JSON
-    scan_local_voices(rebuild=False, use_content_hash=True)  # NEW: Scan locals to memory (SR-agnostic)
+    scan_local_voices(rebuild=False, use_content_hash=True)  # Uses meta JSON (persists probes)
+
+    # FIXED: Load audio cache JSON (global persistence for paths; keeps if ENABLE_DISK_CACHE=True)
+    if ENABLE_DISK_CACHE:
+        _audio_manager._enable_disk_cache = True
+        _audio_manager._load_from_json()  # Loads from "audio_cache.json"
 
     device = device or DEFAULT_DEVICE
     dtype = dtype or DEFAULT_DTYPE
@@ -1631,8 +1826,9 @@ def init_conditional_memory_cache(model=None, device=None, dtype=None, quiet: bo
     if quiet:
         logger.debug(f"Voices dir {voices_dir} has {len(available_voices)} files")
 
-    # Preload all .pt
+    # Preload all .pt (conditionals persistence)
     loaded = 0
+    total_pt = len(list(CACHE_DIR.glob("*.pt")))  # Pre-compute for log
     for pt_file in CACHE_DIR.glob("*.pt"):
         cache_key = pt_file.stem
         try:
@@ -1650,32 +1846,33 @@ def init_conditional_memory_cache(model=None, device=None, dtype=None, quiet: bo
             if not quiet:
                 logger.warning(f"Preload failed {pt_file}: {e}")
 
-    # Evict excess
+    # Evict excess (LRU for memory efficiency)
     if len(_cache_manager._memory_cache) > MAX_MEMORY_ENTRIES:
         excess = len(_cache_manager._memory_cache) - MAX_MEMORY_ENTRIES
         _cache_manager.evict_lru(excess)
         if not quiet:
             logger.info(f"Evicted {excess} excess after preload")
 
-    # Optional pre-extract (if enabled; skip if quiet/hang-prone) TODO review
+    # Optional pre-extract (if enabled; skip if quiet/hang-prone)
     # if pre_extract and model:
     #    pre_extract_fixed_voices(model, device, dtype)
 
-    # Optional pre-validate all voices (new: gains first-gen speedup; if enabled)
+    # Optional pre-validate all voices (uses meta for fast probes)
     pre_validate_count = 0
     if pre_validate_voices and model:
         pre_validate_count = pre_validate_all_voices(model, device, dtype)
 
-    # Compute totals/stats *after* all preloads (includes new conds if pre-validated)
-    total_pt = len(list(CACHE_DIR.glob('*.pt')))
-    stats = _cache_manager.get_cache_stats()
+    # FIXED: Use global guarded stats (merges conds/audio/fuzzy; no recursion)
+    stats = get_cache_stats()  # Fixed: Conds-only class + merge
 
-    # Log summary
+    # Log summary (includes persistence stats)
     if not quiet:
         logger.info(
-            f"Cache init: Memory={ENABLE_MEMORY_CACHE}, Disk={ENABLE_DISK_CACHE}, Loaded {loaded} from {total_pt} (memory: {stats['memory_cache_size']}, pre-valid: {pre_validate_count})")
+            f"Cache init: Memory={ENABLE_MEMORY_CACHE}, Disk={ENABLE_DISK_CACHE}, Loaded {loaded} conds from {total_pt} PTs "
+            f"(memory: {stats.get('memory_cache_size', 0)}, audio: {stats.get('audio_cache_size', 0)}, "
+            f"audio_dirty: {stats.get('dirty', 0)}, fuzzy: {stats.get('fuzzy_size', 0)} entries, "
+            f"pre-valid: {pre_validate_count})")
     return ENABLE_MEMORY_CACHE, ENABLE_DISK_CACHE
-
 
 
 # Parallel voice pre-validation (fix SR/pad/cache conds for all; optional, fast)
