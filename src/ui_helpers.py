@@ -112,7 +112,7 @@ def safe_to_str(val, default=''):
 # NEW: Prop types for JSON safety in init_load/refresh
 float_props = ['exaggeration', 'cfg_weight', 'temperature', 'min_p', 'top_p', 'repetition_penalty', 'speaking_rate', 'eq_gain_db', 'max_gain', 'target_max', 'noise_floor_db', 'trim_threshold_db', 'eq_cutoff_hz', 'fade_ms', 'notch_low', 'notch_high', 'notch_gain_db', 'notch_gain_db_for_stretch']
 int_props = ['max_new_tokens', 'min_new_tokens', 'max_cache_len']
-bool_props = ['enable_memory_cache', 'enable_disk_cache', 'enable_denoising', 'enable_pre_adjustment', 'enable_post_processing', 'enable_light_stretch', 'enable_smoothing', 'enable_spectral_gating', 'notch_enabled', 'hp_enabled', 'timings_enabled', 'enable_timing_logs', 'log_step_times']
+bool_props = ['enable_memory_cache', 'enable_disk_cache', 'enable_denoising', 'enable_pre_adjustment', 'enable_post_processing', 'enable_light_stretch', 'enable_smoothing', 'enable_spectral_gating', 'notch_enabled', 'hp_enabled']
 str_props = ['normalize_method', 'logging_level']
 
 
@@ -246,10 +246,6 @@ def handle_global_flags_change(mem_cache, disk_cache, denoise, pre_adjust=None, 
             CONFIG.flags['notch_enabled'] = notch
         if hp is not None:
             CONFIG.flags['hp_enabled'] = hp
-        if timings is not None:
-            CONFIG.flags['timings_enabled'] = timings
-        if timing_logs is not None:
-            CONFIG.flags['enable_timing_logs'] = timing_logs
         if step_times is not None:
             CONFIG.flags['log_step_times'] = step_times
         # Sync to instance

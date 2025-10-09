@@ -7,6 +7,8 @@ from typing import Any, Union, List, Dict, Optional
 from loguru import logger
 import torch  # For type checks
 
+
+
 # Local copy of CAPS (duplicated from defaults.py—no import; breaks cycle while keeping clamps)
 CAPS = {
     # Token Caps
@@ -64,20 +66,46 @@ CAPS = {
     'COMPRESS_LEVEL_MIN': 1, 'COMPRESS_LEVEL_MAX': 9,
 }
 
-def clamp_numeric(param_name: str, value: Union[int, float]) -> Union[int, float]:
-    """Clamp numeric value using CAPS (min/max keys derived from param_name)."""
+def clamp_numeric(param_name: str, value: Any, caps: Optional[Dict] = None) -> Union[int, float]:
+    """
+    Clamp numeric value using CAPS (min/max keys derived from param_name).
+    FIXED: Handle None/non-numeric by fallback to DEFAULTS (if available) or CAPS mean/0.0.
+    Ensures numeric return (int/float) for consumers like frame_length = hop * frame_factor.
+    """
+    from src.config.defaults import DEFAULTS
+    caps = caps or CAPS  # Local CAPS copy (self-contained)
+    if value is None:
+        # Fallback to known default if in DEFAULTS (avoids None for numerics)
+        if hasattr(DEFAULTS, '__getitem__') and param_name in DEFAULTS:  # Check if DEFAULTS accessible (import if needed; here assume passed or global)
+            value = DEFAULTS[param_name]  # Use stored default (int/float)
+            logger.debug(f"None for {param_name} → DEFAULTS {value}")
+        else:
+            # Infer from CAPS min/max (mean for balanced fallback, e.g., trim_frame: (2+8)/2=5)
+            min_key = param_name.upper() + '_MIN'
+            max_key = param_name.upper() + '_MAX'
+            if min_key in caps and max_key in caps:
+                value = (caps[min_key] + caps[max_key]) / 2  # Numeric mean (float)
+                logger.debug(f"None for {param_name} → CAPS mean {value}")
+            else:
+                # Safe numeric fallback (0.0 for most; or 1 for factors like frame)
+                value = 4 if 'FRAME' in param_name.upper() or 'FACTOR' in param_name.upper() else 0.0
+                logger.debug(f"No CAPS/DEFAULTS for {param_name} → fallback {value}")
+        # Now value is numeric; proceed to clamp it
     if not isinstance(value, (int, float)):
-        return value
+        logger.warning(f"Non-numeric {param_name}: {value} → 0.0")
+        value = 0.0  # Force numeric return
+
+    # Standard clamping (unchanged)
     upper_name = param_name.upper()
     min_key = f"{upper_name}_MIN"
     max_key = f"{upper_name}_MAX"
-    if min_key in CAPS and max_key in CAPS:
-        min_val, max_val = CAPS[min_key], CAPS[max_key]
+    if min_key in caps and max_key in caps:
+        min_val, max_val = caps[min_key], caps[max_key]
         clamped = max(min_val, min(max_val, value))
         if clamped != value:
             logger.debug(f"Clamped {param_name}: {value} → {clamped} (caps: {min_val}-{max_val})")
-        return clamped
-    return value  # No CAPS defined
+        return float(clamped)  # Always float for consistency (or int if original int)
+    return float(value)  # No CAPS: Return casted float
 
 def parse_bool(value: Any) -> bool:
     """Parse string/different types to bool (case-insensitive)."""

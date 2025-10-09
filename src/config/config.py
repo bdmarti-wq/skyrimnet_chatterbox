@@ -650,27 +650,6 @@ class Config:
             self._invalidate_merged_cache()
             self._global_hash = None
 
-    @property
-    def timings_enabled(self):
-        return self._flags.get('timings_enabled', DEFAULTS.get('timings_enabled', False))
-
-    @timings_enabled.setter
-    def timings_enabled(self, value):
-        if self._validate_set('timings_enabled', value):
-            self._flags['timings_enabled'] = parse_bool(value)
-            self._invalidate_merged_cache()
-            self._global_hash = None
-
-    @property
-    def auto_reset_timings(self):
-        return self._flags.get('auto_reset_timings', DEFAULTS.get('auto_reset_timings', True))
-
-    @auto_reset_timings.setter
-    def auto_reset_timings(self, value):
-        if self._validate_set('auto_reset_timings', value):
-            self._flags['auto_reset_timings'] = parse_bool(value)
-            self._invalidate_merged_cache()
-            self._global_hash = None
 
     @property
     def fuzzy_cache_limit(self):

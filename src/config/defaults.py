@@ -75,9 +75,7 @@ DEFAULTS = {
     'enable_memory_cache': True,
     'force_local_refs': True,
     'auto_update_refs': True,
-    'timings_enabled': False,
-    'auto_reset_timings': False,
-    'enable_post_resample': False,
+     'enable_post_resample': False,
     'enable_post_jit_gain': True,
     'enable_post_voice_processing': True,
     'enable_deferred_cleanup': True,
@@ -104,6 +102,7 @@ DEFAULTS = {
     'fade_ms_trail': 50,                 # Longer for breath trails (use if fade_ms=None)
     'trailing_silence_db': -45.0,        # Cut post-rate trails below this (new step)
     'fuzzy_artifact_threshold_hz': 7000.0,  # For is_artifact_laden
+    'trim_frame_length_factor': 4,  # Default frames for trim (hop * 4 = 1024; CAPS 2-8)
 
     # Strings (adjustable defaults)
     'logging_level': 'INFO',
