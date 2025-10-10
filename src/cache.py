@@ -35,7 +35,7 @@ from collections import OrderedDict
 from typing import Dict, Any, Optional, Tuple, Union, List
 from loguru import logger  # Assume available; fallback to print if not
 import threading  # Ensure imported (likely already is)
-from .config import CONFIG
+from .config import get_config, get_config_value
 from src.audio_utils import is_artifact_laden  # Import for artifact check
 import hashlib
 from threading import Thread
@@ -47,6 +47,8 @@ warnings.filterwarnings('ignore', message=r'.*torchaudio._backend.utils.info.*',
 warnings.filterwarnings('ignore', message=r'.*deprecated.*torchaudio.*', category=UserWarning, module='torchaudio')
 warnings.filterwarnings('ignore', category=UserWarning, module='torchaudio')  # Broad fallback
 warnings.filterwarnings('ignore', category=DeprecationWarning, module='torchaudio')
+
+CONFIG = get_config()
 
 # Anchor paths to project root (skyrimnet_chatterbox/) for relocatable code
 ROOT_DIR = Path(__file__).parent.parent  # From src/ -> skyrimnet_chatterbox/
@@ -69,14 +71,14 @@ MAX_RECURSE = 3 # Reconstruction recursion limit
 DEFAULT_DEVICE = "cuda"  # Fallback
 DEFAULT_DTYPE = torch.bfloat16  # TODO was float32 test and review
 MODEL_SR = 24000  # Assume standard for TTS
-MAX_MEMORY_ENTRIES = CONFIG.get_value('max_memory_entries', default=100)
-ENABLE_MEMORY_CACHE = CONFIG.get_value('enable_memory_cache', default=True)
-ENABLE_DISK_CACHE = CONFIG.get_value('enable_disk_cache', default=True)
+MAX_MEMORY_ENTRIES = get_config_value('max_memory_entries', default=100)
+ENABLE_MEMORY_CACHE = get_config_value('enable_memory_cache', default=True)
+ENABLE_DISK_CACHE = get_config_value('enable_disk_cache', default=True)
 ENABLE_THREADED_SAVES = True  # Hardcode or add to CONFIG if needed
-MAX_QUEUE = CONFIG.get_value('save_queue_max', default=20)
+MAX_QUEUE = get_config_value('save_queue_max', default=20)
 
-COMPRESS_PT_SAVES = CONFIG.get_value('compress_pt_saves', default=True)
-COMPRESS_LEVEL = CONFIG.get_value('compress_level', default=6)
+COMPRESS_PT_SAVES = get_config_value('compress_pt_saves', default=True) #TODO
+COMPRESS_LEVEL = get_config_value('compress_level', default=6) #TODO
 
 # Global voice cache (stem → dict: fixed_path, file_hash, conds_key)
 _voice_cache_lock = threading.RLock()
@@ -461,7 +463,7 @@ class AudioCacheManager:
     def __init__(self, enable_disk_cache: bool = ENABLE_DISK_CACHE):
         self._audio_cache = {}
         self._lock = threading.RLock()
-        self._max_size = CONFIG.get_value('max_cache_len', default=100)  # Configurable
+        self._max_size = get_config_value('max_cache_len', default=100)  # Configurable
         self._enable_disk_cache = enable_disk_cache
         self._dirty_keys = set()  # Track changes for batch save
         self._last_save_time = 0  # Throttle timer (prevent flood)
@@ -802,7 +804,7 @@ def validate_voice_path(audio_path: str, stem: str = None, force_refresh: bool =
     is_voice_ref = ('voices' in str(audio_path).lower() or str(Path(audio_path).parent).endswith('voices')) or \
                     any(suffix in Path(audio_path).stem for suffix in ['_fixed_new', '_padded', '_resampled'])
     if not is_voice_ref:  # Only check non-refs (e.g., output_temp gens; refs/Skyrim voices skipped)
-        if CONFIG.get_value('fuzzy_artifact_purge_enable', default=True):
+        if get_config_value('fuzzy_artifact_purge_enable', default=True):
             if is_artifact_laden(audio_path):
                 logger.warning(f"Artifact detected in {audio_path} (centroid high/ratio high) – invalid for use (purge if gen output)")
                 return False, "artifacts_detected"
@@ -812,8 +814,8 @@ def validate_voice_path(audio_path: str, stem: str = None, force_refresh: bool =
     else:
         logger.trace(f"Skipped artifact check for ref: {audio_path} (normal Skyrim voice; is_voice_ref={is_voice_ref})")
 
-    if duration < CONFIG.get_value('min_voice_duration', default=0.5):  # Assume MIN_VOICE_DURATION=0.5s configurable
-        logger.warning(f"Too short: {duration:.2f}s < {CONFIG.get_value('min_voice_duration', default=0.5)}s")
+    if duration < get_config_value('min_voice_duration', default=0.5):  # Assume MIN_VOICE_DURATION=0.5s configurable
+        logger.warning(f"Too short: {duration:.2f}s < {get_config_value('min_voice_duration', default=0.5)}s")
         return False, f"Too short ({duration:.2f}s)"
 
     logger.debug(f"Valid path: {audio_path} (dur={duration:.2f}s)")
@@ -864,8 +866,8 @@ def _resample_if_needed(waveform: torch.Tensor, load_sr: int, model_sr: int, aud
 # New Helper: Pad if needed (extracted; testable: waveform/path → padded_waveform/bool)
 def _pad_if_needed(waveform: torch.Tensor, audio_path: str, model_sr: int, enable_pre_adjustment: bool = False) -> torch.Tensor:
     """Pad waveform for stability/quality (reflect mode); no out_path dependency – in-mem only. FIXED: Required args handled; return tensor."""
-    hop_length = CONFIG.get_value('hop_length', default=256)
-    n_fft = CONFIG.get_value('n_fft', default=2048)
+    hop_length = get_config_value('hop_length', default=256)
+    n_fft = get_config_value('n_fft', default=2048)
 
     # Step 1: Est min-pad based on stability (est tokens * hop_length)
     est_tokens = len(waveform) / hop_length  # Expected mel frames
@@ -1026,7 +1028,7 @@ def check_and_update_ref(audio_path: str, exaggeration: float = 0.5, model_sr: i
     - After save, update _local_voice_cache for future dedup.
     """
     if enable_pre_adjustment is None:
-        enable_pre_adjustment = CONFIG.get_value('enable_pre_adjustment', default=True)  # Default True as per logs
+        enable_pre_adjustment = get_config_value('enable_pre_adjustment', default=True)  # Default True as per logs
 
     stem = _normalize_stem(audio_path, stem)
 
@@ -1086,10 +1088,10 @@ def check_and_update_ref(audio_path: str, exaggeration: float = 0.5, model_sr: i
     # Pad if enabled (gated for quality)
     if enable_pre_adjustment:
         from torchaudio.transforms import MelSpectrogram
-        mel_transform = MelSpectrogram(sample_rate=model_sr, n_fft=CONFIG.get_value('n_fft', default=2048),
-                                       hop_length=CONFIG.get_value('hop_length', default=256), n_mels=80)
+        mel_transform = MelSpectrogram(sample_rate=model_sr, n_fft=get_config_value('n_fft', default=2048),
+                                       hop_length=get_config_value('hop_length', default=256), n_mels=80)
         mel = mel_transform(waveform.unsqueeze(0))
-        waveform = adjust_audio_length_torch(waveform, model_sr, mel.shape, CONFIG.get_value('hop_length', default=256),
+        waveform = adjust_audio_length_torch(waveform, model_sr, mel.shape, get_config_value('hop_length', default=256),
                                              enable_pre_adjustment, stem)
         logger.info(f"Pad applied for {stem}: {len(waveform)} samples (enable_pre={enable_pre_adjustment})")
     else:

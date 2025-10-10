@@ -92,11 +92,11 @@ class ModelManager:
     def load_model(self, model_type: Optional[str] = None, *args, **kwargs) -> bool:
         """Load model (lazy; use multilingual if flag set). Returns True if loaded/success.
         FIX: Lazy CONFIG import/access (breaks cycle)."""
-        from .config import CONFIG  # Lazy import (inside method; after config.py init)
+        from .config import get_config_value  # Lazy import (inside method; after config.py init)
         instance = self.get_instance()
-        model_type = model_type or ('multilingual' if CONFIG.multilingual else 'english')
-        device = CONFIG.device
-        dtype = CONFIG.dtype
+        model_type = model_type or ('multilingual' if get_config_value('multilingual') else 'english')
+        device = get_config_value('device','cuda')
+        dtype = get_config_value('dtype',torch.bfloat16)
         if instance._state.is_loaded(model_type):
             logger.info(f"Model '{model_type}' already loaded")
             return True
@@ -106,10 +106,10 @@ class ModelManager:
     def get_model(self, model_type: Optional[str] = None) -> Optional[Any]:
         """Get loaded model (lazy-loads if None matching type).
         FIX: Lazy CONFIG import/access."""
-        from .config import CONFIG  # Lazy (inside method)
+        from .config import get_config_value  # Lazy (inside method)
         instance = self.get_instance()
         if model_type is None:
-            model_type = 'multilingual' if CONFIG.multilingual else 'english'
+            model_type = 'multilingual' if get_config_value('multilingual') else 'english'
         if not instance._state.is_loaded(model_type):
             success = instance.load_model(model_type)
             if not success:
@@ -119,9 +119,9 @@ class ModelManager:
 
     def is_loaded(self, model_type: Optional[str] = None) -> bool:
         """Check if model loaded. FIX: Lazy CONFIG."""
-        from .config import CONFIG  # Lazy
+        from .config import get_config_value  # Lazy
         instance = self.get_instance()
-        model_type = model_type or ('multilingual' if CONFIG.multilingual else 'english')
+        model_type = model_type or ('multilingual' if get_config_value('multilingual') else 'english')
         return instance._state.is_loaded(model_type)
 
     def clear(self):
@@ -132,23 +132,23 @@ class ModelManager:
     @classmethod
     def reload_model(cls, model_type: Optional[str] = None):
         """Reload: Clear + load fresh. FIX: Lazy CONFIG."""
-        from .config import CONFIG  # Lazy
+        from .config import get_config_value  # Lazy
         instance = cls.get_instance()
         instance.clear()
-        return instance.load_model(model_type or ('multilingual' if CONFIG.multilingual else 'english'))
+        return instance.load_model(model_type or ('multilingual' if get_config_value('multilingual') else 'english'))
 
 
 # Backward Compat: Facades to Singleton (use these if old code calls load_model() directly)
 def load_model(model_type: Optional[str] = None, *args, **kwargs):
     """Old API: Load via singleton. FIX: Lazy CONFIG."""
-    from .config import CONFIG  # Lazy
-    return ModelManager.get_instance().load_model(model_type or ('multilingual' if CONFIG.multilingual else 'english'), *args, **kwargs)
+    from .config import get_config_value  # Lazy
+    return ModelManager.get_instance().load_model(model_type or ('multilingual' if get_config_value('multilingual') else 'english'), *args, **kwargs)
 
 
 def get_model(model_type: Optional[str] = None):
     """Old API: Get via singleton. FIX: Lazy CONFIG."""
-    from .config import CONFIG  # Lazy
-    return ModelManager.get_instance().get_model(model_type or ('multilingual' if CONFIG.multilingual else 'english'))
+    from .config import get_config_value  # Lazy
+    return ModelManager.get_instance().get_model(model_type or ('multilingual' if get_config_value('multilingual') else 'english'))
 
 
 def clear_model():

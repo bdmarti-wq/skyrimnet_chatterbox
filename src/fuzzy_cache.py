@@ -15,7 +15,7 @@ from pathlib import Path
 
 from loguru import logger
 
-from .config import CONFIG
+from .config import get_config, get_config_value
 from .audio_utils import is_artifact_laden
 from .cache import ROOT_DIR, CACHE_AUDIO_DIR  # Import shared paths only
 
@@ -26,9 +26,11 @@ FUZZY_AUDIO_DICT = {}  # {stem: {norm_key: entry}}
 FUZZY_SAVE_INTERVAL = 5.0
 _last_fuzzy_save = 0
 _fuzzy_save_counter = 0  # NEW: Define missing global
-MAX_INDEX_SIZE = CONFIG.get_value('fuzzy_index_size', default=1000)  # For fuzzy per-stem
-ENABLE_FUZZY = CONFIG.get_value('fuzzy_enable', default=True)  # New: Toggle fuzzy
-ENABLE_ARTIFACT_PURGE = CONFIG.get_value('fuzzy_artifact_purge_enable', default=True)  # NEW: Config toggle for purging
+
+get_config()
+MAX_INDEX_SIZE = get_config_value('fuzzy_index_size', default=1000)  # For fuzzy per-stem
+ENABLE_FUZZY = get_config_value('fuzzy_enable', default=True)  # New: Toggle fuzzy
+ENABLE_ARTIFACT_PURGE = get_config_value('fuzzy_artifact_purge_enable', default=True)  # NEW: Config toggle for purging
 
 
 
@@ -94,10 +96,10 @@ def try_fuzzy_audio_cache(audio_path: str = None, text_input: str = None, exagge
             stem = candidate_stem  # Use full if valid
             logger.debug(f"Fuzzy: Extended short stem '{old_stem}' to '{stem}' from path")
 
-    threshold = threshold or CONFIG.get_value('fuzzy_threshold', default=0.75)
+    threshold = threshold or get_config_value('fuzzy_threshold', default=0.75)
 
     # Detect swap: If text_input short/looks like stem (e.g., 'dlc1seranavoice'), warn + auto-swap
-    min_length = CONFIG.get_value('fuzzy_min_length', default=3)
+    min_length = get_config_value('fuzzy_min_length', default=3)
     if len(text_input.strip()) < 10 and re.match(r'^[a-z0-9_]+(voice|maid|npc)?$',
                                                  text_input.lower()):  # Heuristic: Looks like stem
         logger.warning(
@@ -139,9 +141,9 @@ def try_fuzzy_audio_cache(audio_path: str = None, text_input: str = None, exagge
             logger.debug(f"Fuzzy MISS early: Normalized text too short ('{clean_text}')")
         return None
 
-    boost_words = CONFIG.get_value('fuzzy_boost_words',
+    boost_words = get_config_value('fuzzy_boost_words',
                                    default=['ahh', 'mmm', 'ooh', 'throbb', 'moan', 'gasp', 'oh', 'fuck', 'yes', 'aah', 'gods'])  # Or CONFIG
-    boost_amount = CONFIG.get_value('fuzzy_boost_amount', default=0.15)
+    boost_amount = get_config_value('fuzzy_boost_amount', default=0.15)
 
     for entry in candidates:
         clean_entry = re.sub(r'[^\w\s]', '', entry['orig_text'].lower()).strip()
@@ -168,7 +170,7 @@ def try_fuzzy_audio_cache(audio_path: str = None, text_input: str = None, exagge
     if best_sim >= threshold and best_path:
         # NEW: Validate HIT for artifacts (purge if bad; fallback MISS)
         if ENABLE_ARTIFACT_PURGE:
-            artifact_threshold = CONFIG.get_value('fuzzy_artifact_threshold_hz', default=8000.0)
+            artifact_threshold = get_config_value('fuzzy_artifact_threshold_hz', default=8000.0)
             if is_artifact_laden(best_path, threshold_hz=artifact_threshold):
                 logger.warning(
                     f"Fuzzy HIT invalid: Artifacts in {best_path} (centroid >{artifact_threshold}Hz) – purging entry and MISS fallback")
@@ -217,7 +219,7 @@ def _save_fuzzy_audio_cache(save_all: bool = False):
         # NEW: Pre-save purge (validate paths + artifacts; optional but ensures clean saves)
         purged_count = 0
         if ENABLE_ARTIFACT_PURGE:
-            artifact_threshold = CONFIG.get_value('fuzzy_artifact_threshold_hz', default=8000.0)
+            artifact_threshold = get_config_value('fuzzy_artifact_threshold_hz', default=8000.0)
             for stem in list(FUZZY_AUDIO_DICT):
                 for norm_key in list(FUZZY_AUDIO_DICT[stem]):
                     entry = FUZZY_AUDIO_DICT[stem][norm_key]
@@ -289,7 +291,7 @@ def load_fuzzy_cache():
             total_entries = 0
             purged_count = 0
             if ENABLE_ARTIFACT_PURGE:
-                artifact_threshold = CONFIG.get_value('fuzzy_artifact_threshold_hz', default=8000.0)
+                artifact_threshold = get_config_value('fuzzy_artifact_threshold_hz', default=8000.0)
                 logger.info(f"Loading fuzzy cache with artifact purge (threshold={artifact_threshold}Hz)")
 
             for stem, stem_entries in data.items():
@@ -345,7 +347,7 @@ def _background_index_worker():
         try:
             text, wav_path, voice_stem = FUZZY_QUEUE.get(timeout=1)
             orig_text = text
-            min_length = CONFIG.get_value('fuzzy_min_length', default=3)
+            min_length = get_config_value('app_config.globals.fuzzy_min_length', default=3)
             if len(orig_text.strip()) < min_length:  # Optional: Skip indexing very short (e.g., "a" noise)
                 logger.debug(f"Skipped indexing short text (<{min_length}): {orig_text[:10]}...")
                 FUZZY_QUEUE.task_done()  # Clean up queue
@@ -353,15 +355,15 @@ def _background_index_worker():
 
             # Pre-index check for artifacts (skip bad WAVs; don't cache chirpy gens)
             if ENABLE_ARTIFACT_PURGE and is_artifact_laden(wav_path):
-                artifact_threshold = CONFIG.get_value('fuzzy_artifact_threshold_hz', default=8000.0)
+                artifact_threshold = get_config_value('fuzzy_artifact_threshold_hz', default=8000.0)
                 logger.warning(
                     f"Skip fuzzy index: Artifacts in {wav_path} (centroid >{artifact_threshold}Hz) for '{orig_text[:20]}' (stem: {voice_stem})")
                 FUZZY_QUEUE.task_done()
                 continue
 
             norm_key = normalize_text(text)
-            boost_words = CONFIG.get_value('fuzzy_boost_words', default=['ahh', 'mmm', 'ooh', 'throbb', 'moan', 'gasp'])
-            boost_amount = CONFIG.get_value('fuzzy_boost_amount', default=0.1)
+            boost_words = get_config_value('fuzzy_boost_words', default=['ahh', 'mmm', 'ooh', 'throbb', 'moan', 'gasp'])
+            boost_amount = get_config_value('fuzzy_boost_amount', default=0.1)
             clean_text = re.sub(r'[^\w\s]', '', orig_text.lower())
             sim_boost = 0.0
             if boost_amount > 0 and boost_words:

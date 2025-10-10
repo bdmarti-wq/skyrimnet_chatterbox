@@ -9,10 +9,8 @@ from loguru import logger
 from pathlib import Path
 
 # CONFIG singleton
-from src.config import CONFIG, ENABLE_DISK_CACHE
-from src.cache import ENABLE_MEMORY_CACHE
-from src.model import load_model
-
+from src.config import get_config, get_config_value, CONFIG
+from src.model import get_model
 
 # ui_helpers (full: safe_*, handlers, stub_wav_path exclusive for fallbacks)
 from src.ui_helpers import (
@@ -39,13 +37,17 @@ warnings.filterwarnings("ignore", category=UserWarning, module="torchaudio")
 warnings.filterwarnings("ignore", message=r"Reference mel length is not equal to 2 \* reference token length\.", category=UserWarning)
 warnings.filterwarnings("ignore", message="torchaudio._backend.utils.info has been deprecated")  # Suppress stub_wav_path warning
 
+# make sure config and model are loaded
+get_config()
+get_model()
+
 def generate_audio_test(model, text, language_id="en", audio_prompt_path=None, exaggeration=0.5, temperature=0.8, seed_num=0,
              cfgw=0, min_p=0.05, top_p=1.0, repetition_penalty=1.2, cache_uuid=0):
     """
     UI shell: Keeps server-compatible sig. Minimal setup, delegates to generate_audio.
     """
     if model is None:
-        model = load_model()
+        model = get_model()
 
     if not text:
         logger.warning("No text provided – returning empty")
@@ -62,7 +64,7 @@ def generate_audio_test(model, text, language_id="en", audio_prompt_path=None, e
         float(exaggeration), int(cache_uuid),
         float(temperature), float(cfgw), float(min_p), float(top_p), float(repetition_penalty),
         language_id, int(seed_num),
-        ENABLE_MEMORY_CACHE, ENABLE_DISK_CACHE
+        get_config_value('enable_memory_cache', True), get_config_value('enable_disk_cache', True)
     )
     return result
 
@@ -71,19 +73,20 @@ def generate_audio_test(model, text, language_id="en", audio_prompt_path=None, e
 # Tab Load Functions (lazy: CONFIG direct, no State – user clicks "Load/Refresh" to populate)
 def load_test_tab():
     """Load Voice Test tab components from CONFIG (lazy on btn click)."""
-    voice_choices = CONFIG.get_all_voices() or ['default']
+    config = get_config()
+    voice_choices = config.get_all_voices() or ['default']
     if 'default' not in voice_choices:
         voice_choices.append('default')
     test_text_value = "Testing shared config voice parameters."
     params = {
-        'speaking_rate': CONFIG.get_value('speaking_rate', 1.0),
-        'eq_gain_db': CONFIG.get_value('eq_gain_db', -8.0),
-        'max_gain': CONFIG.get_value('max_gain', 2.0),
-        'target_max': CONFIG.get_value('target_max', 0.6),
-        'noise_floor_db': CONFIG.get_value('noise_floor_db', -30.0),
-        'trim_threshold_db': CONFIG.get_value('trim_threshold_db', -28.0),
-        'notch_enabled': CONFIG.get_value('notch_enabled', True),
-        'hp_enabled': CONFIG.get_value('hp_enabled', True),
+        'speaking_rate': get_config_value('speaking_rate', 1.0),
+        'eq_gain_db': get_config_value('eq_gain_db', -8.0),
+        'max_gain': get_config_value('max_gain', 2.0),
+        'target_max': get_config_value('target_max', 0.6),
+        'noise_floor_db': get_config_value('noise_floor_db', -30.0),
+        'trim_threshold_db': get_config_value('trim_threshold_db', -28.0),
+        'notch_enabled': get_config_value('notch_enabled', True),
+        'hp_enabled': get_config_value('hp_enabled', True),
     }
     test_params = {"Loaded defaults": params}  # Sample dict
     test_status_value = "Values loaded from CONFIG – test with custom params if needed."
@@ -98,26 +101,27 @@ def load_test_tab():
     )
 
 def load_editor_tab():
+    config = get_config()
     """Load Voice Editor tab from CONFIG (lazy)."""
-    voice_choices = CONFIG.get_all_voices() or ['default']
+    voice_choices = config.get_all_voices() or ['default']
     if 'default' not in voice_choices:
         voice_choices.append('default')
     # Defaults from CONFIG (global, as voice-specific needs select first)
     params = {
-        'speaking_rate': CONFIG.get_value('speaking_rate', 1.0),
-        'eq_gain_db': CONFIG.get_value('eq_gain_db', -8.0),
-        'max_gain': CONFIG.get_value('max_gain', 2.0),
-        'target_max': CONFIG.get_value('target_max', 0.6),
-        'noise_floor_db': CONFIG.get_value('noise_floor_db', -30.0),
-        'trim_threshold_db': CONFIG.get_value('trim_threshold_db', -28.0),
-        'temperature': CONFIG.get_value('temperature', 0.65),
-        'exaggeration': CONFIG.get_value('exaggeration', 1.0),
-        'cfg_weight': CONFIG.get_value('cfg_weight', 0.45),
-        'min_p': CONFIG.get_value('min_p', 0.1),
-        'top_p': CONFIG.get_value('top_p', 1.0),
-        'repetition_penalty': CONFIG.get_value('repetition_penalty', 1.5),
-        'notch_enabled': CONFIG.get_value('notch_enabled', True),
-        'hp_enabled': CONFIG.get_value('hp_enabled', True),
+        'speaking_rate': get_config_value('speaking_rate', 1.0),
+        'eq_gain_db': get_config_value('eq_gain_db', -8.0),
+        'max_gain': get_config_value('max_gain', 2.0),
+        'target_max': get_config_value('target_max', 0.6),
+        'noise_floor_db': get_config_value('noise_floor_db', -30.0),
+        'trim_threshold_db': get_config_value('trim_threshold_db', -28.0),
+        'temperature': get_config_value('temperature', 0.65),
+        'exaggeration': get_config_value('exaggeration', 1.0),
+        'cfg_weight': get_config_value('cfg_weight', 0.45),
+        'min_p': get_config_value('min_p', 0.1),
+        'top_p': get_config_value('top_p', 1.0),
+        'repetition_penalty': get_config_value('repetition_penalty', 1.5),
+        'notch_enabled': get_config_value('notch_enabled', True),
+        'hp_enabled': get_config_value('hp_enabled', True),
     }
     voice_info_md = "Select a voice and click Load to edit specific params (globals shown now)."
     voice_status = "Ready – load voice-specific values."
@@ -134,32 +138,32 @@ def load_editor_tab():
 def load_global_tab():
     """Load Global Config tab from CONFIG (lazy)."""
     global_dict = {
-        'speaking_rate': safe_to_float(CONFIG.get_value('speaking_rate', 1.0)),
-        'eq_gain_db': safe_to_float(CONFIG.get_value('eq_gain_db', -8.0)),
-        'max_gain': safe_to_float(CONFIG.get_value('max_gain', 2.0)),
-        'target_max': safe_to_float(CONFIG.get_value('target_max', 0.6)),
-        'noise_floor_db': safe_to_float(CONFIG.get_value('noise_floor_db', -30.0)),
-        'trim_threshold_db': safe_to_float(CONFIG.get_value('trim_threshold_db', -28.0)),
-        'eq_cutoff_hz': safe_to_float(CONFIG.get_value('eq_cutoff_hz', 300.0)),
-        'fade_ms': safe_to_float(CONFIG.get_value('fade_ms', 50.0)),
-        'notch_low': safe_to_float(CONFIG.get_value('notch_low', 100.0)),
-        'notch_high': safe_to_float(CONFIG.get_value('notch_high', 5000.0)),
-        'notch_gain_db': safe_to_float(CONFIG.get_value('notch_gain_db', -20.0)),
-        'notch_gain_db_for_stretch': safe_to_float(CONFIG.get_value('notch_gain_db_for_stretch', -10.0)),
-        'temperature': safe_to_float(CONFIG.get_value('temperature', 0.65)),
-        'exaggeration': safe_to_float(CONFIG.get_value('exaggeration', 1.0)),
-        'cfg_weight': safe_to_float(CONFIG.get_value('cfg_weight', 0.45)),
-        'min_p': safe_to_float(CONFIG.get_value('min_p', 0.1)),
-        'top_p': safe_to_float(CONFIG.get_value('top_p', 1.0)),
-        'repetition_penalty': safe_to_float(CONFIG.get_value('repetition_penalty', 1.5)),
-        'max_new_tokens': safe_to_int(CONFIG.get_value('max_new_tokens', 1499)),
-        'min_new_tokens': safe_to_int(CONFIG.get_value('min_new_tokens', 1)),
-        'max_cache_len': safe_to_int(CONFIG.get_value('max_cache_len', 1024)),
-        'normalize_method': safe_to_str(CONFIG.get_value('normalize_method', 'rms')),
-        'logging_level': safe_to_str(CONFIG.get_value('logging_level', 'INFO')),
-        'enable_memory_cache': safe_to_bool(CONFIG.get_value('enable_memory_cache', True)),
-        'enable_disk_cache': safe_to_bool(CONFIG.get_value('enable_disk_cache', False)),
-        'enable_denoising': safe_to_bool(CONFIG.get_value('enable_denoising', True)),
+        'speaking_rate': safe_to_float(get_config_value('speaking_rate', 1.0)),
+        'eq_gain_db': safe_to_float(get_config_value('eq_gain_db', -8.0)),
+        'max_gain': safe_to_float(get_config_value('max_gain', 2.0)),
+        'target_max': safe_to_float(get_config_value('target_max', 0.6)),
+        'noise_floor_db': safe_to_float(get_config_value('noise_floor_db', -30.0)),
+        'trim_threshold_db': safe_to_float(get_config_value('trim_threshold_db', -28.0)),
+        'eq_cutoff_hz': safe_to_float(get_config_value('eq_cutoff_hz', 300.0)),
+        'fade_ms': safe_to_float(get_config_value('fade_ms', 50.0)),
+        'notch_low': safe_to_float(get_config_value('notch_low', 100.0)),
+        'notch_high': safe_to_float(get_config_value('notch_high', 5000.0)),
+        'notch_gain_db': safe_to_float(get_config_value('notch_gain_db', -20.0)),
+        'notch_gain_db_for_stretch': safe_to_float(get_config_value('notch_gain_db_for_stretch', -10.0)),
+        'temperature': safe_to_float(get_config_value('temperature', 0.65)),
+        'exaggeration': safe_to_float(get_config_value('exaggeration', 1.0)),
+        'cfg_weight': safe_to_float(get_config_value('cfg_weight', 0.45)),
+        'min_p': safe_to_float(get_config_value('min_p', 0.1)),
+        'top_p': safe_to_float(get_config_value('top_p', 1.0)),
+        'repetition_penalty': safe_to_float(get_config_value('repetition_penalty', 1.5)),
+        'max_new_tokens': safe_to_int(get_config_value('max_new_tokens', 1499)),
+        'min_new_tokens': safe_to_int(get_config_value('min_new_tokens', 1)),
+        'max_cache_len': safe_to_int(get_config_value('max_cache_len', 1024)),
+        'normalize_method': safe_to_str(get_config_value('normalize_method', 'rms')),
+        'logging_level': safe_to_str(get_config_value('logging_level', 'INFO')),
+        'enable_memory_cache': safe_to_bool(get_config_value('enable_memory_cache', True)),
+        'enable_disk_cache': safe_to_bool(get_config_value('enable_disk_cache', False)),
+        'enable_denoising': safe_to_bool(get_config_value('enable_denoising', True)),
     }
     global_status = "Globals loaded from CONFIG – edit and apply."
     logger.debug("Global Config tab loaded from CONFIG")
@@ -176,6 +180,7 @@ def load_global_tab():
     )
 
 def create_ui():
+    config =  get_config()
     """State-free UI: Tabs with lazy load (user clicks 'Load/Refresh' for CONFIG values). Generate default."""
     with gr.Blocks(title="SkyrimNet Chatterbox", theme=gr.themes.Soft()) as demo:
         # Global Status (top-level, updated via btns)
@@ -190,7 +195,7 @@ def create_ui():
                 with gr.Row():
                     text_input = gr.Textbox(label="Input Text", placeholder="Enter text to generate...", lines=3, value="")
                     # Dropdown (static defaults; refresh via manual if needed)
-                    generate_voice_choices = CONFIG.get_all_voices() or ['default']
+                    generate_voice_choices = config.get_all_voices() or ['default']
                     if 'default' not in generate_voice_choices:
                         generate_voice_choices.append('default')
                     generate_voice_dropdown = gr.Dropdown(
@@ -211,7 +216,8 @@ def create_ui():
 
                 # Voice .change (update self from CONFIG – no state)
                 def update_generate_voice_choices(voice):
-                    choices = CONFIG.get_all_voices() or ['default']
+                    config = get_config()
+                    choices = config.get_all_voices() or ['default']
                     if 'default' not in choices:
                         choices.append('default')
                     return gr.update(choices=choices, value=safe_to_str(voice, 'default'))
@@ -272,7 +278,8 @@ def create_ui():
 
                 # Voice .change (update self from CONFIG)
                 def update_test_voice_choices(voice):
-                    choices = CONFIG.get_all_voices() or ['default']
+                    config = get_config()
+                    choices = config.get_all_voices() or ['default']
                     if 'default' not in choices:
                         choices.append('default')
                     return gr.update(choices=choices, value=safe_to_str(voice, 'default'))
@@ -327,13 +334,14 @@ def create_ui():
 
                 # Per-voice load (after dropdown + global load)
                 def load_voice_to_display(voice):
+                    config = get_config()
                     voice = safe_to_str(voice) or 'default'
-                    current_voices = CONFIG.get_all_voices() or ['default']
+                    current_voices = config.get_all_voices() or ['default']
                     if voice not in current_voices:
                         voice = current_voices[0] if current_voices else 'default'
                     try:
                         rate, eq, gain, target, noise, trim, notch, hp, info = load_voice_params_for_edit(voice)
-                        gen_params = CONFIG.get_voice_parameters(voice) or {}
+                        gen_params = config.get_voice_parameters(voice) or {}
                         info_md = f"**Loaded '{voice}'** | Info: {safe_to_str(info)}"
                         status = "Params loaded – edit and apply."
                         logger.info(f"Voice {voice} loaded via helpers")
@@ -412,7 +420,8 @@ def create_ui():
 
                 # Editor .change (update self from CONFIG)
                 def update_edit_voice_choices(voice):
-                    choices = CONFIG.get_all_voices() or ['default']
+                    config = get_config()
+                    choices = config.get_all_voices() or ['default']
                     if 'default' not in choices:
                         choices.append('default')
                     return gr.update(choices=choices, value=safe_to_str(voice, 'default'))
@@ -499,6 +508,7 @@ def create_ui():
 
                 # Apply (UI-only; updates CONFIG)
                 def apply_global_params(speaking_rate, eq_gain, max_gain, target_max, noise_floor, trim_threshold, eq_cutoff, fade_ms, notch_low, notch_high, notch_gain, notch_stretch, temperature, exaggeration, cfg_weight, min_p, top_p, repetition_penalty, max_tokens, min_tokens, cache_len, normalize_method, logging_level, enable_memory_cache, enable_disk_cache, enable_denoising):
+                    config = get_config()
                     try:
                         params = handle_global_params_change(
                             speaking_rate, eq_gain, max_gain, target_max, noise_floor, trim_threshold, normalize_method,
@@ -507,11 +517,11 @@ def create_ui():
                             max_tokens, min_tokens, cache_len
                         )
                         handle_token_limits_change(max_tokens, min_tokens, cache_len)
-                        CONFIG.enable_memory_cache = safe_to_bool(enable_memory_cache)
-                        CONFIG.enable_disk_cache = safe_to_bool(enable_disk_cache)
-                        CONFIG.enable_denoising = safe_to_bool(enable_denoising)
-                        CONFIG.normalize_method = safe_to_str(normalize_method)
-                        CONFIG.logging_level = safe_to_str(logging_level).upper()
+                        config.set_value('enable_memory_cache', safe_to_bool(enable_memory_cache))
+                        config.set_value('enable_disk_cache',safe_to_bool(enable_disk_cache))
+                        config.set_value('enable_denoising',safe_to_bool(enable_denoising))
+                        config.set_value('normalize_method',safe_to_str(normalize_method))
+                        config.set_value('logging_level',safe_to_str(logging_level).upper())
                         status = "Globals applied to CONFIG (memory-only – save to persist; refresh other tabs to see changes)"
                         api_status = update_api_status()
                         logger.info("Global config applied via helpers")
@@ -600,6 +610,7 @@ import tempfile  # Already? Add if not
 
 # FIXED: Async wrapper (await generate_internal; yield progress for queue overlap)
 async def safe_generate_async(text, voice, ref_wav, exagger=None, cfg_w=None, lang="en", temp=None, min_p=None, top_p=None, rep_pen=None, seed=None):
+    config = get_config()
     """Async UI Wrapper: Awaits generate_internal (GPU gen + thread post/I/O); yields status."""
     try:
         logger.info(f"safe_generate_async inputs: text='{text}', voice='{voice}', ref_wav type={type(ref_wav)}")
@@ -636,7 +647,7 @@ async def safe_generate_async(text, voice, ref_wav, exagger=None, cfg_w=None, la
 
         # Fallback: CONFIG voice WAV (but validate: exists, not project/root/dir) – Unchanged
         if not ref_path:
-            candidate_path = CONFIG.get_voice_wav_path(voice)
+            candidate_path = config.get_voice_wav_path(voice)
             if candidate_path and os.path.isfile(candidate_path):  # File only (not dir/project)
                 # Extra safety: Skip if looks like project root (e.g., contains script name or .venv)
                 if any(bad in candidate_path.lower() for bad in ['skyrimnet_chatterbox', '.venv', os.getcwd()]):
@@ -652,12 +663,12 @@ async def safe_generate_async(text, voice, ref_wav, exagger=None, cfg_w=None, la
         lang = safe_to_str(lang, "en")
 
         # UI params or CONFIG fallback (no clamping—internal merges) – Unchanged
-        final_exagger = safe_to_float(exagger, CONFIG.get_value('exaggeration', 1.0))
-        final_cfg_w = safe_to_float(cfg_w, CONFIG.get_value('cfg_weight', 0.45))
-        final_temp = safe_to_float(temp, CONFIG.get_value('temperature', 0.65))
-        final_min_p = safe_to_float(min_p, CONFIG.get_value('min_p', 0.1))
-        final_top_p = safe_to_float(top_p, CONFIG.get_value('top_p', 1.0))
-        final_rep = safe_to_float(rep_pen, CONFIG.get_value('repetition_penalty', 1.5))
+        final_exagger = safe_to_float(exagger, get_config_value('exaggeration', 1.0))
+        final_cfg_w = safe_to_float(cfg_w, get_config_value('cfg_weight', 0.45))
+        final_temp = safe_to_float(temp, get_config_value('temperature', 0.65))
+        final_min_p = safe_to_float(min_p, get_config_value('min_p', 0.1))
+        final_top_p = safe_to_float(top_p, get_config_value('top_p', 1.0))
+        final_rep = safe_to_float(rep_pen, get_config_value('repetition_penalty', 1.5))
         if seed is None:
             seed_num = random.randint(0, 2**31 - 1)
         else:
@@ -678,8 +689,8 @@ async def safe_generate_async(text, voice, ref_wav, exagger=None, cfg_w=None, la
 
         # Minimal post_overrides (audio params from CONFIG; merge in internal) – Unchanged
         post_overrides = {
-            'speaking_rate': float(CONFIG.get_value('speaking_rate', 1.0)),
-            # Extend e.g., 'eq_gain_db': CONFIG.get_value('eq_gain_db', 0.0) if UI slider added
+            'speaking_rate': float(get_config_value('speaking_rate', 1.0)),
+            # Extend e.g., 'eq_gain_db': get_config_value('eq_gain_db', 0.0) if UI slider added
         }
 
         yield None, "Generating audio..."  # Progress during gen

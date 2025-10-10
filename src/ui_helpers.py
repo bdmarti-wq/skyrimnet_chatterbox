@@ -119,8 +119,8 @@ str_props = ['normalize_method', 'logging_level']
 def update_api_status():
     """Return API/model status string."""
     try:
-        model_ready = "Ready" if CONFIG.model else "Not Loaded"
-        return f"API Status: Model={model_ready} | Voices={len(CONFIG.get_all_voices())} | Modified={CONFIG.is_modified}"
+        model_ready = "Ready" if CONFIG.app_config.globals.model else "Not Loaded"
+        return f"API Status: Model={model_ready} | Voices={len(CONFIG.get_all_voices())} | Modified={CONFIG._is_modified}"
     except Exception as e:
         logger.error(f"Update status failed: {e}")
         return "Status: Error (check logs)"

@@ -9,7 +9,9 @@ from time import perf_counter_ns, time
 import torchaudio
 from typing import Optional, Dict, Any, Tuple
 
-from .config import CONFIG
+from .config import get_config, get_config_value
+
+get_config_value
 from .audio_utils import apply_post_processing
 from .cache import (
     try_audio_cache, set_audio_cache, get_cache_key, get_or_queue_voice_process,
@@ -263,10 +265,11 @@ async def generate_audio(model, text: str, audio_prompt_path: Optional[str], exa
     Main orchestration: Validate, cache checks, prep, gen, post-process.
     Assumes model/device/dtype from globals; cleaned sig (no dead params).
     """
-    device = CONFIG.device
-    dtype = CONFIG.dtype
-    sr = CONFIG.sr  # 24000 from config.py
-    multilingual = CONFIG.multilingual  # False by default
+    config = get_config()
+    device = config.app_config.globals.device
+    dtype = config.app_config.globals.dtype
+    sr = config.app_config.globals.sr  # 24000 from config.py
+    multilingual = config.app_config.globals.multilingual  # False by default
     # FIXED: Derive full_stem consistently (strip '_voice' suffix without split for full base)
     full_stem = Path(audio_prompt_path).stem.replace('_fixed', '').replace('_padded', '').replace('_resampled', '').replace('_ui_resampled', '')  # e.g., 'cs_coralyn_voice'
     voice_stem = full_stem[:-6] if full_stem.endswith('_voice') else full_stem  # Strip '_voice' suffix (e.g., "cs_coralyn_voice" → "cs_coralyn")
@@ -276,7 +279,7 @@ async def generate_audio(model, text: str, audio_prompt_path: Optional[str], exa
 
     if not text:
         logger.warning("No text – using dummy")
-        create_dummy_conds(model, CONFIG.device, CONFIG.dtype, "no_text")
+        create_dummy_conds(model, device, dtype, "no_text")
         dummy_path = str(save_torchaudio_wav(torch.zeros(1, 24000), 24000, uuid=cache_uuid))  # Short dummy path
         return dummy_path
 
@@ -303,7 +306,7 @@ async def generate_audio(model, text: str, audio_prompt_path: Optional[str], exa
 
     # FIXED: Use consistent voice_stem for params (full base, no split[0])
     original_text = text
-    text = pad_short_text(text, CONFIG.get_merged_audio_params(voice_name=voice_stem))  # Was split[0] → 'cs'; now 'cs_coralyn'
+    text = pad_short_text(text, config.get_merged_audio_params(voice_name=voice_stem))  # Was split[0] → 'cs'; now 'cs_coralyn'
     logger.debug(
         f"TTS text: '{text}' (padded={len(text) > len(original_text) if 'original_text' in locals() else False})")
 
@@ -315,7 +318,7 @@ async def generate_audio(model, text: str, audio_prompt_path: Optional[str], exa
 
     reuse_start = perf_counter_ns()  # Time reuse check
     # Reuse check (updated helper)
-    try_fuzzy = CONFIG.get_value('fuzzy_enable', False)
+    try_fuzzy = get_config_value('fuzzy_enable', False)
     reuse_result = try_reuse_audio(text, audio_prompt_path, exaggeration, params, try_fuzzy) if audio_prompt_path else None
     reuse_time_ms = (perf_counter_ns() - reuse_start) / 1_000_000
     if reuse_result:
@@ -365,7 +368,7 @@ async def generate_audio(model, text: str, audio_prompt_path: Optional[str], exa
         "repetition_penalty": repetition_penalty,
         "t3_params": t3_params,
     }
-    if CONFIG.multilingual:
+    if multilingual:
         generate_args["language_id"] = language_id
 
     # Core gen (time it)
@@ -378,12 +381,12 @@ async def generate_audio(model, text: str, audio_prompt_path: Optional[str], exa
 
     if wav is None or wav.numel() == 0:
         logger.warning(f"Empty gen for '{text[:50]}...' – fallback silence")
-        wav = torch.zeros(1, CONFIG.sr * 2, dtype=CONFIG.dtype, device=CONFIG.device)  # 2D silence
+        wav = torch.zeros(1, sr * 2, dtype=dtype, device=device)  # 2D silence
 
     # Post-gen timings/log (derive stem for voice-specific params)
     # FIXED: Use consistent voice_stem for params (full base, no split[0])
     stem = voice_stem  # Reuse the derived voice_stem
-    merged_params = CONFIG.get_merged_audio_params(voice_name=stem)  # Now 'cs_coralyn', not 'cs'
+    merged_params = config.get_merged_audio_params(voice_name=stem)  # Now 'cs_coralyn', not 'cs'
     post_start = perf_counter_ns()
     # FIXED: Ensure 2D input for post ([1, samples] mono)
     if wav.dim() == 1:
@@ -399,7 +402,7 @@ async def generate_audio(model, text: str, audio_prompt_path: Optional[str], exa
 
     try:
         # FIXED: Await async post; handle np/torch return
-        post_result = await apply_post_processing(wav_tensor, CONFIG.sr, merged_params)
+        post_result = await apply_post_processing(wav_tensor, sr, merged_params)
         if isinstance(post_result, torch.Tensor):
             logger.debug(f"Post returned tensor {post_result.shape} – to np")
             wav_np = post_result.detach().cpu().numpy().squeeze() if post_result.dim() > 1 else post_result.cpu().numpy()
@@ -424,17 +427,17 @@ async def generate_audio(model, text: str, audio_prompt_path: Optional[str], exa
     # Fallback empty
     if len(wav_np) == 0:
         logger.warning(f"Post empty for {stem} – silence fallback")
-        wav_np = np.zeros(CONFIG.sr * 2)
+        wav_np = np.zeros(sr * 2)
 
     # To tensor (2D for save)
-    processed_wav = torch.from_numpy(wav_np).unsqueeze(0).to(CONFIG.device, CONFIG.dtype)
+    processed_wav = torch.from_numpy(wav_np).unsqueeze(0).to(device, dtype)
     post_time_ms = (perf_counter_ns() - post_start) / 1_000_000
     logger.info(f"Post for {stem}: {post_time_ms:.2f}ms (rate={merged_params.get('speaking_rate', 1.0)}, notch={merged_params.get('notch_gain_db', 'N/A')}dB)")
 
     func_end_time = perf_counter_ns()
     total_duration_s = (func_end_time - func_start_time) / 1_000_000_000
-    wav_length = len(wav_np) / CONFIG.sr
-    logger.info(f"Processed: {wav_length:.2f}s {CONFIG.sr/1000:.0f}kHz in {total_duration_s:.2f}s (speed: {wav_length/total_duration_s:.2f}x; gen: {gen_time_s:.2f}s, post: {post_time_ms/1000:.3f}s)")
+    wav_length = len(wav_np) / sr
+    logger.info(f"Processed: {wav_length:.2f}s {sr/1000:.0f}kHz in {total_duration_s:.2f}s (speed: {wav_length/total_duration_s:.2f}x; gen: {gen_time_s:.2f}s, post: {post_time_ms/1000:.3f}s)")
 
     # Save/cache (2D float32 CPU)
     save_start = perf_counter_ns()

@@ -8,8 +8,7 @@ import torchaudio
 from pathlib import Path
 
 
-from src.config import DEVICE, DTYPE, _USE_API_MODE, load_skyrimnet_config, get_config_value, ENABLE_MEMORY_CACHE, \
-    ENABLE_DISK_CACHE, MODEL, MULTILINGUAL, CONFIG
+from src.config import get_config, get_config_value
 # Lazy import inside generate (avoids global Gradio scan/inference)
 from src.audio_utils import set_torchaudio_backend
 from src.fuzzy_cache import load_fuzzy_cache
@@ -73,14 +72,25 @@ def main():  # FIXED: Make sync (no async def; Easier for script + handles neste
 
     # Load configuration at startup
     logger.info("Loading SkyrimNet configuration...")
-    load_skyrimnet_config()
+    config = get_config() # loads the config
 
+    # Load TTS model (idempotent)
+    model_type = 'multilingual' if config.get_value('multilingual') else 'english'
+    logger.info(f"Loading {model_type.capitalize()} Model")
 
-    model = ModelManager.get_instance().get_model()  # Gets loaded instance or loads
+    instance = ModelManager.get_instance()
+    model = instance.get_model(model_type)  # Loads/caches; returns object or None
+
     if model is None:
-        logger.error("No model; fallback to silence")
+        logger.error(f"Failed to load {model_type} model; TTS disabled")
+        config.app_config.globals.model = None  # Explicit null
+    else:
+        # Set runtime (in-memory; for CONFIG.model access)
+        config.app_config.globals.model = model
+        logger.info(
+            f"✓ Model loaded : {model.__class__.__name__} ({model_type}) on {config.app_config.globals.device} (dtype={config.app_config.globals.dtype})")
 
-    init_conditional_memory_cache(model, DEVICE, DTYPE, quiet=False, pre_validate_voices=False)  # Quiet for prod
+    init_conditional_memory_cache(model, get_config_value('globals.device'), get_config_value('globals.dtype'), quiet=False, pre_validate_voices=False)  # Quiet for prod
     load_fuzzy_cache()
 
 

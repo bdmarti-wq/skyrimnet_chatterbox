@@ -18,7 +18,9 @@ import gradio as gr
 import torch
 import torchaudio
 from loguru import logger
-from .config import CONFIG, _USE_API_MODE, load_skyrimnet_config, get_config_value  # Direct import for self-contained CONFIG
+from .config import get_config, get_config_value
+
+config = get_config()
 
 # FIX: Load TTS via singleton (essential; supports multilingual)
 from src.model import ModelManager
@@ -64,12 +66,7 @@ def generate_audio_ui(  # REVERT/PATCH: Sync def (Gradio calls without await →
         unconditional_keys: list = None
 ):
     """Generate audio using configurable parameter system (sync wrapper for inner async)"""
-
-    if _USE_API_MODE:
-        defaults, modes = {}, {}
-    else:
-        defaults, modes, flags = load_skyrimnet_config()
-
+    from .config import get_config_value
     api_temperature = linear if linear is not None else None
     api_min_p = min_p if min_p is not None else None
     api_top_p = top_p if top_p is not None else None
@@ -77,16 +74,33 @@ def generate_audio_ui(  # REVERT/PATCH: Sync def (Gradio calls without await →
     api_cfg_weight = cfg_scale if cfg_scale is not None else None
     api_exaggeration = quadratic if quadratic is not None else None
 
-    final_temperature = get_config_value('temperature', api_temperature, defaults, modes, _USE_API_MODE)
-    final_min_p = get_config_value('min_p', api_min_p, defaults, modes, _USE_API_MODE)
-    final_top_p = get_config_value('top_p', api_top_p, defaults, modes, _USE_API_MODE)
-    final_repetition_penalty = get_config_value('repetition_penalty', api_repetition_penalty, defaults, modes,
-                                                _USE_API_MODE)
-    final_cfg_weight = get_config_value('cfg_weight', api_cfg_weight, defaults, modes, _USE_API_MODE)
-    final_exaggeration = get_config_value('exaggeration', api_exaggeration, defaults, modes, _USE_API_MODE)
+    final_temperature = get_config_value('globalstemperature')
+    final_min_p = get_config_value('min_p')
+    final_top_p = get_config_value('top_p')
+    final_repetition_penalty = get_config_value('repetition_penalty')
+    final_cfg_weight = get_config_value('cfg_weight')
+    final_exaggeration = get_config_value('exaggeration')
 
-    logger.debug(
-        f"Final parameters - temp: {final_temperature}, min_p: {final_min_p}, top_p: {final_top_p}, rep_penalty: {final_repetition_penalty}, cfg_weight: {final_cfg_weight}, exaggeration: {final_exaggeration}")
+    # Merge voice params (globals + overrides like serena temp=0.9)
+    voice_params = get_config().get_merged_audio_params('default')  # Default voice
+
+    # Fill None from merged (e.g., if UI None, use 0.9 for serena temp)
+    params = {
+        'temperature': api_temperature or voice_params.get('temperature', voice_params['tts'].get('temperature', 0.7)),
+        'min_p': api_min_p or voice_params.get('min_p', voice_params['tts'].get('min_p', 0.07)),
+        'top_p': api_top_p or voice_params.get('top_p', voice_params['tts'].get('top_p', 1.0)),
+        'repetition_penalty': api_repetition_penalty or voice_params.get('repetition_penalty',
+                                                                     voice_params['tts'].get('repetition_penalty',
+                                                                                             2.0)),
+        'cfg_weight': api_cfg_weight or voice_params.get('cfg_weight', voice_params['tts'].get('cfg_weight', 0.45)),
+        'exaggeration': api_exaggeration or voice_params.get('exaggeration', voice_params['tts'].get('exaggeration', 0.7)),
+        # Add more (e.g., 'speaking_rate': ... from audio)
+        'sr': voice_params.get('sr', 24000),  # Global
+        'device': config.app_config.globals.device
+    }
+
+    logger.info(
+        f"UI provided parameters - temp: {params['temperature']}, min_p: {params['min_p']}, top_p: {params['top_p']}, rep_penalty: {params['repetition_penalty']}, cfg_weight: {params['cfg_weight']}, exaggeration: {params['exaggeration']}")
 
     # Important - use server supplied uuid for consistent seed
     seed_num = cpp_uuid_to_seed(uuid)
@@ -97,22 +111,23 @@ def generate_audio_ui(  # REVERT/PATCH: Sync def (Gradio calls without await →
     try:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
+        logger.info(f"Current model when we call things is... {config.app_config.globals.model.__class__.__name__} ")
 
         # Lazy import + call (via kwargs for sig safety; model=MODEL from global)
         from src.generate_audio import generate_audio  # Assume will be async (returns coroutine)
-        from .config import CONFIG
+        from .config import get_config_value
         gen_coroutine = generate_audio(  # Call async fn → coroutine
-            model=CONFIG.model,
+            model=config.app_config.globals.model,
             text=text,
             audio_prompt_path=speaker_audio,  # None ok (used internally for stem/post)
             seed_num=seed_num,
             cache_uuid=uuid,
-            exaggeration=final_exaggeration,
-            temperature=final_temperature,
-            cfgw=final_cfg_weight,
-            min_p=final_min_p,
-            top_p=final_top_p,
-            repetition_penalty=final_repetition_penalty,
+            exaggeration=params['exaggeration'],
+            temperature=params['temperature'],
+            cfgw=params['cfg_weight'],
+            min_p=params['min_p'],
+            top_p=params['top_p'],
+            repetition_penalty=params['repetition_penalty'],
             language_id=language  # kwarg-safe
         )
 
@@ -126,12 +141,12 @@ def generate_audio_ui(  # REVERT/PATCH: Sync def (Gradio calls without await →
         if loop:
             loop.close()
         # FIXED: 2D mono silence (Gradio-safe: [1, samples], float32 CPU) + save to temp path (str return like HIT)
-        from .config import CONFIG  # Absolute for fallback (sr/dtype/device)
-        silence_2d = torch.zeros(1, CONFIG.sr * 2, dtype=torch.float32, device='cpu')  # 2D [1, 48000]; float32 CPU
+        from .config import get_config_value  # Absolute for fallback (sr/dtype/device)
+        silence_2d = torch.zeros(1, get_config_value('globals.sr', 24000) * 2, dtype=torch.float32, device='cpu')  # 2D [1, 48000]; float32 CPU
         # Temp save (mimic save_and_cache_output; sr=CONFIG.sr)
         with tempfile.TemporaryDirectory() as tmpdir:
             fallback_path = Path(tmpdir) / f"fallback_silence_{uuid}.wav"
-            torchaudio.save(str(fallback_path), silence_2d, CONFIG.sr)
+            torchaudio.save(str(fallback_path), silence_2d, get_config_value('globals.sr', 24000) )
             result = str(fallback_path)  # Str path (Gradio Audio handles; delete on close)
             logger.warning(f"Fallback silence path created: {result} (2s; error: {str(inner_e)[:100]})")
 
@@ -150,10 +165,10 @@ def setup_bridge_api(demo, audio_output, api_status_md):
     No States in inputs (safe for remote API).
     Call inside gr.Blocks() in ui.py.
     """
-
-    model_type = 'multilingual' if CONFIG.multilingual else 'english'
+    from .config import get_config_value
+    model_type = 'multilingual' if get_config_value('multilingual') else 'english'
     ModelManager.get_instance().load_model(model_type)  # Lazy-loads
-    CONFIG.model = ModelManager.get_instance().get_model(model_type)
+
 
     # 29 hidden components (exact from original working code signature/order/defaults)
     model_choice = gr.Textbox(visible=False, value=None, label="Model Choice")

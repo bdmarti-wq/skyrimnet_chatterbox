@@ -12,7 +12,7 @@ import torchaudio
 import soundfile as sf
 import tempfile
 from scipy.signal import sosfilt, butter, iirnotch
-from src.config import CONFIG  # Adjusted import (from .config if package)
+from src.config import CONFIG, get_config_value  # Adjusted import (from .config if package)
 
 # UTILITY: Cleanup function for test files
 def cleanup_old_test_files(max_age_hours: int = 1):
@@ -150,7 +150,7 @@ async def denoise_and_normalize_in_memory(
 def is_artifact_laden(wav_path: str, threshold_hz: float = None, ratio_threshold: float = 0.5, sr: int = 24000) -> bool:
     """Detect artifacts. FIXED: Default from config; accurate log/comp (no '8000'). Keep one version."""
     threshold_hz = threshold_hz or CONFIG.get_value('fuzzy_artifact_threshold_hz', 7000.0)
-    threshold_hz = CONFIG.clamp_value('fuzzy_artifact_threshold_hz', threshold_hz)  # Assume CAP added
+    # threshold_hz = CONFIG.clamp_value('fuzzy_artifact_threshold_hz', threshold_hz)  # Assume CAP added
     ratio_threshold = 0.5  # Fixed; add CAP 'FUZZY_RATIO_THRESHOLD' if tune
 
     try:
@@ -307,6 +307,31 @@ def apply_fade(audio: np.ndarray, sr: int, fade_ms: float | None = 20.0) -> np.n
     audio[-adaptive_fade:] *= fade_out
     return audio
 
+# Helper: Prioritize params → config → default; coerce type with guards
+def _get_audio_param(key: str, param_dict: dict, default=None, target_type=float, required=False):
+    """Get value: params first, then config (validated), then default. Coerce to target_type."""
+    val = param_dict.get(key)
+    if val is not None:
+        try:
+            return target_type(val)  # Coerce (e.g., float('30') → 30.0)
+        except (ValueError, TypeError) as e:
+            logger.warning(
+                f"Invalid audio param '{key}'={val} (type error: {e}); fallback to config/default")
+            val = None  # Treat as missing
+
+    # Fallback to config (handles nested like 'audio.trim_threshold_db')
+    config_val = get_config_value(key, default=default)  # Your facade; assumes validated/non-None
+
+    if config_val is None and required:
+        raise ValueError(f"Required param '{key}' missing from params/config")
+
+    try:
+        return target_type(config_val) if config_val is not None else target_type(default)
+    except (ValueError, TypeError) as e:
+        logger.warning(f"Invalid config/default '{key}' (type error: {e}); using raw default {default}")
+        return target_type(default)
+
+
 async def apply_post_processing(wav: torch.Tensor, sr: int, params: dict | None = None) -> np.ndarray:
     """Async post: Trim → Pad → Heavy (denoise/EQ/notch/norm) → Rate → Trail Cut → Fade → Clamp. FIXED: Guards all * ops; frame_factor/None fallback; outer vars safe."""
     if params is None:
@@ -339,20 +364,20 @@ async def apply_post_processing(wav: torch.Tensor, sr: int, params: dict | None 
     loop = asyncio.get_running_loop()
 
     # FIXED: All params/vars defined early (outer; before heavy; None guards)
-    min_dur_sec = CONFIG.clamp_value('min_post_duration_sec', params.get('min_post_duration_sec', CONFIG.get_value('min_post_duration_sec', 0.05)) or 0.05)
+    min_dur_sec =  _get_audio_param('min_post_duration_sec', params, 0.05)
     min_samples = int(sr * min_dur_sec)
     light_mode = orig_len < min_samples
     if light_mode:
         logger.debug(f"Short input < {min_dur_sec}s – light post (skip heavy)")
 
     # Trim params (FIXED: Guard frame_factor/None before *)
-    trim_db = CONFIG.clamp_value('trim_threshold_db', params.get('trim_threshold_db', CONFIG.get_value('trim_threshold_db', -30.0)) or -30.0)
-    hop = params.get('hop_length', CONFIG.get_value('hop_length', 256)) or 256  # Guard None
+    trim_db = _get_audio_param('trim_threshold_db', params, -30.0)
+    hop = _get_audio_param('hop_length', params, 256 ) # Guard None
     hop = int(hop)  # Ensure int
-    frame_factor = CONFIG.clamp_value('trim_frame_length_factor', params.get('trim_frame_length_factor', CONFIG.get_value('trim_frame_length_factor', 4)) or 4)
+    frame_factor = _get_audio_param('trim_frame_length_factor', params, 4)
     frame_factor = int(frame_factor) if frame_factor is not None else 4  # FIXED: Fallback int on None
     frame_length = hop * frame_factor  # Now safe: both int
-    n_fft_trim = CONFIG.clamp_value('max_n_fft_for_trim', params.get('max_n_fft_for_trim', CONFIG.get_value('max_n_fft_for_trim', 2048)) or 2048)
+    n_fft_trim = _get_audio_param('max_n_fft_for_trim', params, 2048)
     n_fft_trim = min(int(n_fft_trim), orig_len)  # Ensure int/guard
     did_trim = False
 
@@ -360,41 +385,33 @@ async def apply_post_processing(wav: torch.Tensor, sr: int, params: dict | None 
     enable_audio_pad = params.get('enable_audio_padding', CONFIG.get_value('enable_audio_padding', True))
     base_pad_sec = params.get('base_audio_pad_sec', params.get('post_pad_sec', CONFIG.get_value('base_audio_pad_sec', 0.15)) or 0.15)
     base_pad_sec = float(base_pad_sec) if base_pad_sec is not None else 0.15  # Guard
-    multiplier = CONFIG.clamp_value('tiny_audio_pad_multiplier', params.get('tiny_audio_pad_multiplier', CONFIG.get_value('tiny_audio_pad_multiplier', 2.0)) or 2.0)
+    multiplier = _get_audio_param('tiny_audio_pad_multiplier', params, 2.0)
     multiplier = float(multiplier) if multiplier is not None else 2.0
-    tiny_threshold = CONFIG.clamp_value('tiny_threshold_sec', params.get('tiny_threshold_sec', CONFIG.get_value('tiny_threshold_sec', 0.5)) or 0.5)
+    tiny_threshold = _get_audio_param('tiny_threshold_sec', params, 0.5)
     tiny_threshold = float(tiny_threshold) if tiny_threshold is not None else 0.5
     did_pad = False
     is_tiny = False
 
     # Heavy params (FIXED: Guards on None)
-    noise_floor_db = CONFIG.clamp_value('noise_floor_db', params.get('noise_floor_db', CONFIG.get_value('noise_floor_db', -60.0)) or -60.0)
-    min_denoise_samples = CONFIG.clamp_value('min_samples_for_denoise', params.get('min_samples_for_denoise', CONFIG.get_value('min_samples_for_denoise', 100)) or 100)
-    n_fft_denoise = CONFIG.clamp_value('n_fft_denoise', params.get('n_fft_denoise', CONFIG.get_value('n_fft_denoise', 1024)) or 1024)
+    noise_floor_db = _get_audio_param('noise_floor_db', params, -60.0)
+    min_denoise_samples = _get_audio_param('min_samples_for_denoise', params, 100)
+    n_fft_denoise = _get_audio_param('n_fft_denoise', params, 1024)
     n_fft_denoise = min(int(n_fft_denoise), orig_len * 2)  # Safe * (orig_len int)
-    eq_gain_db = CONFIG.clamp_value('eq_gain_db', params.get('eq_gain_db', CONFIG.get_value('eq_gain_db', 0.0)) or 0.0)
-    eq_cutoff_hz = CONFIG.clamp_value('eq_cutoff_hz', params.get('eq_cutoff_hz', CONFIG.get_value('eq_cutoff_hz', 3000)) or 3000)
-    notch_gain_db = params.get('notch_gain_db', CONFIG.get_value('notch_gain_db', None))
-    if notch_gain_db is not None:
-        notch_gain_db = CONFIG.clamp_value('notch_gain_db', notch_gain_db)
-    else:
-        notch_gain_db = 0.0  # FIXED: Fallback to no-op 0
-    notch_low_hz = CONFIG.clamp_value('notch_low_hz', params.get('notch_low_hz', CONFIG.get_value('notch_low_hz', 8000)) or 8000)
-    notch_high_hz = CONFIG.clamp_value('notch_high_hz', params.get('notch_high_hz', CONFIG.get_value('notch_high_hz', 11000)) or 11000)
-    norm_method = params.get('normalize_method', CONFIG.get_value('normalize_method', 'peak')) or 'peak'
-    enable_norm = params.get('enable_denoise_normalize', CONFIG.get_value('enable_denoise_normalize', False))
-    enable_denoise = params.get('enable_denoising', CONFIG.get_value('enable_denoising', False))
-    enable_resample = params.get('enable_post_resample', CONFIG.get_value('enable_post_resample', False))
-    rate = CONFIG.clamp_value('speaking_rate', params.get('speaking_rate', CONFIG.get_value('speaking_rate', 1.0)) or 1.0)
-    trail_db = params.get('trailing_silence_db', CONFIG.get_value('trailing_silence_db', -45.0)) or -45.0
-    trail_db = CONFIG.clamp_value('trailing_silence_db', trail_db)
-    fade_ms = params.get('fade_ms', CONFIG.get_value('fade_ms', None))
-    if fade_ms is not None:
-        fade_ms = CONFIG.clamp_value('fade_ms', fade_ms)
-    else:
-        fade_ms = 0.0  # FIXED: Fallback to no-op 0
-    gain_limit = CONFIG.clamp_value('gain_max_limit', params.get('gain_max_limit', CONFIG.get_value('gain_max_limit', 1.0)) or 1.0)
-    gain_limit = float(gain_limit) if gain_limit is not None else 1.0
+    eq_gain_db = _get_audio_param('eq_gain_db', params, 0.0)
+    eq_cutoff_hz = _get_audio_param('eq_cutoff_hz', params, 3000)
+    notch_gain_db = _get_audio_param('notch_gain_db', params, 0)
+
+    notch_low_hz = _get_audio_param('notch_low_hz', params, 8000)
+    notch_high_hz = _get_audio_param('notch_high_hz', params, 11000)
+    norm_method = _get_audio_param('normalize_method', params,'peak')
+    enable_norm = _get_audio_param('enable_denoise_normalize', params, False)
+    enable_denoise = _get_audio_param('enable_denoising', params, False)
+    enable_resample = _get_audio_param('enable_post_resample', params, False)
+    rate = _get_audio_param('speaking_rate', params, 1.0)
+    trail_db = _get_audio_param('trailing_silence_db', params, -45.0)
+    fade_ms = _get_audio_param('fade_ms', params, 0)
+    gain_limit = _get_audio_param('gain_max_limit', params, 1.0)
+
 
     # Trim (sync; fast) – FIXED: Now frame_length safe
     if trim_db is not None and abs(trim_db) > 5 and not light_mode:
@@ -446,15 +463,15 @@ async def apply_post_processing(wav: torch.Tensor, sr: int, params: dict | None 
     did_denoise = did_eq = did_notch = did_normalize = did_rate = did_trail_cut = did_fade = False
 
     # Heavy steps in executor (FIXED: All outer, no new Nones)
-    def heavy_processing():
+    def heavy_processing(params: dict):
+        from .config import get_config_value
         nonlocal wav_np, did_denoise, did_eq, did_notch, did_normalize
 
         # Denoise (gated)
         if enable_denoise and not heavy_skip and new_len >= min_denoise_samples:
             try:
                 # Pre: High-pass (FIXED: Guard hz/None before /)
-                highpass_hz = CONFIG.clamp_value('denoise_highpass_hz', params.get('denoise_highpass_hz', 80)) or 80
-                highpass_hz = float(highpass_hz) if highpass_hz is not None else 80.0
+                highpass_hz = _get_audio_param('denoise_highpass_hz', params, 80)
                 if highpass_hz > 0:
                     nyquist = sr / 2.0
                     highpass_norm = highpass_hz / nyquist
@@ -467,10 +484,10 @@ async def apply_post_processing(wav: torch.Tensor, sr: int, params: dict | None 
                 mag, phase = np.abs(stft), np.angle(stft)
 
                 freqs = librosa.fft_frequencies(sr=sr, n_fft=n_fft_denoise)
-                target_low = CONFIG.get_value('denoise_target_band_low', 5000) or 5000
-                target_high = CONFIG.get_value('denoise_target_band_high', 12000) or 12000
+                target_low = _get_audio_param('denoise_target_band_low', params,5000)
+                target_high = _get_audio_param('denoise_target_band_high', params, 12000)
                 band_mask = (freqs >= target_low) & (freqs <= target_high)
-                ksize = CONFIG.get_value('denoise_median_ksize', 3) or 3
+                ksize = _get_audio_param('denoise_median_ksize', params,3)
                 ksize = int(ksize)  # Ensure int
                 for frame in range(mag.shape[1]):
                     high_mag = mag[band_mask, frame]
@@ -530,11 +547,12 @@ async def apply_post_processing(wav: torch.Tensor, sr: int, params: dict | None 
     logger.debug(f"Post-heavy: {new_len_heavy/sr:.2f}s (from {new_dur:.2f}s)")
 
     # Rate (FIXED: Guard rate before *)
-    if enable_resample and abs(rate - 1.0) > 0.05 and new_len_heavy > 0:
-        def rate_stretch():
+    speaking_rate = _get_audio_param('speaking_rate', params, 1.0)
+    if enable_resample and abs(speaking_rate - 1.0) > 0.05 and new_len_heavy > 0:
+        def rate_stretch(rate: float):
             nonlocal wav_np
-            rate = float(rate) if rate is not None else 1.0  # Guard
-            target_len = int(new_len_heavy * rate)
+            speaking_rate = float(rate) if rate is not None else 1.0  # Guard
+            target_len = int(new_len_heavy * speaking_rate)
             if target_len > 0:
                 stretch_rate = 1.0 / rate
                 wav_stretch = librosa.effects.time_stretch(wav_np_heavy, rate=stretch_rate)
