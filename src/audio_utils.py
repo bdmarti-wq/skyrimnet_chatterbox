@@ -339,7 +339,7 @@ async def apply_post_processing(wav: torch.Tensor, sr: int, params: dict | None 
         logger.debug("Post skipped (no params) – raw")
         return wav.cpu().squeeze().numpy()
 
-    enable_post = params.get('enable_post_processing', CONFIG.get_value('enable_post_processing', True))
+    enable_post = params.get('enable_post_processing', get_config_value('enable_post_processing', True))
     if not enable_post:
         logger.debug("Post disabled – raw")
         return wav.cpu().squeeze().numpy()

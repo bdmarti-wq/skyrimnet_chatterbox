@@ -10,6 +10,7 @@ import torchaudio
 from typing import Optional, Dict, Any, Tuple
 
 from .config import get_config, get_config_value
+from .monitor import monitor_resources
 
 get_config_value
 from .audio_utils import apply_post_processing
@@ -255,7 +256,7 @@ def save_and_cache_output(
         wave_file = str(save_torchaudio_wav(wav.cpu(), sr, audio_path=None, uuid=cache_uuid))
     return wave_file
 
-
+@monitor_resources(enable=True, log_level="INFO")
 async def generate_audio(model, text: str, audio_prompt_path: Optional[str], exaggeration: float = 0.5,
                          cache_uuid: int = 0,
                          temperature: float = 0.8, cfgw: float = 0, min_p: float = 0.05, top_p: float = 1.0,
@@ -264,95 +265,109 @@ async def generate_audio(model, text: str, audio_prompt_path: Optional[str], exa
     """
     Main orchestration: Validate, cache checks, prep, gen, post-process.
     Assumes model/device/dtype from globals; cleaned sig (no dead params).
+    FIXED: Added full timings/RTF; model guard; consistent stem derivation.
     """
+    # FIXED: Guard model at entry (fetch from manager if bad)
+    from src.model import ModelManager  # Ensure
+    if model is None or isinstance(model, str) or not hasattr(model, 'generate'):
+        logger.warning(f"Invalid model to generate_audio: type={type(model).__name__} ({model}) – fetching from manager")
+        real_model = ModelManager.get_instance().get_model()
+        if real_model is None:
+            logger.error("No model available – silence fallback")
+            sr = 24000  # Default
+            return str(save_torchaudio_wav(torch.zeros(1, sr * 2), sr, uuid=cache_uuid))  # 2s silence
+        model = real_model
+        logger.debug(f"generate_audio using real model: {type(model).__name__} on {getattr(model, 'device', 'N/A')}")
+
     config = get_config()
-    device = config.app_config.globals.device
+    device = torch.device(config.app_config.globals.device)  # Coerce to torch.device
     dtype = config.app_config.globals.dtype
-    sr = config.app_config.globals.sr  # 24000 from config.py
-    multilingual = config.app_config.globals.multilingual  # False by default
-    # FIXED: Derive full_stem consistently (strip '_voice' suffix without split for full base)
-    full_stem = Path(audio_prompt_path).stem.replace('_fixed', '').replace('_padded', '').replace('_resampled', '').replace('_ui_resampled', '')  # e.g., 'cs_coralyn_voice'
-    voice_stem = full_stem[:-6] if full_stem.endswith('_voice') else full_stem  # Strip '_voice' suffix (e.g., "cs_coralyn_voice" → "cs_coralyn")
-    if len(voice_stem) < 3:
-        voice_stem = full_stem  # Ensure full
-    logger.debug(f"Main: Derived voice_stem: '{voice_stem}' from path '{audio_prompt_path}'")  # FIXED: Added debug log
+    sr = config.app_config.globals.sr
+    multilingual = config.app_config.globals.multilingual
+
+    # FIXED: Extract stem derivation to helper (DRY)
+    def _derive_voice_stem(path: str) -> str:
+        if not path:
+            return 'default'
+        full_stem = Path(path).stem.replace('_fixed', '').replace('_padded', '').replace('_resampled', '').replace('_ui_resampled', '')
+        voice_stem = full_stem[:-6] if full_stem.endswith('_voice') else full_stem
+        if len(voice_stem) < 3:
+            voice_stem = full_stem
+        logger.debug(f"Derived voice_stem: '{voice_stem}' from path '{path}'")
+        return voice_stem
+
+    voice_stem = _derive_voice_stem(audio_prompt_path) if audio_prompt_path else 'default'
+
+    func_start_time = perf_counter_ns()  # FIXED: Overall start
 
     if not text:
         logger.warning("No text – using dummy")
         create_dummy_conds(model, device, dtype, "no_text")
-        dummy_path = str(save_torchaudio_wav(torch.zeros(1, 24000), 24000, uuid=cache_uuid))  # Short dummy path
+        dummy_path = str(save_torchaudio_wav(torch.zeros(1, sr * 2), sr, uuid=cache_uuid))  # FIXED: Use sr
         return dummy_path
 
-    # Float conversions
+    # FIXED: Coerce params once (DRY; defaults from config if None)
     exaggeration = float(exaggeration)
     temperature = float(temperature)
     cfgw = float(cfgw)
     min_p = float(min_p)
     top_p = float(top_p)
     repetition_penalty = float(repetition_penalty)
+    seed_num = int(seed_num or 42)  # Ensure int/default
 
     params = {
         'cfgw': cfgw, 'temperature': temperature, 'min_p': min_p, 'top_p': top_p,
         'repetition_penalty': repetition_penalty, 'language_id': language_id
     }
 
-    func_start_time = perf_counter_ns()  # Overall timer
-
-    # Logging (ONLY here—no dup in shell)
+    # Logging (standardize text[:50])
     stem = Path(audio_prompt_path).stem if audio_prompt_path else "No ref audio"
-    logger.info(f"generate called for: \"{text}\", {stem}, uuid: {cache_uuid}, exaggeration: {exaggeration}")
+    logger.info(f"generate called for: \"{text[:50]}...\", {stem}, uuid: {cache_uuid}, exaggeration: {exaggeration:.2f}")
     logger.info(
-        f"Parameters - temp: {temperature}, min_p: {min_p}, top_p: {top_p}, rep_penalty: {repetition_penalty}, cfg_weight: {cfgw}")
+        f"Parameters - temp: {temperature:.3f}, min_p: {min_p:.3f}, top_p: {top_p:.3f}, rep_penalty: {repetition_penalty:.3f}, cfg_weight: {cfgw:.3f}")
 
-    # FIXED: Use consistent voice_stem for params (full base, no split[0])
     original_text = text
-    text = pad_short_text(text, config.get_merged_audio_params(voice_name=voice_stem))  # Was split[0] → 'cs'; now 'cs_coralyn'
+    merged_params = config.get_merged_audio_params(voice_name=voice_stem)
+    text = pad_short_text(text, merged_params)
     logger.debug(
-        f"TTS text: '{text}' (padded={len(text) > len(original_text) if 'original_text' in locals() else False})")
+        f"TTS text: '{text[:50]}...' (padded={len(text) > len(original_text)})")
 
-    # FIXED: Always set seed (default 42 if 0; ensures consistent accents)
+    # FIXED: Set seed once (before gen)
     if seed_num == 0:
-        seed_num = 42  # Default for reproducibility
-    set_seed(int(seed_num))
-    logger.debug(f"Set seed: {seed_num} (for consistent voices/accents)")
+        seed_num = 42
+    set_seed(seed_num)
+    logger.debug(f"Set seed: {seed_num}")
 
-    reuse_start = perf_counter_ns()  # Time reuse check
-    # Reuse check (updated helper)
-    try_fuzzy = get_config_value('fuzzy_enable', False)
+    reuse_start = perf_counter_ns()
+    try_fuzzy = config.get_value('fuzzy_enable')  # Use get_value (consistent)
     reuse_result = try_reuse_audio(text, audio_prompt_path, exaggeration, params, try_fuzzy) if audio_prompt_path else None
     reuse_time_ms = (perf_counter_ns() - reuse_start) / 1_000_000
     if reuse_result:
         audio_reuse_path, hit_type = reuse_result
-        # Load/log (local torchaudio)
-        wav_reused, sr = torchaudio.load(audio_reuse_path)
-        wav_length = wav_reused.shape[-1] / sr
+        wav_reused, _ = torchaudio.load(audio_reuse_path)
+        wav_length = wav_reused.shape[-1] / sr  # Use sr
         logger.info(
-            f"{hit_type} cache HIT: \"{text[:20]}\" ({hit_type.lower()}-match) for {Path(audio_prompt_path).stem} – skipping gen (uuid={cache_uuid}; reuse: {reuse_time_ms:.2f}ms)")
+            f"{hit_type} cache HIT: \"{text[:50]}...\" ({hit_type.lower()}-match) for {stem} – skipping gen (uuid={cache_uuid}; reuse: {reuse_time_ms:.0f}ms)")
         logger.info(f"Reused {hit_type.lower()} audio: {wav_length:.2f}s in ~0s")
-        # FIXED: Enqueue fuzzy with consistent voice_stem (matching query derivation)
         if audio_prompt_path:
-            logger.debug(f"Enqueued for fuzzy enrich (HIT): \"{text[:20]}\" (norm stem={voice_stem})")
-            FUZZY_QUEUE.put((text, audio_reuse_path, voice_stem))  # Now uses full 'cs_coralyn'
+            FUZZY_QUEUE.put((text, audio_reuse_path, voice_stem))
         total_time_ms = (perf_counter_ns() - func_start_time) / 1_000_000
-        logger.info(f"Full cycle: HIT in {total_time_ms:.2f}ms (infinite speed!)")
-        return audio_reuse_path  # Str path (early return)
+        logger.info(f"Full cycle: HIT in {total_time_ms:.0f}ms (infinite speed!)")
+        return audio_reuse_path
 
-    logger.debug(f"Reuse MISS (took {reuse_time_ms:.2f}ms) – proceeding to full gen")
+    logger.debug(f"Reuse MISS (took {reuse_time_ms:.0f}ms) – proceeding to full gen")
 
-    # Prep voice/conds (helper; handles None → dummy)
     prep_start = perf_counter_ns()
     valid_path = prepare_voice_and_conds(
         model, audio_prompt_path, cache_uuid, exaggeration, language_id,
-        enable_memory_cache, enable_disk_cache, device, dtype, sr, multilingual, voice_stem  # Pass consistent voice_stem
+        enable_memory_cache, enable_disk_cache, device, dtype, sr, multilingual, voice_stem
     )
     prep_time_ms = (perf_counter_ns() - prep_start) / 1_000_000
-    logger.debug(f"Prep/conds: {prep_time_ms:.2f}ms")
+    logger.debug(f"Prep/conds: {prep_time_ms:.0f}ms")
 
-    # Conds prep time log (legacy)
     conditional_start_time = perf_counter_ns()
-    logger.info(f"Conditionals prepared. Time: {(conditional_start_time - func_start_time) / 1_000_000:.4f}ms")
+    logger.info(f"Conditionals prepared. Time: {(conditional_start_time - func_start_time) / 1_000_000:.0f}ms")
 
-    # Build args/t3_params
     t3_params = {
         "generate_token_backend": "cudagraphs-manual",
         "stride_length": 4,
@@ -371,95 +386,92 @@ async def generate_audio(model, text: str, audio_prompt_path: Optional[str], exa
     if multilingual:
         generate_args["language_id"] = language_id
 
-    # Core gen (time it)
-    gen_start = perf_counter_ns()
-    # NEW: Ensure seed before gen (consistent even on retry)
-    set_seed(int(seed_num))  # Re-set post-prep (safe)
+    gen_start = perf_counter_ns()  # FIXED: Core gen start
     wav = _generate_audio_core(model, generate_args, t3_params)
-    gen_time_s = (perf_counter_ns() - gen_start) / 1_000_000_000
+    gen_time_s = (perf_counter_ns() - gen_start) / 1_000_000_000  # FIXED: Core time
     logger.debug(f"Core gen time: {gen_time_s:.2f}s | raw wav shape: {wav.shape if wav is not None else 'None'}")
 
     if wav is None or wav.numel() == 0:
         logger.warning(f"Empty gen for '{text[:50]}...' – fallback silence")
-        wav = torch.zeros(1, sr * 2, dtype=dtype, device=device)  # 2D silence
+        # FIXED: Centralize silence
+        def _silence_tensor(sr: int, duration_s: float = 2.0) -> torch.Tensor:
+            return torch.zeros(1, int(sr * duration_s), dtype=dtype, device=device)
+        wav = _silence_tensor(sr)
 
-    # Post-gen timings/log (derive stem for voice-specific params)
-    # FIXED: Use consistent voice_stem for params (full base, no split[0])
-    stem = voice_stem  # Reuse the derived voice_stem
-    merged_params = config.get_merged_audio_params(voice_name=stem)  # Now 'cs_coralyn', not 'cs'
+    merged_params = config.get_merged_audio_params(voice_name=voice_stem)  # Use voice_stem
+
     post_start = perf_counter_ns()
-    # FIXED: Ensure 2D input for post ([1, samples] mono)
+    # FIXED: Ensure 2D mono input
     if wav.dim() == 1:
-        wav_tensor = torch.unsqueeze(wav, 0)  # [1, samples]
+        wav_tensor = wav.unsqueeze(0)
     elif wav.dim() == 2 and wav.shape[0] == 1:
-        wav_tensor = wav  # Already good
+        wav_tensor = wav
     else:
-        logger.warning(f"Unexpected wav shape {wav.shape} for post – squeezing to mono 2D")
         if wav.dim() > 1:
-            wav = torch.mean(wav, dim=0)  # Avg channels → 1D
-        wav_tensor = torch.unsqueeze(wav, 0)  # [1, samples]
-    logger.debug(f"Post input shape: {wav_tensor.shape} (stem={stem})")
+            wav = torch.mean(wav, dim=0)
+        wav_tensor = wav.unsqueeze(0)
+    logger.debug(f"Post input shape: {wav_tensor.shape} (stem={voice_stem})")
 
     try:
-        # FIXED: Await async post; handle np/torch return
         post_result = await apply_post_processing(wav_tensor, sr, merged_params)
         if isinstance(post_result, torch.Tensor):
-            logger.debug(f"Post returned tensor {post_result.shape} – to np")
             wav_np = post_result.detach().cpu().numpy().squeeze() if post_result.dim() > 1 else post_result.cpu().numpy()
         elif isinstance(post_result, np.ndarray):
             wav_np = post_result
         else:
             raise ValueError(f"Post returned invalid type {type(post_result)}")
-        logger.debug(f"Post np: {wav_np.shape} (dtype={wav_np.dtype})")
     except Exception as post_e:
-        logger.error(f"Post failed for {stem}: {post_e} – raw passthru")
-        wav_np = wav_tensor.squeeze(0).cpu().numpy()  # Raw 1D fallback
+        logger.error(f"Post failed for {voice_stem}: {post_e} – raw passthru")
+        wav_np = wav_tensor.squeeze(0).cpu().numpy()
 
-    # Ensure 1D np
+    # FIXED: Ensure 1D np (standardize)
     if len(wav_np.shape) > 1:
         if wav_np.shape[0] == 1:
             wav_np = wav_np.squeeze(0)
         else:
-            wav_np = np.mean(wav_np, axis=1 if wav_np.shape[1] > 1 else 0)  # Stereo to mono
+            wav_np = np.mean(wav_np, axis=1 if wav_np.shape[1] > 1 else 0)
 
-    logger.debug(f"Final wav_np: {wav_np.shape} (len={len(wav_np)})" )
-
-    # Fallback empty
     if len(wav_np) == 0:
-        logger.warning(f"Post empty for {stem} – silence fallback")
+        logger.warning(f"Post empty for {voice_stem} – silence fallback")
         wav_np = np.zeros(sr * 2)
 
-    # To tensor (2D for save)
     processed_wav = torch.from_numpy(wav_np).unsqueeze(0).to(device, dtype)
     post_time_ms = (perf_counter_ns() - post_start) / 1_000_000
-    logger.info(f"Post for {stem}: {post_time_ms:.2f}ms (rate={merged_params.get('speaking_rate', 1.0)}, notch={merged_params.get('notch_gain_db', 'N/A')}dB)")
+
+    # FIXED: Guard None in format (error source)
+    speaking_rate = merged_params.get('speaking_rate', 1.0) or 1.0  # Fallback float
+    notch_gain_db = merged_params.get('notch_gain_db', None)
+    notch_str = f"{notch_gain_db:.1f}dB" if notch_gain_db is not None else 'N/A'
+    logger.info(f"Post for {voice_stem}: {post_time_ms:.0f}ms (rate={speaking_rate:.2f}, notch={notch_str})")
 
     func_end_time = perf_counter_ns()
     total_duration_s = (func_end_time - func_start_time) / 1_000_000_000
-    wav_length = len(wav_np) / sr
-    logger.info(f"Processed: {wav_length:.2f}s {sr/1000:.0f}kHz in {total_duration_s:.2f}s (speed: {wav_length/total_duration_s:.2f}x; gen: {gen_time_s:.2f}s, post: {post_time_ms/1000:.3f}s)")
+    audio_dur_s = len(wav_np) / sr  # FIXED: Generated length (post-processed)
+    rtf_total = total_duration_s / audio_dur_s if audio_dur_s > 0 else float('inf')  # RTF total
+    rtf_core = gen_time_s / audio_dur_s if audio_dur_s > 0 else float('inf')  # RTF core (raw gen dur)
+    logger.info(  # FIXED: RTF log at INFO (end)
+        f"Generated {audio_dur_s:.2f}s audio (total RTF: {rtf_total:.2f}x, core RTF: {rtf_core:.2f}x)")
 
-    # Save/cache (2D float32 CPU)
+    # FIXED: Conditional cleanup
+    if torch.cuda.is_available():
+        del wav
+        torch.cuda.empty_cache()
+
+    logger.info(f"Processed: {audio_dur_s:.2f}s {sr/1000:.0f}kHz in {total_duration_s:.2f}s (speed: {audio_dur_s/total_duration_s:.2f}x; gen: {gen_time_s:.2f}s, post: {post_time_ms/1000:.3f}s)")
+
     save_start = perf_counter_ns()
-    save_wav = processed_wav.to(torch.float32).cpu()  # 2D mono
+    save_wav = processed_wav.to(torch.float32).cpu()
     wave_file = save_and_cache_output(save_wav, model, valid_path or audio_prompt_path, cache_uuid, text, exaggeration, params, enable_memory_cache, enable_disk_cache, sr)
     save_time_ms = (perf_counter_ns() - save_start) / 1_000_000
-    logger.debug(f"Save/cache (processed): {save_time_ms:.2f}ms → {wave_file}")
+    logger.debug(f"Save/cache: {save_time_ms:.0f}ms → {wave_file}")
 
-    # Enqueue fuzzy (MISS only)
     if reuse_result is None and (valid_path or audio_prompt_path):
-        # FIXED: Enqueue fuzzy with consistent voice_stem (matching query derivation)
-        logger.debug(f"Enqueued fuzzy MISS: \"{text[:20]}\" (stem={voice_stem})")
         FUZZY_QUEUE.put((text, wave_file, voice_stem))
 
-    # Stats
     stats = get_cache_stats()
     logger.info(f"Cache post-gen: mem={stats['memory_cache_size']}, disk={stats['disk_files']}, audio={stats['audio_cache_size']}, fuzzy={stats.get('fuzzy_size', 'N/A')}")
 
-    # Cleanup
-    del wav
-    torch.cuda.empty_cache()
     total_time_ms = (perf_counter_ns() - func_start_time) / 1_000_000
     logger.info(f"MISS cycle: {total_time_ms/1000:.2f}s (reuse={reuse_time_ms:.0f}ms, prep={prep_time_ms:.0f}ms, gen={gen_time_s:.2f}s, post={post_time_ms:.0f}ms, save={save_time_ms:.0f}ms)")
 
-    return wave_file  # Str path
+    return wave_file

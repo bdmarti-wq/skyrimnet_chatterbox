@@ -111,7 +111,6 @@ def generate_audio_ui(  # REVERT/PATCH: Sync def (Gradio calls without await →
     try:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-        logger.info(f"Current model when we call things is... {config.app_config.globals.model.__class__.__name__} ")
 
         # Lazy import + call (via kwargs for sig safety; model=MODEL from global)
         from src.generate_audio import generate_audio  # Assume will be async (returns coroutine)
