@@ -22,6 +22,9 @@ from .cache import (
 from .fuzzy_cache import try_fuzzy_audio_cache, FUZZY_QUEUE
 
 from loguru import logger  # FIXED: Use loguru consistently (remove logging import/getLogger)
+
+from .stem_utils import extract_voice_stem, get_logging_voice_name
+
 GEN_ACTIVE_LOCK = threading.RLock()  # Global for gen/prepare
 
 
@@ -304,17 +307,7 @@ async def generate_audio(model, text: str, audio_prompt_path: Optional[str], exa
     multilingual = config.app_config.globals.multilingual
 
     # FIXED: Extract stem derivation to helper (DRY)
-    def _derive_voice_stem(path: str) -> str:
-        if not path:
-            return 'default'
-        full_stem = Path(path).stem.replace('_fixed', '').replace('_padded', '').replace('_resampled', '').replace('_ui_resampled', '')
-        voice_stem = full_stem[:-6] if full_stem.endswith('_voice') else full_stem
-        if len(voice_stem) < 3:
-            voice_stem = full_stem
-        logger.debug(f"Derived voice_stem: '{voice_stem}' from path '{path}'")
-        return voice_stem
-
-    voice_stem = _derive_voice_stem(audio_prompt_path) if audio_prompt_path else 'default'
+    voice_stem = extract_voice_stem(audio_prompt_path)
 
     func_start_time = perf_counter_ns()  # FIXED: Overall start
 
@@ -339,7 +332,7 @@ async def generate_audio(model, text: str, audio_prompt_path: Optional[str], exa
     }
 
     # Logging (standardize text[:50]; all floats :.3f)
-    stem = Path(audio_prompt_path).stem if audio_prompt_path else "No ref audio"
+    stem = get_logging_voice_name(audio_prompt_path)
     logger.info(f"generate called for: \"{text[:50]}...\", {stem}, uuid: {cache_uuid}, exaggeration: {exaggeration:.2f}")
     logger.info(
         f"Parameters - temp: {temperature:.3f}, min_p: {min_p:.3f}, top_p: {top_p:.3f}, rep_penalty: {repetition_penalty:.3f}, cfg_weight: {cfgw:.3f}")
