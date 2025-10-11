@@ -42,43 +42,7 @@ def chatterbox_tts_to(model: Any, device: torch.device, dtype: torch.dtype):
     return model
 
 
-def compile_t3_step(model: Any, compile_mode: str = 'max-autotune'):
-    """Compile T3 step with graphs (from old code; togglable). DRY; fallback safe."""
-    if not torch.cuda.is_available():
-        logger.debug("Skipping t3 compile (no CUDA)")
-        return model
-    from .config import get_config_value  # Lazy
-    if not get_config_value('tts_config.compile_t3', True):  # FIXED: Flat config key (assume globals; adjust if nested)
-        logger.debug("Skipping t3 compile (disabled)")
-        return model
-    # NEW: Debug why skip (attrs post-load/to())
-    if not hasattr(model, 't3'):
-        logger.debug("Skipping t3 compile (no 't3' attr)")
-        return model
-    if not hasattr(model.t3, '_step_compilation_target'):
-        logger.debug(f"Skipping t3 compile (no '_step_compilation_target'; T3 attrs: {dir(model.t3)})")
-        return model
-    try:
-        original_step = model.t3._step_compilation_target
-        if not hasattr(model.t3, '_original_step'):
-            model.t3._original_step = original_step
-        model.t3._step_compilation_target = torch.compile(
-            model.t3._step_compilation_target,
-            mode=compile_mode,       # max-autotune for fusion + graphs
-            fullgraph=True,
-            backend='cudagraphs',    # Unified: Compile traces to graphs
-            dynamic=True            # Handles varying token lengths
-        )
-        logger.info(f"T3 step compiled (mode={compile_mode}, backend=cudagraphs)")
-        return model
-    except Exception as compile_e:
-        logger.warning(f"T3 compile failed (fallback to uncompiled): {compile_e}")
-        if hasattr(model.t3, '_original_step'):
-            model.t3._step_compilation_target = model.t3._original_step
-        return model
 
-
-# DELETE: Entire def compile_t3_step(... )  # No longer needed (built-in in T3.inference)
 
 def warmup_t3(model: Any, num_runs: int = 2):
     """Warm-up T3 graphs/buckets with dummy (built-in inductor for fusion). DRY."""
@@ -87,7 +51,7 @@ def warmup_t3(model: Any, num_runs: int = 2):
         logger.debug("Skipping T3 warmup (disabled or no CUDA)")
         return
     # FIXED: Use source's compile backend ("inductor" fuses + graphs; stride=4)
-    dummy_text = "Hello world! This is a longer sentence to trigger full T3 inference and inductor optimization."
+    dummy_text = "Hello world! This is a longer sentence to trigger full T3 inference"
     dummy_args = {
         "text": dummy_text,
         "exaggeration": 0.75,
@@ -105,13 +69,13 @@ def warmup_t3(model: Any, num_runs: int = 2):
     for i in range(num_runs):
         try:
             _ = model.generate(**dummy_args)
-            logger.debug(f"T3 warmup run {i+1}/{num_runs}: Inductor compiled")
+            logger.debug(f"T3 warmup run {i + 1}/{num_runs}: Graphs captured")  # FIXED:
         except Exception as warm_e:
             logger.warning(f"T3 warmup run {i+1} failed (non-fatal): {warm_e}")
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-    logger.info("T3 warmup complete (inductor + graphs ready)")
+    logger.info("T3 warmup complete (manual graphs ready)")  # FIXED: Match param
 
 
 class SimpleModelState:
@@ -126,7 +90,6 @@ class SimpleModelState:
         """Load and set model. FIX: Load first, then warmup (inits T3), then compile (needs inited attrs)."""
         from .config import get_config  # Lazy for overrides
         config = get_config()
-        re_optimize = kwargs.pop('re_optimize', config.get_value('re_optimize_on_reload', False))  # Optional flag
 
         if model_type == 'multilingual':
             logger.info("Loading Multilingual Model")
@@ -143,12 +106,11 @@ class SimpleModelState:
                 return None
 
             # FIXED: Order: to() → warmup (inits graphs/T3) → compile (targets _step post-init)
-            if re_optimize or not self.optimized:
-                chatterbox_tts_to(self.model, device, dtype)  # Granular dtype/device
-                warmup_t3(self.model)  # NEW: Warm-up first (inits T3 attrs before compile)
-                compile_t3_step(self.model)  # Compile after warmup (ensures _step_compilation_target exists)
-                self.optimized = True  # Mark done (skip next re-load unless flag)
-                logger.info(f"Model optimized (to()/warmup/compile) for {model_type}")
+            if not self.optimized:  # Simplified (always on first/re-optimize)
+                chatterbox_tts_to(self.model, device, dtype)
+                warmup_t3(self.model)
+                self.optimized = True
+                logger.info(f"Model optimized (to()/warmup) for {model_type}")
 
             self.model_type = model_type
             logger.info(
@@ -162,7 +124,6 @@ class SimpleModelState:
             return None
 
     def get_model(self) -> Optional[Any]:
-        # FIXED: Expose state.optimized to model (gen checks; DRY for shared opt status)
         if self.model is not None:
             self.model.optimized = self.optimized  # Propagate for gen skip (idempotent)
         return self.model
@@ -173,11 +134,7 @@ class SimpleModelState:
     def clear(self):
         clear_cache_files()  # Clear conds/audio
         if self.model is not None:
-            # FIXED: Restore original if compiled (from old code)
-            if hasattr(self.model.t3, '_original_step'):
-                self.model.t3._step_compilation_target = self.model.t3._original_step
-                delattr(self.model.t3, '_original_step')  # Clean up
-            # Del key parts to free memory
+              # Del key parts to free memory
             if hasattr(self.model, 't3'):
                 del self.model.t3
             if hasattr(self.model, 'conds'):
