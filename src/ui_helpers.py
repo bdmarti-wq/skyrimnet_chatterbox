@@ -19,8 +19,9 @@ import torchaudio
 from pathlib import Path
 import tempfile
 import torch  # For stub_wav_path (if needed for tensor)
-from .config import CONFIG
-
+from .config import CONFIG, get_config_value
+from .generate_audio import generate_audio
+from .tts_model import get_model
 
 
 # NEW: Safe helpers for scalar conversion (fixes list/None issues in sliders) - prop-based
@@ -466,53 +467,50 @@ def stub_wav_path(empty_dict=False):
         return fallback_path, error_status
 
 
-def test_voice_wrapper(test_text, test_voice, tts_state):
-    from ui import generate_audio_test
-    """Simplified wrapper for ui.py dummy (matches 3 inputs → 3 outputs: audio, status, voices)."""
+
+async def test_voice_generation(voice_name, test_text, seed):
+    """
+    Handle voice test generation with proper error handling and parameter mapping.
+    """
     try:
-        # Type safety
-        test_text = safe_to_str(test_text)
-        test_voice = safe_to_str(test_voice) if test_voice else 'default'
-        # tts_name = safe_to_str(tts_state.value) if tts_state else 'default'
+        logger.info(f"Voice test requested: voice='{voice_name}', text='{test_text[:50]}...', seed={seed})")
 
-        if not CONFIG.model:
-            path, status = stub_wav_path()
-            voices = CONFIG.get_all_voices() or ['default']
-            return path, status, voices
+        # Validate inputs
+        if not test_text.strip():
+            return None, "Please enter test text", {}
 
-        # Update params for voice (safe_to_*)
-        rate = safe_float_value('speaking_rate')
-        eq = safe_float_value('eq_gain_db')
-        gain = safe_float_value('max_gain')
-        target = safe_float_value('target_max')
-        noise = safe_float_value('noise_floor_db')
-        trim = safe_float_value('trim_threshold_db')
-        notch = safe_bool_value('notch_enabled')
-        hp = safe_bool_value('hp_enabled')
-        seed = random.randint(0, 2**32 - 1)
+        # Use the existing generate_audio function
+        result = await generate_audio(
+            model=get_model(),
+            text=test_text,
+            audio_prompt_path=None,  # Will be handled by voice selection
+            exaggeration=get_config_value('exaggeration', 0.75),
+            temperature=get_config_value('temperature', 0.65),
+            cfgw=get_config_value('cfg_weight', 0.45),
+            min_p=get_config_value('min_p', 0.1),
+            top_p=get_config_value('top_p', 1.0),
+            repetition_penalty=get_config_value('repetition_penalty', 1.5),
+            language_id="en",
+            seed_num=seed
+        )
 
-        CONFIG.update_voice_parameter(test_voice, 'speaking_rate', rate)
-        CONFIG.update_voice_parameter(test_voice, 'eq_gain_db', eq)
-        CONFIG.update_voice_parameter(test_voice, 'max_gain', gain)
-        CONFIG.update_voice_parameter(test_voice, 'target_max', target)
-        CONFIG.update_voice_parameter(test_voice, 'noise_floor_db', noise)
-        CONFIG.update_voice_parameter(test_voice, 'trim_threshold_db', trim)
-        CONFIG.update_voice_parameter(test_voice, 'notch_enabled', notch)
-        CONFIG.update_voice_parameter(test_voice, 'hp_enabled', hp)
+        # Extract parameters that were actually used
+        actual_params = {
+            'voice': voice_name,
+            'text': test_text,
+            'seed': seed,
+            'temperature': get_config_value('temperature', 0.65),
+            'cfg_weight': get_config_value('cfg_weight', 0.45),
+            'enable_memory_cache': get_config_value('enable_memory_cache', True),
+            'enable_disk_cache': get_config_value('enable_disk_cache', False),
+        }
 
-        kwargs = {'text': test_text, 'seed_num': seed, 'voice_name': test_voice}
-        result = generate_audio_test(**kwargs)
-        path, status_raw, params_dict = (result[0], result[1], result[2]) if len(result) == 3 else (result, None, {})
-        path = str(path) if path else stub_wav_path()[0]
-        status = safe_to_str(status_raw) if status_raw is not None else "✅ Test generated"
-        if isinstance(status_raw, (int, float)):
-            status = f"✅ Test | Code: {status_raw}"
-        # status += f" | Voice: {test_voice} | TTS: {tts_name}"
-        voices = CONFIG.get_all_voices() or ['default']
-        logger.info(f"Test wrapper success: {status}")
-        return path, status, voices
+        return result, f"✅ Test generated successfully", actual_params
+
     except Exception as e:
-        logger.error(f"Test wrapper failed: {e}")
-        voices = ['default']
-        return stub_wav_path()[0], f"Error: {str(e)}", voices
+        logger.error(f"Voice test failed: {e})")
+        return None, f"❌ Test generation failed: {str(e)}", {}
 
+    except Exception as e:
+        logger.error(f"Voice test error: {e})")
+        return None, f"Error: {str(e)}", {}

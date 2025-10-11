@@ -10,6 +10,7 @@ from pathlib import Path
 
 # CONFIG singleton
 from src.config import get_config, get_config_value, CONFIG
+from src.generate_tab import create_generate_tab
 from src.tts_model import get_model
 
 # ui_helpers (full: safe_*, handlers, stub_wav_path exclusive for fallbacks)
@@ -17,7 +18,7 @@ from src.ui_helpers import (
     update_api_status, safe_to_float, safe_to_int, safe_to_bool, safe_to_str, safe_float_value,
     load_voice_params_for_edit, handle_global_params_change, refresh_config_json, apply_json_changes,
     save_all_config, reset_all_config, reload_all_config, update_voice_params_ui,
-    load_voice_params_ui, handle_token_limits_change, create_global_param_handler, stub_wav_path, test_voice_wrapper
+    load_voice_params_ui, handle_token_limits_change, create_global_param_handler, stub_wav_path, test_voice_generation
 )
 
 
@@ -39,7 +40,7 @@ warnings.filterwarnings("ignore", message="torchaudio._backend.utils.info has be
 
 # make sure config and model are loaded
 get_config()
-get_model()
+MODEL = get_model()
 
 def generate_audio_test(model, text, language_id="en", audio_prompt_path=None, exaggeration=0.5, temperature=0.8, seed_num=0,
              cfgw=0, min_p=0.05, top_p=1.0, repetition_penalty=1.2, cache_uuid=0):
@@ -191,43 +192,9 @@ def create_ui():
         # Tabs (Generate default; others lazy-load via btns)
         with gr.Tabs(selected="generate") as tabs:
             # Tab 1: Generate Audio (no state/lazy – always ready)
-            with gr.TabItem("🎤 Generate Audio", id="generate", elem_id="tab-generate"):
-                with gr.Row():
-                    text_input = gr.Textbox(label="Input Text", placeholder="Enter text to generate...", lines=3, value="")
-                    # Dropdown (static defaults; refresh via manual if needed)
-                    generate_voice_choices = config.get_all_voices() or ['default']
-                    if 'default' not in generate_voice_choices:
-                        generate_voice_choices.append('default')
-                    generate_voice_dropdown = gr.Dropdown(
-                        label="Voice", choices=generate_voice_choices, value='default', allow_custom_value=False
-                    )
-                ref_audio = gr.Audio(label="Reference Audio (optional)", sources="upload", type="filepath")
-                generate_btn = gr.Button("Generate Audio", variant="primary")
-                audio_output = gr.Audio(label="Generated Audio")
-                generate_status = gr.Textbox(label="Status", interactive=False, value="Ready")
-
-                # Events (UI-only, no state)
-                generate_btn.click(
-                    fn=safe_generate_async,
-                    inputs=[text_input, generate_voice_dropdown, ref_audio],
-                    outputs=[audio_output, generate_status],
-                    js="", show_progress=True, concurrency_limit=1
-                )
-
-                # Voice .change (update self from CONFIG – no state)
-                def update_generate_voice_choices(voice):
-                    config = get_config()
-                    choices = config.get_all_voices() or ['default']
-                    if 'default' not in choices:
-                        choices.append('default')
-                    return gr.update(choices=choices, value=safe_to_str(voice, 'default'))
-
-                generate_voice_dropdown.change(
-                    fn=update_generate_voice_choices,
-                    inputs=[generate_voice_dropdown],
-                    outputs=[generate_voice_dropdown],
-                    js="", show_progress=False
-                )
+            generate_tab, audio_output, generate_status = create_generate_tab()
+            # Add a marker to help with debugging if needed
+            logger.info("Generate Audio tab loaded from external module")
 
             # Tab 2: Voice Test (lazy load btn)
             with gr.TabItem("🔊 Voice Test", id="test", elem_id="tab-test"):
@@ -270,8 +237,8 @@ def create_ui():
 
                 # Test btn (UI-only)
                 test_btn.click(
-                    fn=test_voice_wrapper,
-                    inputs=[test_voice_dropdown, test_text, test_seed, test_rate, test_eq, test_gain, test_target, test_noise, test_trim, test_notch, test_hp],
+                    fn=test_voice_generation,
+                    inputs=[test_voice_dropdown, test_text, test_seed],
                     outputs=[test_audio, test_status, test_params],
                     js="", show_progress=True, concurrency_limit=1
                 )
@@ -606,128 +573,6 @@ def create_ui():
         logger.info("State-free Tab UI: Generate default; lazy load via 'Load/Refresh' btns (user-driven, no errors)")
         return demo
 
-import tempfile  # Already? Add if not
-
-# FIXED: Async wrapper (await generate_internal; yield progress for queue overlap)
-async def safe_generate_async(text, voice, ref_wav, exagger=None, cfg_w=None, lang="en", temp=None, min_p=None, top_p=None, rep_pen=None, seed=None):
-    config = get_config()
-    """Async UI Wrapper: Awaits generate_internal (GPU gen + thread post/I/O); yields status."""
-    try:
-        logger.info(f"safe_generate_async inputs: text='{text}', voice='{voice}', ref_wav type={type(ref_wav)}")
-        text = safe_to_str(text, "")
-        voice = safe_to_str(voice, 'default')
-        ref_path = None
-
-        if not text.strip():
-            yield None, "Enter text to generate."
-            return
-
-        yield None, "Preparing..."  # Initial yield (UI responsive)
-
-        # Handle uploaded ref (Gradio dict or temp str/bytes – always valid post-preprocess)
-        if isinstance(ref_wav, dict):
-            ref_path = safe_to_str(ref_wav.get('path') or ref_wav.get('name'), None)
-            if ref_path and ('gradio' in ref_path or '/tmp/' in ref_path):  # Confirm temp upload
-                logger.info(f"Uploaded ref: {ref_path}")
-            else:
-                ref_path = None  # Invalid dict
-        elif isinstance(ref_wav, str):
-            # Temp upload str (post-cache)
-            if os.path.exists(ref_wav) and ('gradio' in ref_wav or '/tmp/' in ref_wav):
-                ref_path = ref_wav
-                logger.info(f"Temp ref: {ref_path}")
-            else:
-                logger.warning(f"Invalid ref str: {ref_wav} – no upload")
-                ref_path = None
-        elif isinstance(ref_wav, bytes):  # FIXED: Handle bytes directly (Gradio Audio type="bytes")
-            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-                tmp.write(ref_wav)
-                ref_path = tmp.name
-                logger.info(f"Bytes ref saved temp: {ref_path}")
-
-        # Fallback: CONFIG voice WAV (but validate: exists, not project/root/dir) – Unchanged
-        if not ref_path:
-            candidate_path = config.get_voice_wav_path(voice)
-            if candidate_path and os.path.isfile(candidate_path):  # File only (not dir/project)
-                # Extra safety: Skip if looks like project root (e.g., contains script name or .venv)
-                if any(bad in candidate_path.lower() for bad in ['skyrimnet_chatterbox', '.venv', os.getcwd()]):
-                    logger.warning(f"Skipping bad fallback path (project dir?): {candidate_path}")
-                    ref_path = None
-                else:
-                    ref_path = candidate_path
-                    logger.info(f"Using valid default ref for '{voice}': {ref_path}")
-            else:
-                logger.info(f"No valid default ref for '{voice}' (path invalid/missing) – Default synthesis")
-                ref_path = None
-
-        lang = safe_to_str(lang, "en")
-
-        # UI params or CONFIG fallback (no clamping—internal merges) – Unchanged
-        final_exagger = safe_to_float(exagger, get_config_value('exaggeration', 1.0))
-        final_cfg_w = safe_to_float(cfg_w, get_config_value('cfg_weight', 0.45))
-        final_temp = safe_to_float(temp, get_config_value('temperature', 0.65))
-        final_min_p = safe_to_float(min_p, get_config_value('min_p', 0.1))
-        final_top_p = safe_to_float(top_p, get_config_value('top_p', 1.0))
-        final_rep = safe_to_float(rep_pen, get_config_value('repetition_penalty', 1.5))
-        if seed is None:
-            seed_num = random.randint(0, 2**31 - 1)
-        else:
-            seed_num = safe_to_int(seed, 0)
-
-        # Voice/Ref (stem for cloning; default if invalid) – Unchanged
-        voice_name = voice
-        if ref_path and os.path.exists(ref_path):
-            voice_name = Path(ref_path).stem
-            if voice_name in ['tmp', 'unknown', 'stub', '']:
-                voice_name = voice or 'default'
-            logger.info(f"Cloning from ref: {ref_path} → voice_name={voice_name}")
-        else:
-            logger.warning(f"No valid ref for '{voice}' - Using default synthesis")
-
-        # Cache UUID (simple seed-based) – Unchanged
-        cache_uuid = seed_num if seed_num > 0 else 0
-
-        # Minimal post_overrides (audio params from CONFIG; merge in internal) – Unchanged
-        post_overrides = {
-            'speaking_rate': float(get_config_value('speaking_rate', 1.0)),
-            # Extend e.g., 'eq_gain_db': get_config_value('eq_gain_db', 0.0) if UI slider added
-        }
-
-        yield None, "Generating audio..."  # Progress during gen
-
-        # FIXED: Direct await generate_internal (async pipeline; no asyncio.run – event loop safe)
-        path = await generate_audio(
-            text, lang, ref_path, final_exagger, final_temp, seed_num, final_cfg_w,
-            final_min_p, final_top_p, final_rep, cache_uuid, voice_name, post_overrides
-        )
-
-        yield None, "Processing and saving..."  # Yield during post/save (overlapped)
-
-        # Validate output – Unchanged
-        status = f"✅ Generated | Voice: {voice_name} | Seed: {seed_num} | Text: {text[:20]}..."
-        if not path or not os.path.exists(path) or os.path.getsize(path) == 0:
-            logger.warning(f"Invalid path from internal: {path} - Falling back to stub")
-            stub_path, stub_status = stub_wav_path()  # From ui_helpers
-            logger.warning(f"Invalid path from internal: {path} - Falling back to stub ({stub_status})")
-            status = f"❌ Invalid output | Voice: {voice_name} | {stub_status}"
-            path = stub_path
-
-        # Cleanup temp ref if bytes
-        if isinstance(ref_wav, bytes) and ref_path:
-            try:
-                os.unlink(ref_path)
-                logger.debug(f"Temp ref cleaned: {ref_path}")
-            except:
-                pass
-
-        yield path, status  # Final yield (audio + success)
-
-        logger.info(f"safe_generate_async: {status} (UI async await → internal)")
-    except Exception as e:
-        logger.error(f"safe_generate_async error: {e}")
-        stub_path, stub_status = stub_wav_path()
-        status = f"Wrapper error: {e} | {stub_status}"
-        yield stub_path, status
 
 
 if __name__ == "__main__":
