@@ -29,7 +29,7 @@ _fuzzy_save_counter = 0  # NEW: Define missing global
 
 get_config()
 MAX_INDEX_SIZE = get_config_value('fuzzy_index_size', default=1000)  # For fuzzy per-stem
-ENABLE_FUZZY = get_config_value('fuzzy_enable', default=True)  # New: Toggle fuzzy
+ENABLE_FUZZY = get_config_value('enable_fuzzy_cache', default=True)  # New: Toggle fuzzy
 ENABLE_ARTIFACT_PURGE = get_config_value('fuzzy_artifact_purge_enable', default=True)  # NEW: Config toggle for purging
 
 
@@ -62,7 +62,7 @@ def try_fuzzy_audio_cache(audio_path: str = None, text_input: str = None, exagge
     Boosts sim for configurable short/moans words; min length tunable.
     NEW: On HIT, validate wav_path for artifacts (purge if bad; fallback MISS)."""
     if not text_input or (
-            text_input and len(text_input.strip()) < 3):  # Min guard (hardcode 3 if config fails; tunable below)
+            text_input and (len(text_input) < 2 or not any(c.isalpha() for c in text_input))):  # Min guard (hardcode 3 if config fails; tunable below)
         if not quiet:
             logger.debug(f"Fuzzy skip: No/invalid text_input ({text_input[:20] if text_input else 'None'})")
         return None

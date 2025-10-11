@@ -10,7 +10,8 @@ from time import perf_counter_ns
 import torchaudio
 from typing import Optional, Dict, Any, Tuple
 
-from .config import get_config  # FIXED: Only get_config (value via config.get_value()); remove loose get_config_value
+from .config import get_config, \
+    get_config_value  # FIXED: Only get_config (value via config.get_value()); remove loose get_config_value
 from .monitor import monitor_resources
 from .audio_utils import apply_post_processing
 from .cache import (
@@ -357,14 +358,14 @@ async def generate_audio(model, text: str, audio_prompt_path: Optional[str], exa
 
     # FIXED: Conditional intra-gen warm-up (skip if pre-optimized; aligns with model.py)
     from .model import warmup_t3
-    if config.get_value('warmup_t3', True) and hasattr(model, 'generate') and not (hasattr(model, 'optimized') and model.optimized):
+    if get_config_value('warmup_t3', True) and hasattr(model, 'generate') and not (hasattr(model, 'optimized') and model.optimized):
         dummy_warm = model.generate("Warm-up text.")  # Short; triggers if no cache hit
         logger.debug("Intra-gen T3 warmup complete (fallback)")
     elif hasattr(model, 'optimized') and model.optimized:
         logger.debug("T3 warmup skipped: Model pre-optimized")
 
     reuse_start = perf_counter_ns()
-    try_fuzzy = config.get_value('fuzzy_enable')  # Use get_value (consistent)
+    try_fuzzy = get_config_value('fuzzy_enable', True)  # Use get_value (consistent)
     reuse_result = try_reuse_audio(text, audio_prompt_path, exaggeration, params, try_fuzzy) if audio_prompt_path else None
     reuse_time_ms = (perf_counter_ns() - reuse_start) / 1_000_000
     if reuse_result:

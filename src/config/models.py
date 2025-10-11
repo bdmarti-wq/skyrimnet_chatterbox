@@ -213,7 +213,7 @@ class AudioConfig(BaseModel):
 class FuzzyConfig(BaseModel):
     model_config = ConfigDict(extra='ignore', populate_by_name=True)
 
-    fuzzy_enable: bool = Field(default=True)
+    enable_fuzzy_cache: bool = Field(default=True)
     fuzzy_threshold: float = Field(default=0.70, ge=CAPS['FUZZY_THRESHOLD_MIN'], le=CAPS['FUZZY_THRESHOLD_MAX'])
     fuzzy_boost_amount: float = Field(default=0.15, ge=CAPS['FUZZY_BOOST_AMOUNT_MIN'], le=CAPS['FUZZY_BOOST_AMOUNT_MAX'])
     fuzzy_boost_words: List[str] = Field(default_factory=lambda: CAPS['FUZZY_BOOST_WORDS'])  # List from CAPS
@@ -360,7 +360,7 @@ class VoiceConfig(BaseModel):
     ebu_true_peak: Optional[float] = Field(default=None, ge=CAPS['EBU_TRUE_PEAK_MIN'], le=CAPS['EBU_TRUE_PEAK_MAX'])
 
     # Fuzzy overrides (optional; inherit from globals.fuzzy)
-    fuzzy_enable: Optional[bool] = Field(default=None)
+    enable_fuzzy_cache: Optional[bool] = Field(default=True)
     fuzzy_threshold: Optional[float] = Field(default=None, ge=CAPS['FUZZY_THRESHOLD_MIN'], le=CAPS['FUZZY_THRESHOLD_MAX'])
     fuzzy_boost_amount: Optional[float] = Field(default=None, ge=CAPS['FUZZY_BOOST_AMOUNT_MIN'], le=CAPS['FUZZY_BOOST_AMOUNT_MAX'])
     fuzzy_index_size: Optional[int] = Field(default=None, ge=CAPS['FUZZY_CACHE_LIMIT_MIN'], le=CAPS['FUZZY_CACHE_LIMIT_MAX'])
