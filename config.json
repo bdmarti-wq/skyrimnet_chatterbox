@@ -10,7 +10,8 @@
       "max_new_tokens": 1499,
       "min_new_tokens": 224,
       "max_cache_len": 4096,
-      "stride_length": 8
+      "stride_length": 8,
+      "generate_token_backend": "cudagraphs-manual"
     },
     "audio": {
       "enable_post_processing": true,

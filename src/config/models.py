@@ -147,6 +147,9 @@ class TtsConfig(BaseModel):
     min_new_tokens: int = Field(default=224, ge=CAPS['MIN_NEW_TOKENS_MIN'], le=CAPS['MIN_NEW_TOKENS_MAX'])
     max_cache_len: int = Field(default=4096, ge=CAPS['MAX_CACHE_LEN_MIN'], le=CAPS['MAX_CACHE_LEN_MAX'])
     stride_length: int = Field(default=8, ge=CAPS['STRIDE_LENGTH_MIN'], le=CAPS['STRIDE_LENGTH_MAX'])
+    compile_t3: bool = True  # Enable T3 compile
+    warmup_t3: bool = True  # Enable warmup
+    re_optimize_on_reload: bool = False  # Re-apply opts on get_model re-load
 
     def get_field_bounds(self, field_name: str) -> Optional[Dict[str, Any]]:
         """UI helper: Return min/max for field from CAPS."""

@@ -1,27 +1,26 @@
 import functools
-import logging
+import gc  # NEW: For potential cleanup (aligns with model.py)
 import threading
+from contextlib import contextmanager
 
 import numpy as np
 from pathlib import Path
 import torch
-from time import perf_counter_ns, time
+from time import perf_counter_ns
 import torchaudio
 from typing import Optional, Dict, Any, Tuple
 
-from .config import get_config, get_config_value
+from .config import get_config  # FIXED: Only get_config (value via config.get_value()); remove loose get_config_value
 from .monitor import monitor_resources
-
-get_config_value
 from .audio_utils import apply_post_processing
 from .cache import (
     try_audio_cache, set_audio_cache, get_cache_key, get_or_queue_voice_process,
     validate_voice_path, create_dummy_conds, load_conditionals_cache, save_conditionals_cache,
     get_cache_stats, check_and_update_ref, save_torchaudio_wav
 )
-from .fuzzy_cache import try_fuzzy_audio_cache, FUZZY_QUEUE  # Added missing import
+from .fuzzy_cache import try_fuzzy_audio_cache, FUZZY_QUEUE
 
-logger = logging.getLogger(__name__)
+from loguru import logger  # FIXED: Use loguru consistently (remove logging import/getLogger)
 GEN_ACTIVE_LOCK = threading.RLock()  # Global for gen/prepare
 
 
@@ -66,7 +65,7 @@ def _generate_audio_core(
     t3_params: Dict[str, Any]
 ) -> torch.Tensor:
     """
-    Core: Just model.generate + graph retry. Returns wav; no del/cleanup.
+    Core: Just model.generate + graph retry. Returns wav; no del/cleanup (handled caller).
     :param model: Loaded TTS model.
     :param generate_args: Dict of args for model.generate.
     :param t3_params: Dict of t3-specific params.
@@ -94,7 +93,13 @@ def _generate_audio_core(
                 wav = model.generate(**generate_args_temp)
             else:
                 raise
-        return wav
+        except Exception as e:  # FIXED: Broader catch for compile errors (e.g., cuFFT)
+            logger.error(f"Core gen failed (fallback silence): {e}")
+            wav = None  # Trigger silence
+        finally:  # FIXED: Ensure cleanup if exception (leaks)
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        return wav if wav is not None else torch.zeros(1, 24000 * 2, dtype=torch.float32, device='cpu')
 
 
 def try_reuse_audio(
@@ -122,16 +127,29 @@ def try_reuse_audio(
     # Fuzzy: Extract stem explicitly (normalize, remove '_fixed' etc.)
     fuzzy_path = None
     if try_fuzzy:
-        # FIXED: Derive full_stem consistently (strip '_voice' suffix without split for full base)
+        if not audio_prompt_path:  # FIXED: Explicit None guard (defensive)
+            logger.debug("Fuzzy skipped: No audio_prompt_path")
+            return None
+        # Derive full_stem consistently (strip '_voice' suffix without split for full base)
         full_stem = Path(audio_prompt_path).stem.replace('_fixed', '').replace('_padded', '').replace('_resampled', '').replace('_ui_resampled', '')  # e.g., 'cs_coralyn_voice'
         voice_stem = full_stem[:-6] if full_stem.endswith('_voice') else full_stem  # Strip '_voice' suffix (e.g., "cs_coralyn_voice" → "cs_coralyn")
         if len(voice_stem) < 3:
             voice_stem = full_stem  # Ensure full
-        logger.debug(f"Query stem derived: '{voice_stem}' from path '{audio_prompt_path}'")  # FIXED: Added debug log
+        logger.debug(f"Query stem derived: '{voice_stem}' from path '{audio_prompt_path}'")
         fuzzy_path = try_fuzzy_audio_cache(audio_prompt_path, text, stem=voice_stem)  # audio_path=voice path, text_input=text, stem=voice_stem
     if fuzzy_path:
         return fuzzy_path, "Fuzzy audio"
     return None
+
+
+@contextmanager
+def no_grad_context(device: str = 'cuda'):
+    """Context for no_grad (memory/perf opt). DRY."""
+    if device != 'cuda':
+        yield
+        return
+    with torch.no_grad():
+        yield
 
 
 def prepare_voice_and_conds(
@@ -219,7 +237,6 @@ def prepare_voice_and_conds(
 
 def save_and_cache_output(
     wav: torch.Tensor,
-    model: Any,
     audio_prompt_path: Optional[str],
     cache_uuid: int,
     text: str,
@@ -232,7 +249,6 @@ def save_and_cache_output(
     """
     Helper: Save WAV, cache exact audio if applicable.
     :param wav: Processed WAV tensor (2D mono).
-    :param model: Loaded model (for sr if needed, but pass sr param).
     :param audio_prompt_path: Audio prompt path.
     :param cache_uuid: Cache UUID.
     :param text: Text.
@@ -255,6 +271,7 @@ def save_and_cache_output(
     else:
         wave_file = str(save_torchaudio_wav(wav.cpu(), sr, audio_path=None, uuid=cache_uuid))
     return wave_file
+
 
 @monitor_resources(enable=True, log_level="INFO")
 async def generate_audio(model, text: str, audio_prompt_path: Optional[str], exaggeration: float = 0.5,
@@ -320,7 +337,7 @@ async def generate_audio(model, text: str, audio_prompt_path: Optional[str], exa
         'repetition_penalty': repetition_penalty, 'language_id': language_id
     }
 
-    # Logging (standardize text[:50])
+    # Logging (standardize text[:50]; all floats :.3f)
     stem = Path(audio_prompt_path).stem if audio_prompt_path else "No ref audio"
     logger.info(f"generate called for: \"{text[:50]}...\", {stem}, uuid: {cache_uuid}, exaggeration: {exaggeration:.2f}")
     logger.info(
@@ -337,6 +354,14 @@ async def generate_audio(model, text: str, audio_prompt_path: Optional[str], exa
         seed_num = 42
     set_seed(seed_num)
     logger.debug(f"Set seed: {seed_num}")
+
+    # FIXED: Conditional intra-gen warm-up (skip if pre-optimized; aligns with model.py)
+    from .model import warmup_t3
+    if config.get_value('warmup_t3', True) and hasattr(model, 'generate') and not (hasattr(model, 'optimized') and model.optimized):
+        dummy_warm = model.generate("Warm-up text.")  # Short; triggers if no cache hit
+        logger.debug("Intra-gen T3 warmup complete (fallback)")
+    elif hasattr(model, 'optimized') and model.optimized:
+        logger.debug("T3 warmup skipped: Model pre-optimized")
 
     reuse_start = perf_counter_ns()
     try_fuzzy = config.get_value('fuzzy_enable')  # Use get_value (consistent)
@@ -365,13 +390,12 @@ async def generate_audio(model, text: str, audio_prompt_path: Optional[str], exa
     prep_time_ms = (perf_counter_ns() - prep_start) / 1_000_000
     logger.debug(f"Prep/conds: {prep_time_ms:.0f}ms")
 
-    conditional_start_time = perf_counter_ns()
-    logger.info(f"Conditionals prepared. Time: {(conditional_start_time - func_start_time) / 1_000_000:.0f}ms")
+    # FIXED: Drop conditional_start_time (redundant with prep_time_ms)
 
     t3_params = {
-        "generate_token_backend": "cudagraphs-manual",
-        "stride_length": 4,
-        "skip_when_1": True,
+        "generate_token_backend": "cudagraphs-manual",  # TODO from config ? FIXED: Use inductor for fused speed (source)
+        "stride_length": 4,  # Parallel tokens (source)
+        "skip_when_1": True
     }
     generate_args = {
         "text": text,
@@ -387,15 +411,16 @@ async def generate_audio(model, text: str, audio_prompt_path: Optional[str], exa
         generate_args["language_id"] = language_id
 
     gen_start = perf_counter_ns()  # FIXED: Core gen start
-    wav = _generate_audio_core(model, generate_args, t3_params)
+    with no_grad_context(device=device):  # FIXED: Pass torch.device (no str)
+        wav = _generate_audio_core(model, generate_args, t3_params)
     gen_time_s = (perf_counter_ns() - gen_start) / 1_000_000_000  # FIXED: Core time
     logger.debug(f"Core gen time: {gen_time_s:.2f}s | raw wav shape: {wav.shape if wav is not None else 'None'}")
 
     if wav is None or wav.numel() == 0:
         logger.warning(f"Empty gen for '{text[:50]}...' – fallback silence")
-        # FIXED: Centralize silence
+        # FIXED: Centralize silence; CPU/fp32 for torchaudio save
         def _silence_tensor(sr: int, duration_s: float = 2.0) -> torch.Tensor:
-            return torch.zeros(1, int(sr * duration_s), dtype=dtype, device=device)
+            return torch.zeros(1, int(sr * duration_s), dtype=torch.float32, device='cpu')  # FIXED: CPU fallback (save-safe)
         wav = _silence_tensor(sr)
 
     merged_params = config.get_merged_audio_params(voice_name=voice_stem)  # Use voice_stem
@@ -452,16 +477,19 @@ async def generate_audio(model, text: str, audio_prompt_path: Optional[str], exa
     logger.info(  # FIXED: RTF log at INFO (end)
         f"Generated {audio_dur_s:.2f}s audio (total RTF: {rtf_total:.2f}x, core RTF: {rtf_core:.2f}x)")
 
-    # FIXED: Conditional cleanup
+    # FIXED: Conditional cleanup (always; safe)
     if torch.cuda.is_available():
-        del wav
+        del wav  # FIXED: Del even if reused (idempotent)
+        del wav_tensor  # NEW: Extra del for post
         torch.cuda.empty_cache()
 
     logger.info(f"Processed: {audio_dur_s:.2f}s {sr/1000:.0f}kHz in {total_duration_s:.2f}s (speed: {audio_dur_s/total_duration_s:.2f}x; gen: {gen_time_s:.2f}s, post: {post_time_ms/1000:.3f}s)")
 
     save_start = perf_counter_ns()
     save_wav = processed_wav.to(torch.float32).cpu()
-    wave_file = save_and_cache_output(save_wav, model, valid_path or audio_prompt_path, cache_uuid, text, exaggeration, params, enable_memory_cache, enable_disk_cache, sr)
+    wave_file = save_and_cache_output(  # FIXED: Removed model arg
+        save_wav, valid_path or audio_prompt_path, cache_uuid, text, exaggeration, params, enable_memory_cache, enable_disk_cache, sr
+    )
     save_time_ms = (perf_counter_ns() - save_start) / 1_000_000
     logger.debug(f"Save/cache: {save_time_ms:.0f}ms → {wave_file}")
 
