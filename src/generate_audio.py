@@ -286,7 +286,7 @@ async def generate_audio(model, text: str, audio_prompt_path: Optional[str], exa
     FIXED: Added full timings/RTF; model guard; consistent stem derivation.
     """
     # FIXED: Guard model at entry (fetch from manager if bad)
-    from src.model import ModelManager  # Ensure
+    from src.tts_model import ModelManager  # Ensure
     if model is None or isinstance(model, str) or not hasattr(model, 'generate'):
         logger.warning(f"Invalid model to generate_audio: type={type(model).__name__} ({model}) – fetching from manager")
         real_model = ModelManager.get_instance().get_model()
@@ -357,7 +357,7 @@ async def generate_audio(model, text: str, audio_prompt_path: Optional[str], exa
     logger.debug(f"Set seed: {seed_num}")
 
     # FIXED: Conditional intra-gen warm-up (skip if pre-optimized; aligns with model.py)
-    from .model import warmup_t3
+    from .tts_model import warmup_t3
     if get_config_value('warmup_t3', True) and hasattr(model, 'generate') and not (hasattr(model, 'optimized') and model.optimized):
         dummy_warm = model.generate("Warm-up text.")  # Short; triggers if no cache hit
         logger.debug("Intra-gen T3 warmup complete (fallback)")

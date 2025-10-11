@@ -23,7 +23,7 @@ from .config import get_config, get_config_value
 config = get_config()
 
 # FIX: Load TTS via singleton (essential; supports multilingual)
-from src.model import ModelManager
+from src.tts_model import ModelManager
 
 ### SkyrimNet Zonos Emulated
 @functools.cache

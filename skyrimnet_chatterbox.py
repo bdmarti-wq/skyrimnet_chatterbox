@@ -12,9 +12,8 @@ from src.config import get_config, get_config_value
 # Lazy import inside generate (avoids global Gradio scan/inference)
 from src.audio_utils import set_torchaudio_backend
 from src.fuzzy_cache import load_fuzzy_cache
-from src.model import load_model
 from src.ui import create_ui
-from src.model import ModelManager
+from src.tts_model import ModelManager
 
 backend = set_torchaudio_backend()
 

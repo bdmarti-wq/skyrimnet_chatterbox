@@ -10,7 +10,7 @@ from pathlib import Path
 
 # CONFIG singleton
 from src.config import get_config, get_config_value, CONFIG
-from src.model import get_model
+from src.tts_model import get_model
 
 # ui_helpers (full: safe_*, handlers, stub_wav_path exclusive for fallbacks)
 from src.ui_helpers import (
