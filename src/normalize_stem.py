@@ -1,4 +1,3 @@
-# New Helper: Shared stem normalization (extracted from multiple places; testable: input path → expected stem)
 import re
 import loguru
 from pathlib import Path
@@ -24,7 +23,7 @@ def normalize_stem(audio_path: str, provided_stem: str | None = None, min_len: i
     # Regex extract voice before UUID/temp (e.g., 'vp_11_lilia_123hex' → 'vp_11_lilia')
     match = re.match(r'([a-zA-Z0-9_]+[voice]?)(_?[0-9a-f]{15,})?$', basename)
     stem = match.group(1) if match else basename.replace('_fixed', '').replace('_padded', '').replace('_resampled',
-                                                                                                      '').replace(
+                                                                                                  '').replace(
         '_ui_resampled', '').replace('_temp', '')
     if len(stem) < min_len:
         stem = basename  # Fallback to full

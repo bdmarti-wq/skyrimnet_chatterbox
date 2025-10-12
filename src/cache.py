@@ -465,7 +465,7 @@ _cache_manager = ConditionalsCacheManager()
 
 
 class AudioCacheManager:
-    """Memory-only LRU cache for generated audio paths with optional JSON persistence."""
+    """Memory + disk LRU cache for generated audio paths with JSON persistence."""
 
     def __init__(self, enable_disk_cache: bool = ENABLE_DISK_CACHE):
         self._audio_cache = {}
@@ -474,6 +474,7 @@ class AudioCacheManager:
         self._enable_disk_cache = enable_disk_cache
         self._dirty_keys = set()  # Track changes for batch save
         self._last_save_time = 0  # Throttle timer (prevent flood)
+        self.persistent_file = CACHE_AUDIO_DIR / "audio_cache.json"  # NEW: Dedicated persistent file
         if self._enable_disk_cache:
             self._load_from_json()
 
@@ -483,12 +484,12 @@ class AudioCacheManager:
             if path:
                 path = Path(path) if isinstance(path, str) else path  # Ensure Path
                 if path.exists():
-                    logger.trace(f"Audio cache get HIT: {key[:8]}... → {path}")
+                    logger.trace(f"Audio cache get HIT: {key[:8]}... → {path} (from memory)")
                     return str(path)  # Return str for compat (e.g., bridge_ui expects str path)
                 else:
-                    logger.debug(f"Audio cache path missing: {path} – evict")
+                    logger.debug(f"Audio cache path missing: {path} – evict from memory")
                     self._audio_cache.pop(key, None)  # Clean invalid
-            logger.trace(f"Audio cache MISS: {key[:8]}...")
+            logger.trace(f"Audio cache MISS: {key[:8]}... (checking memory)")
             return None
 
     def set(self, key, path):
@@ -512,7 +513,7 @@ class AudioCacheManager:
                 oldest_path = self._audio_cache.pop(oldest_key)
                 self._dirty_keys.discard(oldest_key)
                 logger.trace(f"Evicted oldest audio cache: {oldest_key[:8]}... ({oldest_path})")
-            # FIXED: Throttle async (check time + dirty; reduce spam on rapid sets like batch gen)
+            # FIXED: Throttle async save (check time + dirty; reduce spam on rapid sets like batch gen)
             if self._enable_disk_cache and len(self._dirty_keys) >= 10:
                 now = time.time()
                 if now - self._last_save_time > 2.0:  # Min 2s between saves (anti-flood)
@@ -533,25 +534,26 @@ class AudioCacheManager:
 
     def _load_from_json(self):
         """Load audio cache from JSON on init (relative str → absolute Path)."""
-        cache_json = CACHE_AUDIO_DIR / "audio_cache.json"
-        if cache_json.exists():
-            try:
-                with open(cache_json, 'r') as f:
-                    data = json.load(f)
-                loaded = 0
-                with self._lock:
-                    for key, rel_str in data.items():
-                        abs_path = ROOT_DIR / rel_str  # str → Path
-                        if abs_path.exists():
-                            self._audio_cache[key] = abs_path  # Store Path
-                            loaded += 1
-                        else:
-                            logger.warning(f"Loaded invalid path for {key[:8]}...: {abs_path} – skipped")
-                logger.info(f"Loaded audio cache from JSON: {loaded}/{len(data)} entries (as Path objects)")
-            except (json.JSONDecodeError, OSError) as e:
-                logger.warning(f"Load audio cache JSON failed: {e} – fresh cache")
-                with self._lock:
-                    self._audio_cache.clear()
+        if not self.persistent_file.exists():
+            logger.debug("No audio cache JSON – starting empty memory cache")
+            return
+        try:
+            with open(self.persistent_file, 'r') as f:
+                data = json.load(f)
+            loaded = 0
+            with self._lock:
+                for key, rel_str in data.items():
+                    abs_path = ROOT_DIR / rel_str  # str → Path
+                    if abs_path.exists():
+                        self._audio_cache[key] = abs_path  # Store Path
+                        loaded += 1
+                    else:
+                        logger.warning(f"Loaded invalid path for {key[:8]}...: {abs_path} – skipped")
+            logger.info(f"Loaded persistent audio cache from JSON: {loaded}/{len(data)} entries (as Path objects)")
+        except (json.JSONDecodeError, OSError) as e:
+            logger.warning(f"Load audio cache JSON failed: {e} – fresh cache")
+            with self._lock:
+                self._audio_cache.clear()
 
     def _save_to_json(self, force_empty: bool = False):
         """Save current audio cache to JSON (Path → relative str; skip invalids). FIXED: Handle str if any slip through."""
@@ -571,15 +573,14 @@ class AudioCacheManager:
                     except ValueError as ve:
                         logger.debug(f"Save skip non-relative path for {key[:8]}...: {abs_path} ({ve})")
                         continue
-            cache_json = CACHE_AUDIO_DIR / "audio_cache.json"
             try:
-                with open(cache_json, 'w') as f:
+                with open(self.persistent_file, 'w') as f:
                     json.dump(temp_cache, f, indent=2)
                 self._dirty_keys.clear()
-                logger.debug(f"Saved audio cache JSON: {len(temp_cache)} entries (dirty cleared; no str errors)")
+                logger.debug(f"Saved persistent audio cache JSON: {len(temp_cache)} entries (dirty cleared; no str errors)")
                 self._last_save_time = time.time()  # Update throttle
             except OSError as e:
-                logger.error(f"Save audio cache JSON failed: {e} – memory only")
+                logger.error(f"Save persistent audio cache JSON failed: {e} – memory only")
 
     def _async_save_if_dirty(self):
         """Async batch save if dirty (throttled; FIXED: Lock + check to prevent overlap/spam)."""
@@ -589,6 +590,7 @@ class AudioCacheManager:
                 logger.trace(f"Async save skipped: {len(self._dirty_keys)} dirty (throttle)")
                 return
         self._save_to_json()  # Now safe (locked check passed)
+
 
 
 _audio_manager = AudioCacheManager()

@@ -230,7 +230,7 @@ def prepare_voice_and_conds(
 
 def save_and_cache_output(
         wav: torch.Tensor,
-        audio_prompt_path: Optional[str],
+        audio_prompt_path: Optional[str],  # Now explicitly named 'audio_prompt_path' for unpadded
         cache_uuid: int,
         text: str,
         exaggeration: float,
@@ -248,7 +248,7 @@ def save_and_cache_output(
     if audio_prompt_path:
         full_cache_key = get_cache_key(audio_path=audio_prompt_path, uuid=cache_uuid, exaggeration=exaggeration,
                                        text=text)
-        # Enhanced log: Use normalized stem for debugging
+        # Enhanced log: Use normalized stem from voice_path param (now unpadded)
         norm_stem = normalize_stem(audio_prompt_path)
         logger.debug(
             f"Generated audio cache_key: {full_cache_key} (stem={norm_stem}, text='{text[:20]}...', uuid_hex={hex(cache_uuid)[:10]}...)")
@@ -477,8 +477,11 @@ async def generate_audio(model, text: str, audio_prompt_path: Optional[str], exa
 
     save_start = perf_counter_ns()
     save_wav = processed_wav.to(torch.float32).cpu()
-    wave_file = save_and_cache_output(  # FIXED: Removed model arg
-        save_wav, valid_path or audio_prompt_path, cache_uuid, text, exaggeration, params, enable_memory_cache, enable_disk_cache, sr
+    # FIXED: Use original unpadded audio_prompt_path for save (unpadded key/prefix); valid_path for prep only
+    save_voice_path = audio_prompt_path  # Unpadded original for consistent cache key
+    logger.debug(f"Save using unpadded voice_path: '{save_voice_path}' (valid_path was '{valid_path}')")
+    wave_file = save_and_cache_output(
+        save_wav, save_voice_path, cache_uuid, text, exaggeration, params, enable_memory_cache, enable_disk_cache, sr
     )
     save_time_ms = (perf_counter_ns() - save_start) / 1_000_000
     logger.debug(f"Save/cache: {save_time_ms:.0f}ms → {wave_file}")
