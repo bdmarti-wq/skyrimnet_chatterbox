@@ -100,7 +100,7 @@ def generate_audio_ui(  # REVERT/PATCH: Sync def (Gradio calls without await →
     }
 
     logger.info(
-        f"UI provided parameters - temp: {params['temperature']}, min_p: {params['min_p']}, top_p: {params['top_p']}, rep_penalty: {params['repetition_penalty']}, cfg_weight: {params['cfg_weight']}, exaggeration: {params['exaggeration']}")
+        f"UI provided parameters - cache_uuid: {uuid}, temp: {params['temperature']}, min_p: {params['min_p']}, top_p: {params['top_p']}, rep_penalty: {params['repetition_penalty']}, cfg_weight: {params['cfg_weight']}, exaggeration: {params['exaggeration']}")
 
     # Important - use server supplied uuid for consistent seed
     seed_num = cpp_uuid_to_seed(uuid)
@@ -127,6 +127,8 @@ def generate_audio_ui(  # REVERT/PATCH: Sync def (Gradio calls without await →
             min_p=params['min_p'],
             top_p=params['top_p'],
             repetition_penalty=params['repetition_penalty'],
+            enable_memory_cache=get_config_value('app_config.globals.enable_memory_cache', True),
+            enable_disk_cache=get_config_value('app_config.globals.enable_disk_cache', True),
             language_id=language  # kwarg-safe
         )
 

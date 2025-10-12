@@ -18,6 +18,7 @@ from loguru import logger
 from .config import get_config, get_config_value
 from .audio_utils import is_artifact_laden
 from .cache import ROOT_DIR, CACHE_AUDIO_DIR  # Import shared paths only
+from .normalize_stem import normalize_stem
 
 # Globals
 FUZZY_QUEUE = Queue(maxsize=0)  # Non-blocking
@@ -67,53 +68,33 @@ def try_fuzzy_audio_cache(audio_path: str = None, text_input: str = None, exagge
             logger.debug(f"Fuzzy skip: No/invalid text_input ({text_input[:20] if text_input else 'None'})")
         return None
 
-    # Extract/fix stem (required; fallback if swapped)
-    if stem is None:
-        if audio_path:
-            full_stem = Path(audio_path).stem.replace('_fixed', '').replace('_padded', '').replace('_resampled',
-                                                                                                   '').replace(
-                '_ui_resampled', '')  # e.g., 'cs_coralyn_voice'
-            if full_stem.endswith('_voice'):
-                stem = full_stem[:-6]  # Remove '_voice' (e.g., "cs_coralyn_voice" → "cs_coralyn")
-            else:
-                stem = full_stem  # Already clean
-            logger.debug(f"Full stem derived: '{stem}' from path '{audio_path}'")
-        else:
-            logger.warning(
-                "Fuzzy: No audio_path or stem – cannot filter per-voice; using global fallback (inefficient)")
-            stem = 'global'  # Fallback: All entries (less precise)
-    # Auto-extend short stems (e.g., 'vp' → full from audio_path or cache)
-    if len(stem) < 3 and audio_path:
-        old_stem = stem
-        full_stem = Path(audio_path).stem.replace('_fixed', '').replace('_padded', '').replace('_resampled',
-                                                                                               '').replace(
-            '_ui_resampled', '')
-        if full_stem.endswith('_voice'):
-            candidate_stem = full_stem[:-6]  # Remove '_voice' (e.g., "cs_coralyn_voice" → "cs_coralyn")
-        else:
-            candidate_stem = full_stem  # Already clean
+    if stem is None and audio_path:
+        stem = normalize_stem(audio_path)
+    elif len(stem) < 3 and audio_path:
+        # Try to get a valid stem from audio path
+        candidate_stem = normalize_stem(audio_path)
         if len(candidate_stem) >= 3 and candidate_stem not in ['global', 'audio_reuse']:
-            stem = candidate_stem  # Use full if valid
+            old_stem = stem
+            stem = candidate_stem
             logger.debug(f"Fuzzy: Extended short stem '{old_stem}' to '{stem}' from path")
+            # Fallback if still invalid
+            if stem is None:
+                logger.warning("Fuzzy: No audio_path or stem – using global fallback (less precise)")
+                stem = 'global'
+    if stem is None:
+        logger.warning("Fuzzy: No audio_path or stem – using global fallback (less precise)")
+        stem = 'global'
 
     threshold = threshold or get_config_value('fuzzy_threshold', default=0.75)
 
     # Detect swap: If text_input short/looks like stem (e.g., 'dlc1seranavoice'), warn + auto-swap
     min_length = get_config_value('fuzzy_min_length', default=3)
     if len(text_input.strip()) < 10 and re.match(r'^[a-z0-9_]+(voice|maid|npc)?$',
-                                                 text_input.lower()):  # Heuristic: Looks like stem
-        logger.warning(
-            f"Fuzzy detect: Possible arg swap (text_input='{text_input}' too stem-like) – auto-fixing (use correct: audio_path, text_input=text, stem=voice)")
+            text_input.lower()):  # Heuristic: Looks like stem
+        logger.warning(f"Fuzzy detect: Possible arg swap (text_input='{text_input}' too stem-like) – auto-fixing (use correct: audio_path, text_input=text, stem=voice)")
         text_input, audio_path = audio_path, text_input  # Swap back
-        full_stem = Path(audio_path).stem.replace('_fixed', '').replace('_padded', '').replace('_resampled',
-                                                                                               '').replace(
-            '_ui_resampled', '')
-        if full_stem.endswith('_voice'):
-            stem = full_stem[:-6]  # Remove '_voice'
-        else:
-            stem = full_stem
-        if len(stem) < 3:
-            stem = stem  # Ensure full
+        # Use unified stem extraction after fixing the swap
+        stem = normalize_stem(audio_path)
         if len(text_input.strip()) < min_length:
             if not quiet:
                 logger.debug(f"Fuzzy skip after swap: Text too short (<{min_length} chars)")

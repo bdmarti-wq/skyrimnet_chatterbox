@@ -15,6 +15,7 @@ import os
 import json
 import datetime
 import functools
+import tempfile
 import time
 import warnings
 import hashlib
@@ -42,6 +43,8 @@ from threading import Thread
 from pathlib import Path
 from loguru import logger
 
+from .normalize_stem import normalize_stem
+
 # Suppress torchaudio deprecations precisely (exact message/module for backend utils)
 warnings.filterwarnings('ignore', message=r'.*torchaudio._backend.utils.info.*', category=UserWarning)
 warnings.filterwarnings('ignore', message=r'.*deprecated.*torchaudio.*', category=UserWarning, module='torchaudio')
@@ -59,6 +62,7 @@ CACHE_BASE = ROOT_DIR / "cache"
 CACHE_DIR = CACHE_BASE / "conditionals"
 CACHE_AUDIO_DIR = CACHE_BASE / "audio"
 voices_dir = CACHE_AUDIO_DIR / "voices"  # For check_and_update_ref
+cache_output = CACHE_AUDIO_DIR / "output"
 
 # Global model lock (new: serialize access to prevent graph races)
 MODEL_LOCK = threading.RLock()
@@ -87,7 +91,7 @@ _voice_info_cache = {}  # {stem: (sr, channels, duration_frames)} – simple, th
 _voice_info_lock = threading.RLock()  # Optional: For concurrent access (shared with _voice_cache_lock)
 
 # Create dirs (rooted)
-for d in [WAV_OUTPUT_DIR, CACHE_BASE, CACHE_DIR, CACHE_AUDIO_DIR, voices_dir]:
+for d in [WAV_OUTPUT_DIR, CACHE_BASE, CACHE_DIR, CACHE_AUDIO_DIR, voices_dir, cache_output]:
     d.mkdir(parents=True, exist_ok=True)
 
 # Import fallbacks
@@ -104,7 +108,9 @@ except ImportError:
 _local_voice_cache = {}  # Memory: stem → {'content_hash': str, 'sr': int, 'processed_path': str}
 
 def _content_hash(wav_path: str) -> str:
-    """SR-agnostic: Hash decoded audio samples (ignores header/SR)."""
+    if wav_path is None or not os.path.exists(wav_path):
+        logger.warning(f"Content hash: Invalid path {wav_path}")
+        return ""  # Empty hash fallback
     try:
         waveform, _ = torchaudio.load(wav_path)
         if waveform.dim() > 1:
@@ -112,7 +118,8 @@ def _content_hash(wav_path: str) -> str:
         return hashlib.md5(waveform.numpy().tobytes()).hexdigest()
     except Exception as e:
         logger.warning(f"Content hash failed for {wav_path}: {e} – fallback file hash")
-        return _compute_file_hash(wav_path, method='hybrid')  # Fallback
+        return _compute_file_hash(wav_path, method='hybrid') or ""
+
 
 def scan_local_voices(voices_dir: Path = voices_dir, rebuild: bool = False, use_content_hash: bool = True) -> int:
     """Pre-scan voices_dir at startup: Hash + SR, cache for API dedup. use_content_hash=True for SR-agnostic."""
@@ -126,7 +133,7 @@ def scan_local_voices(voices_dir: Path = voices_dir, rebuild: bool = False, use_
     for wav_file in voices_dir.glob("*.wav"):
         if any(suffix in wav_file.stem for suffix in ['_padded', '_resampled', '_fixed']):  # Skip processed
             continue
-        stem = _normalize_stem(str(wav_file))
+        stem = normalize_stem(str(wav_file))
         if stem in _local_voice_cache:
             continue  # Dedup stems
 
@@ -603,68 +610,177 @@ def get_cache_dir():
 
 
 @functools.lru_cache(maxsize=128)
-def get_wavout_dir():
-    formatted_start_time = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    wavout_dir = WAV_OUTPUT_DIR / formatted_start_time
-    wavout_dir.mkdir(parents=True, exist_ok=True)  # FIXED: parents=True (not persona; valid kwargs)
+def get_wavout_dir(cache: bool = True):
+    if not cache:
+        formatted_start_time = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        wavout_dir = WAV_OUTPUT_DIR / formatted_start_time
+        logger.debug(f"Using timestamped dir (cache=False): {wavout_dir}")
+        wavout_dir.mkdir(parents=True, exist_ok=True)  # FIXED: parents=True (not persona; valid kwargs)
+    else:
+        wavout_dir = cache_output  # "cache/audio/output"
+        logger.debug(f"Using stable cache dir (cache=True): {wavout_dir}")
+        wavout_dir.mkdir(parents=True, exist_ok=True)
     return wavout_dir
 
 
 def get_cache_key(audio_path: str = None, uuid: Any = None, exaggeration: float = None,
-                  params: Dict[str, Any] = None) -> str:
-    """Robust cache key: Original simple mode + params hashing."""
+                  text: str = None, **other_params) -> str:
+    """
+    Generate a stable cache key based on inputs.
+    FIXED: Guards against None/invalid inputs; never returns None; logs issues.
+    :param audio_path: Audio path (str or None).
+    :param uuid: UUID (int, str, Any, or None).
+    :param exaggeration: Exaggeration (float or None).
+    :param text: Text (str or None).
+    :param other_params: Ignored extra params.
+    :return: Stable str key (fallback "default_key" if all invalid).
+    """
+    try:
+        # FIXED: Guard required inputs with fallbacks
+        if audio_path is None:
+            logger.warning("get_cache_key: audio_path is None – fallback to 'default_path'")
+            audio_path = "default_path"
+        if text is None:
+            logger.warning("get_cache_key: text is None – fallback to empty str")
+            text = ""
+        if uuid is None:
+            logger.warning("get_cache_key: uuid is None – fallback to 'default'")
+            uuid = "default"
+        if exaggeration is None:
+            logger.warning("get_cache_key: exaggeration is None – fallback to 0.50")
+            exaggeration = 0.50
+
+        # FIXED: Robust Path.stem (handle non-str)
+        try:
+            if not isinstance(audio_path, str):
+                logger.debug(f"get_cache_key: Coerce audio_path {audio_path} (type={type(audio_path)}) to str")
+                audio_path = str(audio_path)
+            cache_prefix = Path(audio_path).stem
+            if not cache_prefix or cache_prefix == ".":  # Invalid path
+                logger.warning("get_cache_key: Invalid audio_path.stem – fallback prefix")
+                cache_prefix = "default_voice"
+        except Exception as path_e:
+            logger.error(f"get_cache_key: Path.stem failed for audio_path={audio_path}: {type(path_e).__name__}: {path_e} – fallback prefix")
+            cache_prefix = "default_voice"
+
+        # FIXED: Guard uuid to hex/str
+        try:
+            if isinstance(uuid, int):
+                uuid_hex = hex(uuid)[2:]  # e.g., "27193232517884719"
+            else:
+                uuid_hex = str(uuid)
+            if not uuid_hex or uuid_hex.startswith("0x"):
+                logger.warning(f"get_cache_key: Invalid uuid_hex '{uuid_hex}' – fallback 'default'")
+                uuid_hex = "default"
+        except Exception as uuid_e:
+            logger.error(f"get_cache_key: uuid to hex failed for uuid={uuid}: {type(uuid_e).__name__}: {uuid_e} – fallback 'default'")
+            uuid_hex = "default"
+
+        # FIXED: Guard exaggeration to str
+        try:
+            exag_str = f"{float(exaggeration):.2f}"  # Force float, format
+        except (ValueError, TypeError) as exag_e:
+            logger.error(f"get_cache_key: exaggeration format failed for {exaggeration}: {type(exag_e).__name__}: {exag_e} – fallback '0.50'")
+            exag_str = "0.50"
+
+        # FIXED: Guard text for MD5 (empty ok, but encode safely)
+        try:
+            if not isinstance(text, str):
+                logger.warning(f"get_cache_key: Coerce text {text} (type={type(text)}) to str")
+                text = str(text)
+            if text.strip():  # Non-empty
+                text_hash = hashlib.md5(text.encode('utf-8')).hexdigest()[:8]
+            else:
+                text_hash = "empty"  # Fallback for empty text
+        except Exception as hash_e:
+            logger.error(f"get_cache_key: MD5 hash failed for text='{text}': {type(hash_e).__name__}: {hash_e} – fallback 'default_hash'")
+            text_hash = "default_hash"
+
+        # Build key
+        key = f"{cache_prefix}_{text_hash}_{exag_str}_{uuid_hex[:8]}"
+
+        logger.debug(f"Generated stable key: '{key}' (prefix={cache_prefix}, text_hash={text_hash}, exag={exag_str}, uuid={uuid_hex[:8]})")
+        return key
+
+    except Exception as overall_e:
+        logger.error(f"get_cache_key: Overall failure: {type(overall_e).__name__}: {overall_e} – fallback 'default_key'")
+        return "default_key"
+
+
+def save_torchaudio_wav(
+        wav_tensor=None,
+        sr: int = 24000,
+        audio_path: str = None,
+        uuid: Any = None,
+        cache_key: str = None,  # FIXED: Pre-computed key (str or None; cache if provided)
+        cache: bool = True
+):
+    """
+    Save WAV tensor to file and return path (fallback to temp if issues).
+    FIXED: Concise single try-except; pass pre-computed cache_key for caching.
+    :param wav_tensor: Audio tensor (or None → silence).
+    :param sr: Sample rate.
+    :param audio_path: For filename prefix (or None → "default_voice").
+    :param uuid: For filename (or None → "default").
+    :param cache_key: Optional cache key (cache if not None).
+    :param cache: Use cache dir (True) or temp (False).
+    :return: str path (always; temp fallback on errors).
+    """
+    # Upfront guards (minimal fallbacks)
+    if wav_tensor is None:
+        wav_tensor = torch.zeros(1, sr * 2, dtype=torch.float32)  # 2s silence
+    if sr <= 0:
+        sr = 24000
     if audio_path is None:
-        return None
+        audio_path = "default_voice"
+    if uuid is None:
+        uuid = "default"
+    if cache is None:
+        cache = True
 
-    cache_prefix = Path(audio_path).stem
-
-    # Simple mode (original)
     try:
-        uuid_hex = hex(uuid)[2:] if isinstance(uuid, (int, type(None))) else str(uuid)
-    except:
-        uuid_hex = str(uuid)
-    if exaggeration is None:
-        cache_key = f"{cache_prefix}_{uuid_hex}"
-    else:
-        cache_key = f"{cache_prefix}_{uuid_hex}_{exaggeration:.2f}"
-    if len(cache_key) <= 100:
-        return cache_key
+        # Compute path/filename (coerce audio_path)
+        audio_path = str(audio_path)
+        cache_prefix = Path(audio_path).stem or "default_voice"
+        uuid_hex = hex(uuid)[2:][:8] if isinstance(uuid, int) else str(uuid)[:8] or "default"
 
-    # Params mode (alternative: hash robustly)
-    if params is None:
-        params = {}
-    param_dict = {'prefix': cache_prefix, 'uuid': uuid_hex, 'exagg': f"{exaggeration:.2f}" if exaggeration else "0.5"}
-    param_dict.update(params)
+        # Get dir and build path
+        from .cache import get_wavout_dir  # Ensure import
+        out_dir = get_wavout_dir(cache)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        filename = f"{cache_prefix}_{uuid_hex}.wav"
+        path = out_dir / filename
 
-    # Robust-ize (simplified: shapes/str, no slow bytes)
-    for k, v in list(param_dict.items()):
-        if isinstance(v, (np.ndarray, torch.Tensor)):
-            shape_str = f"shape_{v.shape}_{str(v.dtype) if hasattr(v, 'dtype') else 'unknown'}"
-            param_dict[k] = f"hash_{hash(shape_str)}"
-        elif hasattr(v, '__dict__') and hasattr(v, 't3'):  # Conditionals
-            param_dict[k] = f"conds_id_{id(v)}_{getattr(v.t3, 'shape', 'unknown')}"
+        # Save tensor (to CPU/FP32)
+        safe_wav = wav_tensor.cpu().to(torch.float32) if hasattr(wav_tensor, 'cpu') else torch.zeros_like(wav_tensor)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            torchaudio.save(str(path), safe_wav, sr, encoding="PCM_S")
+
+        # Verify and cache if key provided
+        if not path.exists() or path.stat().st_size == 0:
+            raise OSError(f"Empty save for {path}")
+
+        if cache_key:
+            set_audio_cache(cache_key, str(path.resolve()))
+            logger.debug(f"Saved & cached: {path.name} (key={cache_key[:8]})")
         else:
-            param_dict[k] = str(v)  # Safe: str() on non-tensor
+            logger.debug(f"Saved: {path.name} (no cache key)")
 
-    try:
-        serialized = json.dumps(param_dict, sort_keys=True)
-        return hashlib.sha256(serialized.encode()).hexdigest()[:KEY_LEN]
-    except:
-        return hashlib.md5(cache_key.encode()).hexdigest()[:KEY_LEN]
+        return str(path)
 
-
-def save_torchaudio_wav(wav_tensor, sr, audio_path, uuid):
-    """Original: Save WAV with timestamp (rooted paths)."""
-    formatted_now_time = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    cache_key = get_cache_key(audio_path, uuid)
-    filename = f"{formatted_now_time}_{cache_key}"
-    path = get_wavout_dir() / f"{filename}.wav"
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        torchaudio.save(path, wav_tensor.cpu(), sr, encoding="PCM_S")
-    # Cache audio path
-    set_audio_cache(cache_key, path.resolve())
-    return path.resolve()
+    except Exception as e:
+        logger.error(
+            f"save_torchaudio_wav failed (path={path or 'N/A'}, key={cache_key[:8] or 'N/A'}): {type(e).__name__}: {e} – temp fallback")
+        try:
+            temp_path = Path(tempfile.mktemp(suffix=".wav"))
+            torch.save(torch.zeros(1, sr * 2, dtype=torch.float32), temp_path)  # Simple silence fallback
+            if cache_key:
+                set_audio_cache(cache_key, str(temp_path))  # Cache fallback if key
+            logger.debug(f"Temp fallback: {temp_path}")
+            return str(temp_path)
+        except:
+            return str(Path(tempfile.gettempdir()) / "error.wav")  # Last-resort empty str path
 
 
 def _get_or_cache_audio_info(stem: str = None, audio_path: str = None, force_refresh: bool = False) -> Optional[
@@ -1030,7 +1146,7 @@ def check_and_update_ref(audio_path: str, exaggeration: float = 0.5, model_sr: i
     if enable_pre_adjustment is None:
         enable_pre_adjustment = get_config_value('enable_pre_adjustment', default=True)  # Default True as per logs
 
-    stem = _normalize_stem(audio_path, stem)
+    stem = normalize_stem(audio_path, stem)
 
     # NEW: Quick match vs pre-scanned local voices (SR-agnostic content hash)
     if stem in _local_voice_cache:
@@ -1135,19 +1251,18 @@ def check_and_update_ref(audio_path: str, exaggeration: float = 0.5, model_sr: i
 
 
 
-def try_audio_cache(audio_path: str, text: str, exaggeration: float = 0.5, params: Dict = None) -> Optional[str]:
-    """Check audio cache for hit; return path if exists."""
+def try_audio_cache(audio_path: str, text: str, exaggeration: float = 0.5, cache_uuid: int | str = None) -> Optional[str]:
     if not audio_path or not text:
         return None
-    if params is None:
-        params = {'exagg': exaggeration}
-    cache_key = get_cache_key(audio_path, uuid="audio_reuse", exaggeration=exaggeration, params=params)
+    # Use cache_uuid if provided, else "audio_reuse" fallback
+    uuid_to_use = cache_uuid or "audio_reuse"
+    cache_key = get_cache_key(audio_path, uuid=uuid_to_use, exaggeration=exaggeration, text=text)
     cached_path = get_audio_cache(cache_key)
     if cached_path and Path(cached_path).exists():
-        logger.info(f"Audio cache HIT: {cache_key[:8]}... ({text[:20]}...)")
+        logger.info(f"Audio cache HIT: {cache_key[:20]}... ({text[:20]}...)")  # Now with real UUID
         return cached_path
-    logger.debug(f"Audio cache MISS: {cache_key[:8]}...")
-    return None
+    logger.debug(f"Audio cache MISS: {cache_key[:20]}...")
+    return None  # Proceed to fuzzy or gen
 
 
 # Patched _compute_file_hash (robust info)
@@ -1204,33 +1319,7 @@ def _compute_file_hash(file_path: str, method='hybrid', stem: str = None) -> str
         return ""
 
 
-# New Helper: Shared stem normalization (extracted from multiple places; testable: input path → expected stem)
-def _normalize_stem(audio_path: str, provided_stem: str | None = None, min_len: int = 3) -> str:
-    """Derive/clean stem from path or provided; handles temps/UUIDs. Returns str >= min_len or fallback."""
-    if provided_stem is not None and isinstance(provided_stem, (int, float)):
-        provided_stem = str(provided_stem)  # Handle old int calls
 
-    if provided_stem and len(str(provided_stem)) >= min_len:
-        # Clean if provided (remove suffixes)
-        stem = str(provided_stem).replace('_fixed', '').replace('_padded', '').replace('_resampled', '').replace(
-            '_ui_resampled', '')
-        if len(stem) >= min_len:
-            return stem
-        logger.debug(f"Provided stem '{provided_stem}' too short/invalid → derive from path")
-
-    if not audio_path:
-        raise ValueError("No audio_path for stem derivation")
-
-    basename = Path(audio_path).stem
-    # Regex extract voice before UUID/temp (e.g., 'vp_11_lilia_123hex' → 'vp_11_lilia')
-    match = re.match(r'([a-zA-Z0-9_]+[voice]?)(_?[0-9a-f]{15,})?$', basename)
-    stem = match.group(1) if match else basename.replace('_fixed', '').replace('_padded', '').replace('_resampled',
-                                                                                                      '').replace(
-        '_ui_resampled', '').replace('_temp', '')
-    if len(stem) < min_len:
-        stem = basename  # Fallback to full
-    logger.trace(f"Normalized stem for '{basename}': '{stem}'")
-    return stem
 
 
 # New Helper: Quick cache path validation (extracted; testable: stem/path → quick_reuse bool + info)
@@ -1456,7 +1545,7 @@ def get_or_queue_voice_process(audio_path: str, model, device, dtype, stem: str 
     if not audio_path:
         return audio_path  # No-op
 
-    stem = _normalize_stem(audio_path, stem)
+    stem = normalize_stem(audio_path, stem)
 
     with _voice_cache_lock:
         cached = _voice_cache.get(stem, {})
@@ -1742,60 +1831,6 @@ def string_similarity(s1: str, s2: str, threshold=0.75) -> float:
 
 
 
-# Sync pre-extract (threaded for non-blocking; hardcoded top voices)
-# Sync pre-extract (threaded for non-blocking; hardcoded top voices)
-def pre_extract_fixed_voices(model, device, dtype, top_voices: List[str] = ['nwskatyavoice', 'vp_11_lilia', 'nwsjennavoice', 'ba_ahnivoice']):
-    """Pre-extract conds for top voices (threaded; rooted paths). Non-blocking with timeout/error handling."""
-    def _extract_worker(voice):
-        logger.debug(f"Pre-extract worker start: {voice}")
-        if not T3_AVAILABLE:
-            logger.debug(f"Pre-extract skip {voice}: T3 unavailable")
-            return
-        ref_path = voices_dir / f"{voice}.wav"
-        if not ref_path.exists():
-            logger.warning(f"Skipping pre-extract {voice}: No {ref_path}")
-            return
-        cache_key = get_cache_key(str(ref_path), uuid=voice, exaggeration=0.5)
-        if _cache_manager.load(cache_key, model, device, dtype, quiet=True):
-            logger.info(f"Pre-extract HIT: {voice}")
-            return
-        try:
-            # Check graphs before prep (defer if active)
-            if hasattr(model, 't3') and hasattr(model.t3, '_bucket_graphs') and len(model.t3._bucket_graphs) > 0:
-                logger.debug(f"Pre-extract defer {voice}: Graphs active")
-                return
-            with MODEL_LOCK:  # Lock to prevent race with main model access
-                model.prepare_conditionals(str(ref_path), exaggeration=0.5)
-                if model.conds:  # Success check
-                    _cache_manager.save(cache_key, model.conds, model, device, dtype)
-                    logger.info(f"Pre-extracted: {voice} (key={cache_key[:8]})")
-                else:
-                    logger.warning(f"Pre-extract conds empty for {voice}")
-                model.set_conditionals(None)  # Clear after save
-        except Exception as e:
-            logger.warning(f"Pre-extract failed {voice}: {e}")
-            if hasattr(model, 'set_conditionals') and model.conds:
-                model.set_conditionals(None)
-        logger.debug(f"Pre-extract worker end: {voice}")
-
-    logger.info(f"Pre-extracting {len(top_voices)} voices")
-    threads = []
-    for voice in top_voices:
-        t = Thread(target=_extract_worker, args=(voice,))
-        t.daemon = True
-        t.start()
-        threads.append(t)
-
-    # Join with timeout (10s per thread; skip hangers)
-    for t in threads:
-        t.join(timeout=10)  # 10s timeout per worker
-        if t.is_alive():
-            logger.warning(f"Pre-extract worker timeout (skipped): {t.name} – may need manual WAV/SR check")
-        else:
-            logger.trace(f"Pre-extract worker complete: {t.name}")
-    logger.info("Pre-extract complete")
-
-
 
 # Init (merged: preload + optional pre-extract)
 def init_conditional_memory_cache(model=None, device=None, dtype=None, quiet: bool = False,
@@ -1854,10 +1889,6 @@ def init_conditional_memory_cache(model=None, device=None, dtype=None, quiet: bo
         _cache_manager.evict_lru(excess)
         if not quiet:
             logger.info(f"Evicted {excess} excess after preload")
-
-    # Optional pre-extract (if enabled; skip if quiet/hang-prone)
-    # if pre_extract and model:
-    #    pre_extract_fixed_voices(model, device, dtype)
 
     # Optional pre-validate all voices (uses meta for fast probes)
     pre_validate_count = 0

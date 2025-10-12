@@ -208,7 +208,7 @@ class AudioConfig(BaseModel):
         """UI helper: Return min/max for field from CAPS."""
         return _get_field_bounds(field_name)
 
-# Fuzzy Category: Fuzzy cache params
+
 # Fuzzy Category: Fuzzy cache params
 class FuzzyConfig(BaseModel):
     model_config = ConfigDict(extra='ignore', populate_by_name=True)

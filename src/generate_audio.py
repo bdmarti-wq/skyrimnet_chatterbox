@@ -23,7 +23,7 @@ from .fuzzy_cache import try_fuzzy_audio_cache, FUZZY_QUEUE
 
 from loguru import logger  # FIXED: Use loguru consistently (remove logging import/getLogger)
 
-from .stem_utils import extract_voice_stem, get_logging_voice_name
+from .normalize_stem import  normalize_stem
 
 GEN_ACTIVE_LOCK = threading.RLock()  # Global for gen/prepare
 
@@ -106,41 +106,30 @@ def _generate_audio_core(
         return wav if wav is not None else torch.zeros(1, 24000 * 2, dtype=torch.float32, device='cpu')
 
 
+
 def try_reuse_audio(
     text: str,
     audio_prompt_path: Optional[str],
     exaggeration: float,
-    params: Dict[str, Any],
+    cache_uuid: int = None,  # NEW: Add param
+    params: Dict[str, Any] = None,
     try_fuzzy: bool = True
 ) -> Optional[Tuple[str, str]]:
-    """
-    Try exact then fuzzy; return (path, hit_type) or None. Handles None path.
-    :param text: Input text.
-    :param audio_prompt_path: Path to audio prompt.
-    :param exaggeration: Exaggeration value.
-    :param params: Merged params dict.
-    :param try_fuzzy: Whether to try fuzzy cache.
-    :return: (path, hit_type) or None.
-    """
     if not audio_prompt_path:
         return None
-    # Exact
-    exact_path = try_audio_cache(audio_prompt_path, text, exaggeration, params=params)
+    # Exact: Pass cache_uuid (or "audio_reuse" if None)
+    exact_path = try_audio_cache(audio_prompt_path, text, exaggeration, cache_uuid=cache_uuid)
     if exact_path:
         return exact_path, "Full audio"
-    # Fuzzy: Extract stem explicitly (normalize, remove '_fixed' etc.)
+    # Fuzzy: Unchanged (doesn't need UUID)
     fuzzy_path = None
     if try_fuzzy:
-        if not audio_prompt_path:  # FIXED: Explicit None guard (defensive)
+        if not audio_prompt_path:
             logger.debug("Fuzzy skipped: No audio_prompt_path")
             return None
-        # Derive full_stem consistently (strip '_voice' suffix without split for full base)
-        full_stem = Path(audio_prompt_path).stem.replace('_fixed', '').replace('_padded', '').replace('_resampled', '').replace('_ui_resampled', '')  # e.g., 'cs_coralyn_voice'
-        voice_stem = full_stem[:-6] if full_stem.endswith('_voice') else full_stem  # Strip '_voice' suffix (e.g., "cs_coralyn_voice" → "cs_coralyn")
-        if len(voice_stem) < 3:
-            voice_stem = full_stem  # Ensure full
-        logger.debug(f"Query stem derived: '{voice_stem}' from path '{audio_prompt_path}'")
-        fuzzy_path = try_fuzzy_audio_cache(audio_prompt_path, text, stem=voice_stem)  # audio_path=voice path, text_input=text, stem=voice_stem
+        voice_stem = normalize_stem(audio_prompt_path)
+        logger.debug(f"Query stem derived: '{voice_stem}' from path '{audio_prompt_path}' (using cache module)")
+        fuzzy_path = try_fuzzy_audio_cache(audio_prompt_path, text, stem=voice_stem)
     if fuzzy_path:
         return fuzzy_path, "Fuzzy audio"
     return None
@@ -240,40 +229,40 @@ def prepare_voice_and_conds(
 
 
 def save_and_cache_output(
-    wav: torch.Tensor,
-    audio_prompt_path: Optional[str],
-    cache_uuid: int,
-    text: str,
-    exaggeration: float,
-    params: Dict[str, Any],
-    enable_memory_cache: bool,
-    enable_disk_cache: bool,
-    sr: int
+        wav: torch.Tensor,
+        audio_prompt_path: Optional[str],
+        cache_uuid: int,
+        text: str,
+        exaggeration: float,
+        params: Dict[str, Any],
+        enable_memory_cache: bool = True,
+        enable_disk_cache: bool = True,
+        sr: int = 24000
 ) -> str:
     """
     Helper: Save WAV, cache exact audio if applicable.
-    :param wav: Processed WAV tensor (2D mono).
-    :param audio_prompt_path: Audio prompt path.
-    :param cache_uuid: Cache UUID.
-    :param text: Text.
-    :param exaggeration: Exaggeration.
-    :param params: Merged params.
-    :param enable_memory_cache: Enable memory cache.
-    :param enable_disk_cache: Enable disk cache.
-    :param sr: Sample rate.
-    :return: Saved path str.
+    FIXED: Compute cache_key upfront (uses text/exag); pass to save_torchaudio_wav for I/O + cache set.
     """
+    cache = enable_disk_cache or enable_memory_cache
+    # FIXED: Always compute full key with real params (text/exag/uuid/audio)
     if audio_prompt_path:
-        full_cache_key = get_cache_key(audio_prompt_path, cache_uuid, exaggeration, params={
-            'text': text, 'cfgw': params.get('cfgw'), 'temperature': params.get('temperature'),
-            'min_p': params.get('min_p'), 'top_p': params.get('top_p'),
-            'repetition_penalty': params.get('repetition_penalty'),
-            'language_id': params.get('language_id')
-        })
-        wave_file = str(save_torchaudio_wav(wav.cpu(), sr, audio_path=audio_prompt_path, uuid=cache_uuid))
-        set_audio_cache(full_cache_key, wave_file)
+        full_cache_key = get_cache_key(audio_path=audio_prompt_path, uuid=cache_uuid, exaggeration=exaggeration,
+                                       text=text)
+        logger.debug(
+            f"Generated audio cache_key: {full_cache_key} (text='{text[:20]}...', uuid_hex={hex(cache_uuid)[:10]}...)")
+
+        # FIXED: Pass pre-computed key to save (no text/exag in I/O)
+        wave_file = str(save_torchaudio_wav(wav.cpu(), sr, audio_path=audio_prompt_path, uuid=cache_uuid,
+                                            cache_key=full_cache_key, cache=cache))  # Pass key!
+
+        logger.debug(f"Audio saved to cache dir: {Path(wave_file).parent}, cache={cache}")
     else:
-        wave_file = str(save_torchaudio_wav(wav.cpu(), sr, audio_path=None, uuid=cache_uuid))
+        # Fallback for no prompt (e.g., dummy): Use fallback key
+        fallback_key = get_cache_key(audio_path="default", uuid=cache_uuid, exaggeration=exaggeration, text=text)
+        wave_file = str(save_torchaudio_wav(wav.cpu(), sr, audio_path=None, uuid=cache_uuid,
+                                            cache_key=fallback_key, cache=cache))
+        logger.debug(f"Audio fallback saved: {wave_file}, skip audio cache (no prompt)")
+
     return wave_file
 
 
@@ -290,13 +279,16 @@ async def generate_audio(model, text: str, audio_prompt_path: Optional[str], exa
     """
     # FIXED: Guard model at entry (fetch from manager if bad)
     from src.tts_model import ModelManager  # Ensure
+
+    cache = enable_disk_cache or enable_memory_cache # TODO review
+
     if model is None or isinstance(model, str) or not hasattr(model, 'generate'):
         logger.warning(f"Invalid model to generate_audio: type={type(model).__name__} ({model}) – fetching from manager")
         real_model = ModelManager.get_instance().get_model()
         if real_model is None:
             logger.error("No model available – silence fallback")
             sr = 24000  # Default
-            return str(save_torchaudio_wav(torch.zeros(1, sr * 2), sr, uuid=cache_uuid))  # 2s silence
+            return str(save_torchaudio_wav(torch.zeros(1, sr * 2), sr, uuid=cache_uuid, cache=cache))  # 2s silence
         model = real_model
         logger.debug(f"generate_audio using real model: {type(model).__name__} on {getattr(model, 'device', 'N/A')}")
 
@@ -307,14 +299,16 @@ async def generate_audio(model, text: str, audio_prompt_path: Optional[str], exa
     multilingual = config.app_config.globals.multilingual
 
     # FIXED: Extract stem derivation to helper (DRY)
-    voice_stem = extract_voice_stem(audio_prompt_path)
+    voice_stem = normalize_stem(audio_prompt_path)
 
     func_start_time = perf_counter_ns()  # FIXED: Overall start
+
+    logger.info(f'generate_audio called for {voice_stem} with cache_uuid = {cache_uuid}')
 
     if not text:
         logger.warning("No text – using dummy")
         create_dummy_conds(model, device, dtype, "no_text")
-        dummy_path = str(save_torchaudio_wav(torch.zeros(1, sr * 2), sr, uuid=cache_uuid))  # FIXED: Use sr
+        dummy_path = str(save_torchaudio_wav(torch.zeros(1, sr * 2), sr, uuid=cache_uuid, audio_path=None, cache=False))  # FIXED: Use sr
         return dummy_path
 
     # FIXED: Coerce params once (DRY; defaults from config if None)
@@ -332,7 +326,7 @@ async def generate_audio(model, text: str, audio_prompt_path: Optional[str], exa
     }
 
     # Logging (standardize text[:50]; all floats :.3f)
-    stem = get_logging_voice_name(audio_prompt_path)
+    stem = normalize_stem(audio_prompt_path)
     logger.info(f"generate called for: \"{text[:50]}...\", {stem}, uuid: {cache_uuid}, exaggeration: {exaggeration:.2f}")
     logger.info(
         f"Parameters - temp: {temperature:.3f}, min_p: {min_p:.3f}, top_p: {top_p:.3f}, rep_penalty: {repetition_penalty:.3f}, cfg_weight: {cfgw:.3f}")
@@ -358,8 +352,8 @@ async def generate_audio(model, text: str, audio_prompt_path: Optional[str], exa
         logger.debug("T3 warmup skipped: Model pre-optimized")
 
     reuse_start = perf_counter_ns()
-    try_fuzzy = get_config_value('fuzzy_enable', True)  # Use get_value (consistent)
-    reuse_result = try_reuse_audio(text, audio_prompt_path, exaggeration, params, try_fuzzy) if audio_prompt_path else None
+    try_fuzzy = get_config_value('app_config.globals.fuzzy.enable_fuzzy.cache', True)  # Use get_value (consistent)
+    reuse_result = try_reuse_audio(text, audio_prompt_path, exaggeration, cache_uuid=cache_uuid, try_fuzzy=try_fuzzy) if audio_prompt_path else None
     reuse_time_ms = (perf_counter_ns() - reuse_start) / 1_000_000
     if reuse_result:
         audio_reuse_path, hit_type = reuse_result
