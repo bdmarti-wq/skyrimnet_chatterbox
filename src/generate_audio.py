@@ -248,19 +248,21 @@ def save_and_cache_output(
     if audio_prompt_path:
         full_cache_key = get_cache_key(audio_path=audio_prompt_path, uuid=cache_uuid, exaggeration=exaggeration,
                                        text=text)
+        # Enhanced log: Use normalized stem for debugging
+        norm_stem = normalize_stem(audio_prompt_path)
         logger.debug(
-            f"Generated audio cache_key: {full_cache_key} (text='{text[:20]}...', uuid_hex={hex(cache_uuid)[:10]}...)")
+            f"Generated audio cache_key: {full_cache_key} (stem={norm_stem}, text='{text[:20]}...', uuid_hex={hex(cache_uuid)[:10]}...)")
 
-        # FIXED: Pass pre-computed key to save (no text/exag in I/O)
+        # FIXED: Pass pre-computed key and text to save (no text/exag in I/O; text for filename uniqueness)
         wave_file = str(save_torchaudio_wav(wav.cpu(), sr, audio_path=audio_prompt_path, uuid=cache_uuid,
-                                            cache_key=full_cache_key, cache=cache))  # Pass key!
+                                            cache_key=full_cache_key, text=text, cache=cache))  # Pass text!
 
         logger.debug(f"Audio saved to cache dir: {Path(wave_file).parent}, cache={cache}")
     else:
         # Fallback for no prompt (e.g., dummy): Use fallback key
         fallback_key = get_cache_key(audio_path="default", uuid=cache_uuid, exaggeration=exaggeration, text=text)
         wave_file = str(save_torchaudio_wav(wav.cpu(), sr, audio_path=None, uuid=cache_uuid,
-                                            cache_key=fallback_key, cache=cache))
+                                            cache_key=fallback_key, text=text, cache=cache))
         logger.debug(f"Audio fallback saved: {wave_file}, skip audio cache (no prompt)")
 
     return wave_file

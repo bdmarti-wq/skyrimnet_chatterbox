@@ -34,7 +34,7 @@ def cpp_uuid_to_seed(uuid_64: int) -> int:
     """
     return abs(hash(uuid_64)) % (2 ** 32)
 
-def generate_audio_ui(  # REVERT/PATCH: Sync def (Gradio calls without await → no coroutine error)
+def generate_audio_ui(  # Sync def (Gradio calls without await → no coroutine error)
         model_choice=None,
         text="On that first day from Saturalia, My missus gave for me, A big bowl of moon sugar!",
         language="en",

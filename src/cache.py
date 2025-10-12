@@ -650,17 +650,18 @@ def get_cache_key(audio_path: str = None, uuid: Any = None, exaggeration: float 
             logger.warning("get_cache_key: exaggeration is None – fallback to 0.50")
             exaggeration = 0.50
 
-        # FIXED: Robust Path.stem (handle non-str)
+        # FIXED: Use normalize_stem for consistent prefix (unpadded, handles suffixes/temps)
         try:
             if not isinstance(audio_path, str):
                 logger.debug(f"get_cache_key: Coerce audio_path {audio_path} (type={type(audio_path)}) to str")
                 audio_path = str(audio_path)
-            cache_prefix = Path(audio_path).stem
+            cache_prefix = normalize_stem(audio_path)
+            logger.debug(f"Normalized cache_prefix from '{audio_path}': '{cache_prefix}'")
             if not cache_prefix or cache_prefix == ".":  # Invalid path
-                logger.warning("get_cache_key: Invalid audio_path.stem – fallback prefix")
+                logger.warning("get_cache_key: Invalid normalized prefix – fallback")
                 cache_prefix = "default_voice"
         except Exception as path_e:
-            logger.error(f"get_cache_key: Path.stem failed for audio_path={audio_path}: {type(path_e).__name__}: {path_e} – fallback prefix")
+            logger.error(f"get_cache_key: normalize_stem failed for audio_path={audio_path}: {type(path_e).__name__}: {path_e} – fallback prefix")
             cache_prefix = "default_voice"
 
         # FIXED: Guard uuid to hex/str
@@ -713,6 +714,7 @@ def save_torchaudio_wav(
         audio_path: str = None,
         uuid: Any = None,
         cache_key: str = None,  # FIXED: Pre-computed key (str or None; cache if provided)
+        text: str = None,  # NEW: Pass text for hash in filename
         cache: bool = True
 ):
     """
@@ -723,6 +725,7 @@ def save_torchaudio_wav(
     :param audio_path: For filename prefix (or None → "default_voice").
     :param uuid: For filename (or None → "default").
     :param cache_key: Optional cache key (cache if not None).
+    :param text: Text for per-gen filename uniqueness (hash included).
     :param cache: Use cache dir (True) or temp (False).
     :return: str path (always; temp fallback on errors).
     """
@@ -741,15 +744,23 @@ def save_torchaudio_wav(
     try:
         # Compute path/filename (coerce audio_path)
         audio_path = str(audio_path)
-        cache_prefix = Path(audio_path).stem or "default_voice"
+        # FIXED: Use normalize_stem for consistent unpadded prefix (handles suffixes/temps)
+        cache_prefix = normalize_stem(audio_path)
         uuid_hex = hex(uuid)[2:][:8] if isinstance(uuid, int) else str(uuid)[:8] or "default"
 
+        # NEW: Compute text_hash if text provided (per-gen unique)
+        text_hash = "default"  # Fallback
+        if text and isinstance(text, str):
+            text_hash = hashlib.md5(text.encode('utf-8')).hexdigest()[:8]
+            logger.debug(f"Filename text_hash computed: {text_hash} for text='{text[:20]}...'")
+
+        # FIXED: Include text_hash in filename (prevents overwrite); uses normalized prefix
+        filename = f"{cache_prefix}_{text_hash}_{uuid_hex}.wav"
+        path = get_wavout_dir(True) / filename
+
         # Get dir and build path
-        from .cache import get_wavout_dir  # Ensure import
         out_dir = get_wavout_dir(cache)
         out_dir.mkdir(parents=True, exist_ok=True)
-        filename = f"{cache_prefix}_{uuid_hex}.wav"
-        path = out_dir / filename
 
         # Save tensor (to CPU/FP32)
         safe_wav = wav_tensor.cpu().to(torch.float32) if hasattr(wav_tensor, 'cpu') else torch.zeros_like(wav_tensor)
@@ -763,9 +774,10 @@ def save_torchaudio_wav(
 
         if cache_key:
             set_audio_cache(cache_key, str(path.resolve()))
-            logger.debug(f"Saved & cached: {path.name} (key={cache_key[:8]})")
+            logger.debug(
+                f"Saved & cached: {path.name} (key={cache_key[:8]}, text_hash={text_hash}, prefix={cache_prefix})")
         else:
-            logger.debug(f"Saved: {path.name} (no cache key)")
+            logger.debug(f"Saved: {path.name} (no cache key, text_hash={text_hash}, prefix={cache_prefix})")
 
         return str(path)
 
@@ -781,6 +793,9 @@ def save_torchaudio_wav(
             return str(temp_path)
         except:
             return str(Path(tempfile.gettempdir()) / "error.wav")  # Last-resort empty str path
+
+
+
 
 
 def _get_or_cache_audio_info(stem: str = None, audio_path: str = None, force_refresh: bool = False) -> Optional[
@@ -1261,8 +1276,9 @@ def try_audio_cache(audio_path: str, text: str, exaggeration: float = 0.5, cache
     if cached_path and Path(cached_path).exists():
         logger.info(f"Audio cache HIT: {cache_key[:20]}... ({text[:20]}...)")  # Now with real UUID
         return cached_path
-    logger.debug(f"Audio cache MISS: {cache_key[:20]}...")
+    logger.debug(f"Audio cache MISS: {cache_key} (full: {cache_key})")  # FIXED: Full key on MISS
     return None  # Proceed to fuzzy or gen
+
 
 
 # Patched _compute_file_hash (robust info)

@@ -255,6 +255,8 @@ class Globals(BaseModel):
     compress_pt_saves: bool = Field(default=True)
     compress_level: int = Field(default=6, ge=CAPS['COMPRESS_LEVEL_MIN'], le=CAPS['COMPRESS_LEVEL_MAX'])
     enable_deferred_cleanup: bool = Field(default=True)
+    enable_memory_cache: bool = Field(default=True)
+    enable_disk_cache: bool = Field(default=True)
     tts_name: str = Field(default='Chatterbox')
 
     # Core fields

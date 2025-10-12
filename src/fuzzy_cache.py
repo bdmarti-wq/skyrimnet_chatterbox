@@ -61,13 +61,18 @@ def try_fuzzy_audio_cache(audio_path: str = None, text_input: str = None, exagge
     """Fuzzy audio cache: SequenceMatcher on per-stem DB; returns path or None.
     REQUIRES stem (kwarg or from audio_path); detects/ warns on swap (text short like stem).
     Boosts sim for configurable short/moans words; min length tunable.
-    NEW: On HIT, validate wav_path for artifacts (purge if bad; fallback MISS)."""
+    NEW: On HIT, validate wav_path for artifacts (purge if bad; fallback MISS).
+    FIXED: Derive stem early/safely (before swap; avoids None if audio_path missing).
+    FIXED: Detect swap only if audio_path provided (avoid None swap/crash); skip if short/None.
+    FIXED: Extra guard post-swap/detect (prevent None.strip()).
+    """
     if not text_input or (
             text_input and (len(text_input) < 2 or not any(c.isalpha() for c in text_input))):  # Min guard (hardcode 3 if config fails; tunable below)
         if not quiet:
             logger.debug(f"Fuzzy skip: No/invalid text_input ({text_input[:20] if text_input else 'None'})")
         return None
 
+    # FIXED: Derive stem early/safely (before swap; avoids None if audio_path missing)
     if stem is None and audio_path:
         stem = normalize_stem(audio_path)
     elif len(stem) < 3 and audio_path:
@@ -87,18 +92,29 @@ def try_fuzzy_audio_cache(audio_path: str = None, text_input: str = None, exagge
 
     threshold = threshold or get_config_value('fuzzy_threshold', default=0.75)
 
-    # Detect swap: If text_input short/looks like stem (e.g., 'dlc1seranavoice'), warn + auto-swap
+    # FIXED: Detect swap only if audio_path provided (avoid None swap/crash); skip if short/None
     min_length = get_config_value('fuzzy_min_length', default=3)
-    if len(text_input.strip()) < 10 and re.match(r'^[a-z0-9_]+(voice|maid|npc)?$',
+    if audio_path and len(text_input.strip()) < 10 and re.match(r'^[a-z0-9_]+(voice|maid|npc)?$',
             text_input.lower()):  # Heuristic: Looks like stem
         logger.warning(f"Fuzzy detect: Possible arg swap (text_input='{text_input}' too stem-like) – auto-fixing (use correct: audio_path, text_input=text, stem=voice)")
-        text_input, audio_path = audio_path, text_input  # Swap back
-        # Use unified stem extraction after fixing the swap
-        stem = normalize_stem(audio_path)
-        if len(text_input.strip()) < min_length:
-            if not quiet:
-                logger.debug(f"Fuzzy skip after swap: Text too short (<{min_length} chars)")
-            return None
+        # FIXED: Safe swap: Validate audio_path before assign (prevent None.strip())
+        if audio_path and len(audio_path.strip()) > min_length:
+            text_input, audio_path = audio_path, text_input  # Swap back
+            # Use unified stem extraction after fixing the swap
+            stem = normalize_stem(audio_path) or stem
+            logger.debug(f"Post-swap stem: '{stem}'")
+        else:
+            logger.warning(f"Swap skipped: Invalid audio_path after detect ('{audio_path}') – treat as MISS")
+            if len(text_input.strip()) < min_length:
+                if not quiet:
+                    logger.debug(f"Fuzzy skip after detect: Text too short (<{min_length} chars)")
+                return None
+
+    # FIXED: Extra guard post-swap/detect (prevent None.strip())
+    if text_input is None or len(text_input.strip()) < min_length:
+        if not quiet:
+            logger.debug(f"Fuzzy MISS early: Text None or too short after guards ('{text_input or 'None'}')")
+        return None
 
     if not quiet:
         per_stem_size = len(FUZZY_AUDIO_DICT.get(stem, {}))

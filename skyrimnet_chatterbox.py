@@ -89,7 +89,7 @@ def main():  # FIXED: Make sync (no async def; Easier for script + handles neste
         logger.info(
             f"✓ Model loaded : {model.__class__.__name__} ({model_type}) on {config.app_config.globals.device} (dtype={config.app_config.globals.dtype})")
 
-    init_conditional_memory_cache(model, get_config_value('globals.device'), get_config_value('globals.dtype'), quiet=False, pre_validate_voices=False)  # Quiet for prod
+    init_conditional_memory_cache(model, get_config_value('globals.device'), get_config_value('globals.dtype'), pre_validate_voices=False)  # Quiet for prod
     load_fuzzy_cache()
 
 
