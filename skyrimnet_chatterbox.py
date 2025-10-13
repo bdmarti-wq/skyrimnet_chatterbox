@@ -12,6 +12,7 @@ from src.config import get_config, get_config_value
 # Lazy import inside generate (avoids global Gradio scan/inference)
 from src.audio_utils import set_torchaudio_backend
 from src.fuzzy_cache import load_fuzzy_cache
+from src.generate_audio import initialize_silence_assets
 from src.ui import create_ui
 from src.tts_model import ModelManager
 
@@ -79,6 +80,13 @@ def main():  # FIXED: Make sync (no async def; Easier for script + handles neste
 
     instance = ModelManager.get_instance()
     model = instance.get_model(model_type)  # Loads/caches; returns object or None
+    try:
+        initialize_silence_assets()
+    except NameError:
+        # Handle case where initialize_silence_assets hasn't been defined yet
+        pass
+    except Exception as e:
+        logger.error(f"Failed to initialize silence assets during import: {str(e)}")
 
     if model is None:
         logger.error(f"Failed to load {model_type} model; TTS disabled")

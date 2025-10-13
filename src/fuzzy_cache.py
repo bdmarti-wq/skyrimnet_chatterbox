@@ -337,79 +337,121 @@ def clear_fuzzy_cache():
         FUZZY_AUDIO_DICT.clear()
         logger.debug("Cleared fuzzy cache")
 
+def _process_fuzzy_queue_item(text, wav_path, voice_stem):
+    """Isolated function for fuzzy entry processing"""
+    min_length = get_config_value('app_config.globals.fuzzy_min_length', default=3)
+
+    # Skip very short texts
+    if len(text.strip()) < min_length:
+        logger.debug(f"Skipped indexing short text (<{min_length}): {text[:10]}...")
+        return
+
+    # Validate audio quality
+    if ENABLE_ARTIFACT_PURGE and is_artifact_laden(wav_path):
+        threshold = get_config_value('fuzzy_artifact_threshold_hz', default=8000.0)
+        logger.warning(f"Skip fuzzy index: Artifacts in {wav_path} (centroid >{threshold}Hz)")
+        return
+
+    # Normalize text for indexing
+    norm_key = normalize_text(text)
+
+    # Calculate similarity boost
+    boost_words = get_config_value('fuzzy_boost_words', default=['ahh', 'mmm', 'ooh'])
+    boost_amount = get_config_value('fuzzy_boost_amount', default=0.1)
+    clean_text = re.sub(r'[^\w\s]', '', text.lower())
+    sim_boost = boost_amount if any(word in clean_text for word in boost_words) else 0.0
+
+    # Add to cache (thread-safe)
+    with FUZZY_LOCK:
+        # Ensure per-stem sub-dict exists
+        if voice_stem not in FUZZY_AUDIO_DICT:
+            FUZZY_AUDIO_DICT[voice_stem] = {}
+            logger.debug(f"Created new stem entry: {voice_stem}")
+
+        stem_dict = FUZZY_AUDIO_DICT[voice_stem]
+
+        # Skip duplicates
+        if norm_key in stem_dict:
+            logger.debug(f"Skipped dup fuzzy index: {norm_key[:30]} ({voice_stem})")
+            return
+
+        # Evict oldest if over capacity
+        if len(stem_dict) >= MAX_INDEX_SIZE:
+            oldest_key = next(iter(stem_dict))
+            del stem_dict[oldest_key]
+            logger.debug(f"Fuzzy per-stem full ({voice_stem}) – evicted oldest")
+
+        # Add new entry
+        stem_dict[norm_key] = {
+            'wav_path': wav_path,
+            'orig_text': text,
+            'stem': voice_stem,
+            'sim_boost': sim_boost,
+            'time_indexed': time.time()
+        }
+        logger.debug(f"Successfully added fuzzy entry: stem='{voice_stem}', text='{text[:30]}...'")
+
+
 
 def _background_index_worker():
+    """Fixed: Proactively initializes all state variables on each loop iteration"""
     global _fuzzy_save_counter
+    _fuzzy_save_counter = 0
+
+    # Initialize tracking variables at the function level
+    last_log_time = time.time()
+    logs_since_report = 0
+
     while True:
+        # Re-initialize state on each iteration for safety
+        current_time = time.time()
+        text, wav_path, voice_stem = None, None, None
+
         try:
+            # Safely get queue item
             text, wav_path, voice_stem = FUZZY_QUEUE.get(timeout=1)
-            orig_text = text
-            min_length = get_config_value('app_config.globals.fuzzy_min_length', default=3)
-            if len(orig_text.strip()) < min_length:  # Optional: Skip indexing very short (e.g., "a" noise)
-                logger.debug(f"Skipped indexing short text (<{min_length}): {orig_text[:10]}...")
-                FUZZY_QUEUE.task_done()  # Clean up queue
-                continue
+            logs_since_report += 1
 
-            # Pre-index check for artifacts (skip bad WAVs; don't cache chirpy gens)
-            if ENABLE_ARTIFACT_PURGE and is_artifact_laden(wav_path):
-                artifact_threshold = get_config_value('fuzzy_artifact_threshold_hz', default=8000.0)
-                logger.warning(
-                    f"Skip fuzzy index: Artifacts in {wav_path} (centroid >{artifact_threshold}Hz) for '{orig_text[:20]}' (stem: {voice_stem})")
-                FUZZY_QUEUE.task_done()
-                continue
+            # Add diagnostic logging with proper timing
+            if current_time - last_log_time > 5.0:
+                logger.debug(f"Fuzzy queue processing: Active, {logs_since_report} items processed since last report")
+                logs_since_report = 0
+                last_log_time = current_time
 
-            norm_key = normalize_text(text)
-            boost_words = get_config_value('fuzzy_boost_words', default=['ahh', 'mmm', 'ooh', 'throbb', 'moan', 'gasp'])
-            boost_amount = get_config_value('fuzzy_boost_amount', default=0.1)
-            clean_text = re.sub(r'[^\w\s]', '', orig_text.lower())
-            sim_boost = 0.0
-            if boost_amount > 0 and boost_words:
-                for word in boost_words:
-                    if word in clean_text:
-                        sim_boost = boost_amount
-                        break  # Meta: Potential boost for this entry
-            with FUZZY_LOCK:
-                # Ensure per-stem sub-dict
-                if voice_stem not in FUZZY_AUDIO_DICT:
-                    FUZZY_AUDIO_DICT[voice_stem] = {}
-                stem_dict = FUZZY_AUDIO_DICT[voice_stem]
-                if norm_key in stem_dict:  # Dedup per-stem/norm_key
-                    logger.debug(f"Skipped dup fuzzy index: {norm_key[:30]} ({voice_stem})")
-                else:
-                    if len(stem_dict) >= MAX_INDEX_SIZE:  # Per-stem cap
-                        stem_dict.pop(next(iter(stem_dict)))  # Evict oldest in stem
-                        logger.debug(f"Fuzzy per-stem full ({voice_stem}) – evicted oldest")
-                    time_indexed = time.time()
-                    stem_dict[norm_key] = {
-                        'wav_path': wav_path,
-                        'orig_text': orig_text,
-                        'stem': voice_stem,
-                        'sim_boost': sim_boost,  # Meta for future
-                        'time_indexed': time_indexed
-                    }
-                    _fuzzy_save_counter += 1
-                    logger.debug(
-                        f"Indexed fuzzy audio: {norm_key[:30]} -> {wav_path} (stem: {voice_stem}, boost={sim_boost})")
-                # Throttle saves: Every 10 adds, queue >20, or 30s idle
-                if (_fuzzy_save_counter >= 10 or FUZZY_QUEUE.qsize() > 20):
-                    _save_fuzzy_audio_cache(save_all=False)  # Incremental
-                    _fuzzy_save_counter = 0
-            FUZZY_QUEUE.task_done()  # Always cleanup after get()
+            # Log specific processing (INFO for critical operations)
+            logger.info(f"Fuzzy indexing: '{text[:20]}...' → stem='{voice_stem}'")
 
-        except Empty:  # FIXED: Correct exception (from queue.Empty import; handles timeout)
-            # Idle: Periodic full save if dirty (>30s since last)
-            time_since_last = time.time() - _last_fuzzy_save
-            if time_since_last > 30 and FUZZY_AUDIO_DICT:  # Entries exist but no activity
-                logger.trace(f"Fuzzy idle >30s – full save check")
+            # Process the queue item
+            _process_fuzzy_queue_item(text, wav_path, voice_stem)
+
+            # Save throttling logic
+            _fuzzy_save_counter += 1
+            if (_fuzzy_save_counter >= 10 or FUZZY_QUEUE.qsize() > 20):
+                _save_fuzzy_audio_cache(save_all=False)
+                _fuzzy_save_counter = 0
+
+        except Empty:
+            # Always reset tracking when queue is empty
+            if time.time() - last_log_time > 30 and FUZZY_AUDIO_DICT:
+                logger.info("Fuzzy idle >30s – performing full save")
                 _save_fuzzy_audio_cache(save_all=True)
-            pass  # Continue loop (no error log; expected idle)
+                last_log_time = time.time()
 
-        except Exception as e:  # Broad catch for worker errors (e.g., bad path, lock)
-            logger.error(f"Fuzzy worker error indexing '{text[:20] if 'text' in locals() else 'unknown'}': {e}")
-            if 'FUZZY_QUEUE' in locals():  # Safe cleanup if queue item pending
-                FUZZY_QUEUE.task_done()
-            pass  # Continue (don't crash thread)
+        except Exception as e:
+            # CRITICAL: Always clean up queue task
+            logger.error(f"Fuzzy worker error processing '{text or 'unknown'}': {str(e)}")
+
+            # Ensure queue task is marked as done even on failure
+            if 'text' in locals() and text is not None:
+                logger.warning(f"Skipping fuzzy entry for '{text[:30]}...' due to error")
+
+        finally:
+            # ALWAYS ensure task is marked as complete
+            if 'text' in locals() and text is not None:
+                FUZZY_QUEUE.task_done()  # Prevent queue buildup
 
 
 # Start worker (call in main.py init)
-threading.Thread(target=_background_index_worker, daemon=True, name="FuzzyIndexer").start()
+_fuzzy_indexer_thread  = threading.Thread(target=_background_index_worker, daemon=True, name="FuzzyIndexer")
+_fuzzy_indexer_thread.start()
+logger.info(f"Intialized fuzzy cache system - thread active: {_fuzzy_indexer_thread.is_alive()}")
