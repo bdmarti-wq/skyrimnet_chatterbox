@@ -1,5 +1,3 @@
-import functools
-import gc  # NEW: For potential cleanup (aligns with model.py)
 import threading
 from contextlib import contextmanager
 
@@ -10,12 +8,11 @@ from time import perf_counter_ns
 import torchaudio
 from typing import Optional, Dict, Any, Tuple
 
-from .config import get_config, \
-    get_config_value  # FIXED: Only get_config (value via config.get_value()); remove loose get_config_value
+from .config import get_config, get_config_value
 from .monitor import monitor_resources
 from .audio_utils import apply_post_processing
 from .cache import (
-    try_audio_cache, set_audio_cache, get_cache_key, get_or_queue_voice_process,
+    try_audio_cache, get_cache_key, get_or_queue_voice_process,
     validate_voice_path, create_dummy_conds, load_conditionals_cache, save_conditionals_cache,
     get_cache_stats, check_and_update_ref, save_torchaudio_wav
 )
@@ -30,15 +27,24 @@ GEN_ACTIVE_LOCK = threading.RLock()  # Global for gen/prepare
 
 def set_seed(seed: int):
     """
-    Set random seeds for reproducible generation.
+    Set  seeds for reproducible generation.
     """
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed(seed)
 
 
+def get_voice_stem(audio_prompt_path: Optional[str]) -> str:
+     """Helper: Derive normalized voice stem once (DRY for stem extraction)."""
+     return normalize_stem(audio_prompt_path) if audio_prompt_path else 'default'
+
+
+def calculate_rtf(time_taken_s: float, audio_duration_s: float) -> float:
+     """Helper: Compute RTF safely (DRY; avoid divide-by-zero)."""
+     return time_taken_s / audio_duration_s if audio_duration_s > 0 else float('inf')
+
 # Text padding for short/vocalise (pre-TTS; smooths garble via pauses)
-# Gated text padding (pre-TTS; uses merged params for tunables/gates)
+# Gated text padding (pre-TTS; uses merged voice params for tunables/gates)
 def pad_short_text(text: str, params: Dict[str, Any]) -> str:
     """
     Pad short text based on merged params (enable/gates/tunables from config).
@@ -52,7 +58,7 @@ def pad_short_text(text: str, params: Dict[str, Any]) -> str:
         return text
     ellipses = params.get('text_ellipses_count', 2)
     max_len = params.get('max_short_word_len', 3)
-    patterns = params.get('vocalise_patterns', ['ah', 'oh', 'aah'])
+    patterns = params.get('vocalise_patterns', ['ah', 'oh', 'aah', 'mmm'])
 
     words = text.strip().split()
     if (len(words) == 1 and len(words[0]) <= max_len and words[0].lower() in patterns) or '...' in text:
@@ -98,7 +104,7 @@ def _generate_audio_core(
             else:
                 raise
         except Exception as e:  # FIXED: Broader catch for compile errors (e.g., cuFFT)
-            logger.error(f"Core gen failed (fallback silence): {e}")
+            logger.exception(f"Core gen failed (fallback silence)")
             wav = None  # Trigger silence
         finally:  # FIXED: Ensure cleanup if exception (leaks)
             if torch.cuda.is_available():
@@ -127,7 +133,7 @@ def try_reuse_audio(
         if not audio_prompt_path:
             logger.debug("Fuzzy skipped: No audio_prompt_path")
             return None
-        voice_stem = normalize_stem(audio_prompt_path)
+        voice_stem = get_voice_stem(audio_prompt_path)
         logger.debug(f"Query stem derived: '{voice_stem}' from path '{audio_prompt_path}' (using cache module)")
         fuzzy_path = try_fuzzy_audio_cache(audio_prompt_path, text, stem=voice_stem)
     if fuzzy_path:
@@ -249,7 +255,7 @@ def save_and_cache_output(
         full_cache_key = get_cache_key(audio_path=audio_prompt_path, uuid=cache_uuid, exaggeration=exaggeration,
                                        text=text)
         # Enhanced log: Use normalized stem from voice_path param (now unpadded)
-        norm_stem = normalize_stem(audio_prompt_path)
+        norm_stem = get_voice_stem(audio_prompt_path)
         logger.debug(
             f"Generated audio cache_key: {full_cache_key} (stem={norm_stem}, text='{text[:20]}...', uuid_hex={hex(cache_uuid)[:10]}...)")
 
@@ -268,6 +274,40 @@ def save_and_cache_output(
     return wave_file
 
 
+def prepare_generation_params(text: str, audio_prompt_path: Optional[str], exaggeration: float, temperature: float, cfgw: float, min_p: float, top_p: float, repetition_penalty: float, language_id: str, seed_num: int, config) -> Tuple[Dict[str, Any], str, Dict[str, Any], str]:
+     """Helper: Coerce and merge gen params (DRY for setup). Returns (params_dict, voice_stem, voice_params)."""
+     # merge sanitize and set defaults here
+     # Coerce params
+     exaggeration = float(exaggeration)  # ... (copy coercions from original function)
+     temperature = float(temperature)
+     cfgw = float(cfgw)
+     min_p = float(min_p)
+     top_p = float(top_p)
+     repetition_penalty = float(repetition_penalty)
+     seed_num = int(seed_num or 42)
+
+     voice_stem = get_voice_stem(audio_prompt_path)  # Use existing helper
+     voice_params = config.get_merged_audio_params(voice_name=voice_stem)
+     text = pad_short_text(text, voice_params)
+
+     t3_params = {
+         "generate_token_backend": "cudagraphs-manual",
+         # TODO from config ? FIXED: Use inductor for fused speed (source)
+         "stride_length": 4,  # Parallel tokens (source)
+         "skip_when_1": True
+     }
+
+     # if get_config_value('app_config.globals.multilingual', False):
+     #    generate_args["language_id"] = language_id
+
+     generate_args = {
+         'text': text, 'exaggeration': exaggeration, 'temperature': temperature, 'cfg_weight': cfgw,  'min_p': min_p, 'top_p': top_p,
+         'repetition_penalty': repetition_penalty, 'language_id': language_id, 't3_params': t3_params
+     }
+
+     return generate_args, voice_stem, voice_params, text
+
+
 @monitor_resources(enable=True, log_level="INFO")
 async def generate_audio(model, text: str, audio_prompt_path: Optional[str], exaggeration: float = 0.5,
                          cache_uuid: int = 0,
@@ -277,11 +317,9 @@ async def generate_audio(model, text: str, audio_prompt_path: Optional[str], exa
     """
     Main orchestration: Validate, cache checks, prep, gen, post-process.
     Assumes model/device/dtype from globals; cleaned sig (no dead params).
-    FIXED: Added full timings/RTF; model guard; consistent stem derivation.
     """
-    # FIXED: Guard model at entry (fetch from manager if bad)
+    func_start_time = perf_counter_ns()  # FIXED: Overall start
     from src.tts_model import ModelManager  # Ensure
-
     cache = enable_disk_cache or enable_memory_cache # TODO review
 
     if model is None or isinstance(model, str) or not hasattr(model, 'generate'):
@@ -300,69 +338,35 @@ async def generate_audio(model, text: str, audio_prompt_path: Optional[str], exa
     sr = config.app_config.globals.sr
     multilingual = config.app_config.globals.multilingual
 
-    # FIXED: Extract stem derivation to helper (DRY)
-    voice_stem = normalize_stem(audio_prompt_path)
-
-    func_start_time = perf_counter_ns()  # FIXED: Overall start
-
-    logger.info(f'generate_audio called for {voice_stem} with cache_uuid = {cache_uuid}')
-
     if not text:
         logger.warning("No text – using dummy")
         create_dummy_conds(model, device, dtype, "no_text")
         dummy_path = str(save_torchaudio_wav(torch.zeros(1, sr * 2), sr, uuid=cache_uuid, audio_path=None, cache=False))  # FIXED: Use sr
         return dummy_path
 
-    # FIXED: Coerce params once (DRY; defaults from config if None)
-    exaggeration = float(exaggeration)
-    temperature = float(temperature)
-    cfgw = float(cfgw)
-    min_p = float(min_p)
-    top_p = float(top_p)
-    repetition_penalty = float(repetition_penalty)
-    seed_num = int(seed_num or 42)  # Ensure int/default
-
-    params = {
-        'cfgw': cfgw, 'temperature': temperature, 'min_p': min_p, 'top_p': top_p,
-        'repetition_penalty': repetition_penalty, 'language_id': language_id
-    }
-
-    # Logging (standardize text[:50]; all floats :.3f)
-    stem = normalize_stem(audio_prompt_path)
-    logger.info(f"generate called for: \"{text[:50]}...\", {stem}, uuid: {cache_uuid}, exaggeration: {exaggeration:.2f}")
-    logger.info(
-        f"Parameters - temp: {temperature:.3f}, min_p: {min_p:.3f}, top_p: {top_p:.3f}, rep_penalty: {repetition_penalty:.3f}, cfg_weight: {cfgw:.3f}")
-
     original_text = text
-    merged_params = config.get_merged_audio_params(voice_name=voice_stem)
-    text = pad_short_text(text, merged_params)
-    logger.debug(
-        f"TTS text: '{text[:50]}...' (padded={len(text) > len(original_text)})")
+    # get safe, cleaned, merged voice_params, and casted values
+    generate_args, voice_stem, voice_params, text = prepare_generation_params(text, audio_prompt_path, exaggeration, temperature,
+                                                                    cfgw, min_p, top_p, repetition_penalty, language_id,
+                                                                    seed_num, config)
+    set_seed(generate_args.get('seed_num', 42))
+    logger.debug(f"Set seed: {generate_args.get('seed_num')}")
 
-    # FIXED: Set seed once (before gen)
-    if seed_num == 0:
-        seed_num = 42
-    set_seed(seed_num)
-    logger.debug(f"Set seed: {seed_num}")
-
-    # FIXED: Conditional intra-gen warm-up (skip if pre-optimized; aligns with model.py)
-    from .tts_model import warmup_t3
     if get_config_value('warmup_t3', True) and hasattr(model, 'generate') and not (hasattr(model, 'optimized') and model.optimized):
         dummy_warm = model.generate("Warm-up text.")  # Short; triggers if no cache hit
-        logger.debug("Intra-gen T3 warmup complete (fallback)")
     elif hasattr(model, 'optimized') and model.optimized:
         logger.debug("T3 warmup skipped: Model pre-optimized")
 
     reuse_start = perf_counter_ns()
     try_fuzzy = get_config_value('app_config.globals.fuzzy.enable_fuzzy.cache', True)  # Use get_value (consistent)
-    reuse_result = try_reuse_audio(text, audio_prompt_path, exaggeration, cache_uuid=cache_uuid, try_fuzzy=try_fuzzy) if audio_prompt_path else None
+    reuse_result = try_reuse_audio(generate_args.get('text'), audio_prompt_path, generate_args.get('exaggeration'), cache_uuid=cache_uuid, try_fuzzy=try_fuzzy) if audio_prompt_path else None
     reuse_time_ms = (perf_counter_ns() - reuse_start) / 1_000_000
     if reuse_result:
         audio_reuse_path, hit_type = reuse_result
         wav_reused, _ = torchaudio.load(audio_reuse_path)
         wav_length = wav_reused.shape[-1] / sr  # Use sr
         logger.info(
-            f"{hit_type} cache HIT: \"{text[:50]}...\" ({hit_type.lower()}-match) for {stem} – skipping gen (uuid={cache_uuid}; reuse: {reuse_time_ms:.0f}ms)")
+            f"{hit_type} cache HIT: \"{text[:50]}...\" ({hit_type.lower()}-match) for {generate_args.get('voice_stem')} – skipping gen (uuid={cache_uuid}; reuse: {reuse_time_ms:.0f}ms)")
         logger.info(f"Reused {hit_type.lower()} audio: {wav_length:.2f}s in ~0s")
         if audio_prompt_path:
             FUZZY_QUEUE.put((text, audio_reuse_path, voice_stem))
@@ -374,35 +378,16 @@ async def generate_audio(model, text: str, audio_prompt_path: Optional[str], exa
 
     prep_start = perf_counter_ns()
     valid_path = prepare_voice_and_conds(
-        model, audio_prompt_path, cache_uuid, exaggeration, language_id,
-        enable_memory_cache, enable_disk_cache, device, dtype, sr, multilingual, voice_stem
+        model, audio_prompt_path, cache_uuid, generate_args.get('exaggeration', 0.7), language_id,
+        enable_memory_cache, enable_disk_cache, device, dtype, sr, multilingual, generate_args.get('voice_stem')
     )
     prep_time_ms = (perf_counter_ns() - prep_start) / 1_000_000
     logger.debug(f"Prep/conds: {prep_time_ms:.0f}ms")
 
-    # FIXED: Drop conditional_start_time (redundant with prep_time_ms)
-
-    t3_params = {
-        "generate_token_backend": "cudagraphs-manual",  # TODO from config ? FIXED: Use inductor for fused speed (source)
-        "stride_length": 4,  # Parallel tokens (source)
-        "skip_when_1": True
-    }
-    generate_args = {
-        "text": text,
-        "exaggeration": exaggeration,
-        "temperature": temperature,
-        "cfg_weight": cfgw,
-        "min_p": min_p,
-        "top_p": top_p,
-        "repetition_penalty": repetition_penalty,
-        "t3_params": t3_params,
-    }
-    if multilingual:
-        generate_args["language_id"] = language_id
 
     gen_start = perf_counter_ns()  # FIXED: Core gen start
     with no_grad_context(device=device):  # FIXED: Pass torch.device (no str)
-        wav = _generate_audio_core(model, generate_args, t3_params)
+        wav = _generate_audio_core(model, generate_args, generate_args.get('t3_params')) #TODO review t3
     gen_time_s = (perf_counter_ns() - gen_start) / 1_000_000_000  # FIXED: Core time
     logger.debug(f"Core gen time: {gen_time_s:.2f}s | raw wav shape: {wav.shape if wav is not None else 'None'}")
 
@@ -412,8 +397,6 @@ async def generate_audio(model, text: str, audio_prompt_path: Optional[str], exa
         def _silence_tensor(sr: int, duration_s: float = 2.0) -> torch.Tensor:
             return torch.zeros(1, int(sr * duration_s), dtype=torch.float32, device='cpu')  # FIXED: CPU fallback (save-safe)
         wav = _silence_tensor(sr)
-
-    merged_params = config.get_merged_audio_params(voice_name=voice_stem)  # Use voice_stem
 
     post_start = perf_counter_ns()
     # FIXED: Ensure 2D mono input
@@ -428,7 +411,7 @@ async def generate_audio(model, text: str, audio_prompt_path: Optional[str], exa
     logger.debug(f"Post input shape: {wav_tensor.shape} (stem={voice_stem})")
 
     try:
-        post_result = await apply_post_processing(wav_tensor, sr, merged_params)
+        post_result = await apply_post_processing(wav_tensor, sr, voice_params)
         if isinstance(post_result, torch.Tensor):
             wav_np = post_result.detach().cpu().numpy().squeeze() if post_result.dim() > 1 else post_result.cpu().numpy()
         elif isinstance(post_result, np.ndarray):
@@ -454,16 +437,16 @@ async def generate_audio(model, text: str, audio_prompt_path: Optional[str], exa
     post_time_ms = (perf_counter_ns() - post_start) / 1_000_000
 
     # FIXED: Guard None in format (error source)
-    speaking_rate = merged_params.get('speaking_rate', 1.0) or 1.0  # Fallback float
-    notch_gain_db = merged_params.get('notch_gain_db', None)
+    speaking_rate = voice_params.get('speaking_rate', 1.0) or 1.0  # Fallback float
+    notch_gain_db = voice_params.get('notch_gain_db', None)
     notch_str = f"{notch_gain_db:.1f}dB" if notch_gain_db is not None else 'N/A'
     logger.info(f"Post for {voice_stem}: {post_time_ms:.0f}ms (rate={speaking_rate:.2f}, notch={notch_str})")
 
     func_end_time = perf_counter_ns()
     total_duration_s = (func_end_time - func_start_time) / 1_000_000_000
     audio_dur_s = len(wav_np) / sr  # FIXED: Generated length (post-processed)
-    rtf_total = total_duration_s / audio_dur_s if audio_dur_s > 0 else float('inf')  # RTF total
-    rtf_core = gen_time_s / audio_dur_s if audio_dur_s > 0 else float('inf')  # RTF core (raw gen dur)
+    rtf_total = calculate_rtf(total_duration_s, audio_dur_s)
+    rtf_core = calculate_rtf(gen_time_s, audio_dur_s)
     logger.info(  # FIXED: RTF log at INFO (end)
         f"Generated {audio_dur_s:.2f}s audio (total RTF: {rtf_total:.2f}x, core RTF: {rtf_core:.2f}x)")
 
@@ -481,7 +464,7 @@ async def generate_audio(model, text: str, audio_prompt_path: Optional[str], exa
     save_voice_path = audio_prompt_path  # Unpadded original for consistent cache key
     logger.debug(f"Save using unpadded voice_path: '{save_voice_path}' (valid_path was '{valid_path}')")
     wave_file = save_and_cache_output(
-        save_wav, save_voice_path, cache_uuid, text, exaggeration, params, enable_memory_cache, enable_disk_cache, sr
+        save_wav, save_voice_path, cache_uuid, generate_args.get('text'), generate_args.get('exaggeration'), generate_args, enable_memory_cache, enable_disk_cache, sr
     )
     save_time_ms = (perf_counter_ns() - save_start) / 1_000_000
     logger.debug(f"Save/cache: {save_time_ms:.0f}ms → {wave_file}")
