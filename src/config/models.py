@@ -258,7 +258,6 @@ class Globals(BaseModel):
     enable_memory_cache: bool = Field(default=True)
     enable_disk_cache: bool = Field(default=True)
     tts_name: str = Field(default='Chatterbox')
-    cache_dir: str = Field('./cache')
 
     # Core fields
     device: str = Field(default='cuda')
