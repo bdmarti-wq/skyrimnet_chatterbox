@@ -79,15 +79,7 @@ def main():  # FIXED: Make sync (no async def; Easier for script + handles neste
 
     instance = ModelManager.get_instance()
     model = instance.get_model(model_type)  # Loads/caches; returns object or None
-
-    if model is None:
-        logger.error(f"Failed to load {model_type} model; TTS disabled")
-        config.app_config.globals.model = None  # Explicit null
-    else:
-        # Set runtime (in-memory; for CONFIG.model access)
-        config.app_config.globals.model = model
-        logger.info(
-            f"✓ Model loaded : {model.__class__.__name__} ({model_type}) on {config.app_config.globals.device} (dtype={config.app_config.globals.dtype})")
+    logger.info(f"✓ Model loaded : {model.__class__.__name__} ({model_type}) on {config.app_config.globals.device} (dtype={config.app_config.globals.dtype})")
 
     init_conditional_memory_cache(model, get_config_value('globals.device'), get_config_value('globals.dtype'), pre_validate_voices=False)  # Quiet for prod
     load_fuzzy_cache()

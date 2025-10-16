@@ -111,12 +111,13 @@ def generate_audio_ui(  # Sync def (Gradio calls without await → no coroutine 
     try:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
+        model = ModelManager.get_instance().get_model()
 
         # Lazy import + call (via kwargs for sig safety; model=MODEL from global)
         from src.generate_audio import generate_audio  # Assume will be async (returns coroutine)
         from .config import get_config_value
         gen_coroutine = generate_audio(  # Call async fn → coroutine
-            model=config.app_config.globals.model,
+            model=model,
             text=text,
             audio_prompt_path=speaker_audio,  # None ok (used internally for stem/post)
             seed_num=seed_num,

@@ -21,7 +21,7 @@ import tempfile
 import torch  # For stub_wav_path (if needed for tensor)
 from .config import CONFIG, get_config_value
 from .generate_audio import generate_audio
-from .tts_model import get_model
+from .tts_model import get_model, ModelManager
 
 
 # NEW: Safe helpers for scalar conversion (fixes list/None issues in sliders) - prop-based
@@ -120,7 +120,7 @@ str_props = ['normalize_method', 'logging_level']
 def update_api_status():
     """Return API/model status string."""
     try:
-        model_ready = "Ready" if CONFIG.app_config.globals.model else "Not Loaded"
+        model_ready = "Ready" if ModelManager.get_instance().get_model() else "Not Loaded"
         return f"API Status: Model={model_ready} | Voices={len(CONFIG.get_all_voices())} | Modified={CONFIG._is_modified}"
     except Exception as e:
         logger.error(f"Update status failed: {e}")

@@ -263,7 +263,7 @@ class Globals(BaseModel):
     device: str = Field(default='cuda')
     multilingual: bool = Field(default=False)
     sr: int = Field(default=24000)
-    model: Optional[Any] = Field(default=None)
+
 
     # Core validators (coercion for device/dtype)
     @field_validator('device', mode='before')
