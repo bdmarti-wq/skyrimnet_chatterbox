@@ -36,7 +36,7 @@ from collections import OrderedDict
 from typing import Dict, Any, Optional, Tuple, Union, List
 from loguru import logger  # Assume available; fallback to print if not
 import threading  # Ensure imported (likely already is)
-from .config import get_config, get_config_value
+from .config import get_config, get_config_value, find_project_root
 from src.audio_utils import is_artifact_laden  # Import for artifact check
 import hashlib
 from threading import Thread
@@ -47,14 +47,18 @@ from .normalize_stem import normalize_stem
 
 # Suppress torchaudio deprecations precisely (exact message/module for backend utils)
 warnings.filterwarnings('ignore', message=r'.*torchaudio._backend.utils.info.*', category=UserWarning)
-warnings.filterwarnings('ignore', message=r'.*deprecated.*torchaudio.*', category=UserWarning, module='torchaudio')
+warnings.filterwarnings('ignore', message=r'.*deprecated.*torchaudio.*', category=UserWarning,  module='torchaudio')
 warnings.filterwarnings('ignore', category=UserWarning, module='torchaudio')  # Broad fallback
 warnings.filterwarnings('ignore', category=DeprecationWarning, module='torchaudio')
 
 CONFIG = get_config()
 
 # Anchor paths to project root (skyrimnet_chatterbox/) for relocatable code
+
 ROOT_DIR = Path(__file__).parent.parent  # From src/ -> skyrimnet_chatterbox/
+logger.info(f"original root: {ROOT_DIR} ")
+logger.info(f"root from find: {find_project_root()}")
+logger.info(f"root from config: {get_config_value('globals.root')}")
 
 # Original globals (now rooted)
 WAV_OUTPUT_DIR = ROOT_DIR / "output_temp"

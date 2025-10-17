@@ -42,6 +42,8 @@ def reload_config():
     config = get_config()
     config.reload_config()
 
+
+
 class Config:
     _instance = None
     _lock = threading.Lock()
@@ -115,6 +117,22 @@ class Config:
             self._config_cache = self.app_config.model_dump()  # Updated with coercion
             self.save_config(create_backup=False)
             logger.warning("Loaded default config.json (with coercion)")
+
+
+        # AFTER validation but before caching
+        if self.app_config:
+            try:
+                # Force directory resolution/validation
+                _ = self.app_config.globals.root  # Trigger property
+                logger.info(f"Project root: {self.app_config.globals.root}")
+                logger.info(f"Cache root: {self.app_config.globals.cache_dir}")
+            except Exception as e:
+                logger.error(f"Directory initialization failed: {e}")
+                # Critical failure handling
+                if not self.app_config.globals.root:
+                    self.app_config.globals.root = Path.cwd()
+                if not self.app_config.globals.cache_dir:
+                    self.app_config.globals.cache_dir = self.app_config.globals.root / "cache_fallback"
 
         # Post-load: Setup caches
         self._invalidate_merged_cache()
@@ -323,6 +341,151 @@ class Config:
         self._voice_hashes[voice_name] = voice_key
         logger.debug(f"Merged params for {voice_name} (LRU miss; cached)")
         return params
+
+
+    # Merged audio params (use models)
+    def get_voice_params(self, voice_name: Optional[str] = None, overrides: Optional[Dict] = None) -> Dict[
+        str, Any]:
+        """Get voice params with proper initialization safety check."""
+        # Critical safety check - must be first thing in method
+        if not self._is_initialized or self.app_config is None:
+            logger.warning("Config not initialized - using fallback voice params")
+            voice_name = voice_name or 'default_fallback'
+
+            return {
+                'temperature': 0.8,
+                'exaggeration': 0.5,
+                'top_p': 1.0,
+                'min_p': 0.05,
+                'repetition_penalty': 1.2,
+                'cfgw': 0.0,
+                'speaking_rate': 1.0,
+                'language_id': 'en',
+                'enable_pre_adjustment': True,
+                'sr': 24000,
+                'min_ref_duration': 3.0,
+                'check_artifacts': True,
+                'hop_length': 256,
+                'n_fft': 1024,
+                'normalize_method': 'peak',
+                'post_gain': 0.0,
+                'voice_name': voice_name
+            }
+
+        # Define EXACTLY which parameters we need with their expected types
+        # EXCLUDE 'voice_name' as it's handled separately
+        PARAM_SPECS = {
+            'temperature': float,
+            'exaggeration': float,
+            'top_p': float,
+            'min_p': float,
+            'repetition_penalty': float,
+            'cfgw': float,
+            'speaking_rate': float,
+            'language_id': str,
+            'enable_pre_adjustment': bool,
+            'sr': int,
+            'min_ref_duration': float,
+            'check_artifacts': bool,
+            'hop_length': int,
+            'n_fft': int,
+            'normalize_method': str,
+            'post_gain': float
+        }
+
+        DEFAULT_VALUES = {
+            'temperature': 0.8,
+            'exaggeration': 0.5,
+            'top_p': 1.0,
+            'min_p': 0.05,
+            'repetition_penalty': 1.2,
+            'cfgw': 0.0,
+            'speaking_rate': 1.0,
+            'language_id': 'en',
+            'enable_pre_adjustment': True,
+            'sr': 24000,
+            'min_ref_duration': 3.0,
+            'check_artifacts': True,
+            'hop_length': 256,
+            'n_fft': 1024,
+            'normalize_method': 'peak',
+            'post_gain': 0.0
+        }
+
+        voice_name = voice_name or 'default'
+        params = {}
+
+        # Helper function to safely get typed values
+        def _get_value(config_obj, param, param_type, default):
+            """Safely get parameter from config, preserving type"""
+            if config_obj is None:
+                return default
+
+            try:
+                value = getattr(config_obj, param, None)
+                if value is not None:
+                    # Handle type conversion based on expected type
+                    if param_type == bool:
+                        return bool(value)
+                    elif param_type == int:
+                        return int(float(value))  # Handle float→int conversion
+                    elif param_type == float:
+                        return float(value)
+                    else:  # str or other
+                        return str(value) if value is not None else default
+                return default
+            except (TypeError, ValueError, AttributeError):
+                return default
+
+        # Get globals config values with proper types
+        for param, param_type in PARAM_SPECS.items():
+            params[param] = _get_value(self.app_config.globals, param, param_type, DEFAULT_VALUES[param])
+
+        # Override with voice-specific config if available
+        if voice_name != 'default' and voice_name in self.app_config.voices:
+            voice = self.app_config.voices[voice_name]
+            for param, param_type in PARAM_SPECS.items():
+                value = _get_value(voice, param, param_type, None)
+                if value is not None:
+                    params[param] = value
+
+        # Apply API overrides with proper type handling
+        if overrides:
+            for param, value in overrides.items():
+                if param in PARAM_SPECS:
+                    try:
+                        if PARAM_SPECS[param] == bool:
+                            params[param] = bool(value)
+                        elif PARAM_SPECS[param] == int:
+                            params[param] = int(float(value))
+                        elif PARAM_SPECS[param] == float:
+                            params[param] = float(value)
+                        else:  # str
+                            params[param] = str(value)
+                    except (TypeError, ValueError):
+                        logger.warning(f"Invalid override for {param} - keeping current value", exc_info=True)
+
+        # SPECIAL HANDLING FOR VOICE_NAME (done after all other params)
+        params['voice_name'] = voice_name
+
+        # Special handling for known parameters
+        try:
+            params['sr'] = int(params['sr'])
+            params['exaggeration'] = max(0.0, min(1.0, float(params['exaggeration'])))
+        except (TypeError, ValueError) as e:
+            logger.error(f"Error with voice parameter values: {str(e)}")
+            # Set safe defaults if conversion fails
+            params['sr'] = 24000
+            params['exaggeration'] = 0.5
+
+        # Ensure normalize_method has valid value
+        valid_methods = ['peak', 'rms', 'none']
+        if params['normalize_method'] not in valid_methods:
+            logger.warning(f"Invalid normalize_method '{params['normalize_method']}' - using 'peak'")
+            params['normalize_method'] = 'peak'
+
+        return params
+
 
     def get_voice_parameters(self, voice_name: str) -> Dict[str, Any]:
         if self.app_config is None:

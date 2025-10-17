@@ -15,10 +15,12 @@ from pathlib import Path
 
 from loguru import logger
 
-from .config import get_config, get_config_value
+from .config import get_config, get_config_value, find_project_root
 from .audio_utils import is_artifact_laden
-from .cache import ROOT_DIR, CACHE_AUDIO_DIR  # Import shared paths only
 from .normalize_stem import normalize_stem
+
+ROOT_DIR = Path(find_project_root())
+CACHE_AUDIO_DIR = ROOT_DIR / "cache" / "audio"
 
 # Globals
 FUZZY_QUEUE = Queue(maxsize=0)  # Non-blocking

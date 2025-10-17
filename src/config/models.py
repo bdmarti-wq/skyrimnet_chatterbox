@@ -13,6 +13,8 @@ from loguru import logger
 from pathlib import Path
 import torch
 
+from src.config.utils import find_project_root
+
 # Global CAPS dict (constraints referenced in Fields)
 CAPS = {
     # Token Caps
@@ -264,6 +266,13 @@ class Globals(BaseModel):
     multilingual: bool = Field(default=False)
     sr: int = Field(default=24000)
 
+    # directories
+    root: Optional[Path] = Field(default=None, description="Project root directory")
+    cache_dir: Optional[Path] = Field(default=None, description="Base cache directory")
+    audio_cache_dir: Optional[Path] = Field(default=None, description="Audio processing cache")
+    voices_cache_dir: Optional[Path] = Field(default=None, description="Voice-specific audio cache")
+    output_cache_dir: Optional[Path] = Field(default=None, description="Final audio output")
+    conditionals_cache_dir: Optional[Path] = Field(default=None, description="Conditionals cache")
 
     # Core validators (coercion for device/dtype)
     @field_validator('device', mode='before')
@@ -301,6 +310,74 @@ class Globals(BaseModel):
         if field_name in ['tts', 'audio', 'fuzzy']:
             return None  # Nested; use sub.get_field_bounds
         return _get_field_bounds(field_name)
+
+    @model_validator(mode='after')
+    def setup_directories(self):
+        """Resolve all directory paths with user overrides and auto-configuration."""
+        try:
+            # 1. Find root (user override > auto-detect)
+            if not self.root:
+                self.root = find_project_root()
+
+            # Convert to absolute paths early
+            self.root = Path(self.root).expanduser().resolve()
+
+            # 2. Resolve cache_dir (user override > root/cache)
+            if not self.cache_dir:
+                self.cache_dir = self.root / "cache"
+            else:
+                self.cache_dir = Path(self.cache_dir).expanduser().resolve()
+                if not self.cache_dir.is_absolute():
+                    self.cache_dir = (self.root / self.cache_dir).resolve()
+
+            # 3. Resolve child directories (follow proper hierarchy)
+            self.audio_cache_dir = self._resolve_dir(self.audio_cache_dir, self.cache_dir / "audio")
+            self.voices_cache_dir = self._resolve_dir(self.voices_cache_dir, self.audio_cache_dir / "voices")
+            self.output_cache_dir = self._resolve_dir(self.output_cache_dir, self.audio_cache_dir / "output")
+            self.conditionals_cache_dir = self._resolve_dir(self.conditionals_cache_dir, self.cache_dir / "conditionals")
+
+            # 4. Ensure all directories exist
+            self._create_directories()
+
+        except Exception as e:
+            logger.error(f"Directory setup failed: {e}")
+            # Fallback to memory cache if disk fails
+            self.enable_disk_cache = False
+            self.enable_memory_cache = True
+
+        return self
+
+    def _resolve_dir(self, user_path: Optional[Path], default_path: Path) -> Path:
+        """Resolve a directory path with proper absolute conversion."""
+        if user_path is None:
+            return default_path
+
+        resolved = Path(user_path).expanduser().resolve()
+        return resolved if resolved.is_absolute() else (self.root / user_path).resolve()
+
+    def _create_directories(self):
+        """Ensure all directories exist with proper permissions."""
+        directories = [
+            ("cache", self.cache_dir),
+            ("audio cache", self.audio_cache_dir),
+            ("voices cache", self.voices_cache_dir),
+            ("output cache", self.output_cache_dir),
+            ("conditionals cache", self.conditionals_cache_dir)
+        ]
+
+        for name, path in directories:
+            if not path or not path.parent.exists():
+                continue
+
+            try:
+                path.mkdir(parents=True, exist_ok=True)
+                logger.debug(f"Created directory: {name} → {path}")
+            except PermissionError:
+                logger.error(f"Permission denied: cannot create {name} at {path}")
+                if name == "cache":
+                    self.enable_disk_cache = False
+            except Exception as e:
+                logger.error(f"Failed to create {name} directory ({path}): {e}")
 
 
 # VoiceConfig: Flat overrides (as before)

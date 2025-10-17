@@ -10,7 +10,7 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DTYPE = torch.bfloat16 if DEVICE == "cuda" else torch.float32
 MULTILINGUAL = False  # Default; pulled from CONFIG in methods
 
-from src.cache import clear_cache_files  # Clear conds/audio on unload
+# from src.cache import clear_cache_files  # Clear conds/audio on unload
 
 
 def chatterbox_tts_to(model: Any, device: torch.device, dtype: torch.dtype):
@@ -132,7 +132,7 @@ class SimpleModelState:
         return self.model is not None and self.model_type == model_type
 
     def clear(self):
-        clear_cache_files()  # Clear conds/audio
+        # clear_cache_files()  # Clear conds/audio
         if self.model is not None:
               # Del key parts to free memory
             if hasattr(self.model, 't3'):

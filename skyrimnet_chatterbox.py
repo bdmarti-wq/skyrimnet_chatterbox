@@ -20,7 +20,7 @@ backend = set_torchaudio_backend()
 import gradio as gr
 from argparse import ArgumentParser
 import torch
-from src.cache import (
+from src.cache_transition import (
     init_conditional_memory_cache, clear_cache_files, clear_output_directories
 )
 from loguru import logger

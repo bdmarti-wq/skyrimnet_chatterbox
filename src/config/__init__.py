@@ -2,7 +2,7 @@
 src/config Package Init: Lazy CONFIG + facades.
 """
 from typing import Optional
-
+from .utils import find_project_root
 from .config import (
     get_config, load_skyrimnet_config, get_config_value, reload_config
 )  # All facades; no legacy
@@ -41,5 +41,6 @@ __all__ = [
     'get_config',
     'load_skyrimnet_config',
     'get_config_value',
-    'reload_config'
+    'reload_config',
+    'find_project_root'
 ]

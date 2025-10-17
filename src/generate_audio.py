@@ -11,7 +11,7 @@ from typing import Optional, Dict, Any, Tuple
 from .config import get_config, get_config_value
 from .monitor import monitor_resources
 from .audio_utils import apply_post_processing
-from .cache import (
+from .cache_transition import (
     try_audio_cache, get_cache_key, get_or_queue_voice_process,
     validate_voice_path, create_dummy_conds, load_conditionals_cache, save_conditionals_cache,
     get_cache_stats, check_and_update_ref, save_torchaudio_wav
