@@ -16,7 +16,7 @@ import torchaudio  # For optional load/debug if needed
 
 from src.audio_utils import pad_short_text, get_silence
 from src.config import get_config
-from src.tts_model import GEN_ACTIVE_LOCK  # Global lock for gen/prepare
+from src.tts_model import GEN_ACTIVE_LOCK, restore_graphs_for_bucket  # Global lock for gen/prepare
 from .base import GenerationPhase as BaseGenerationPhase
 from ...pipeline.context import AudioGenerationContext
 from loguru import logger
@@ -85,6 +85,14 @@ class GenerationPhase(BaseGenerationPhase):
             # Set seed first (align with seeding)
             if context.seed is not None:
                 set_seed(context.seed)
+
+            # Determine bucket (e.g., from args; hardcode common for now)
+            max_tokens = 250 # context.max_new_tokens  # 250     TODO move to context
+            conds_state = 0  # 0 for clone; adjust if varies (e.g., from context or 0 for default)
+            bucket = (max_tokens, conds_state)
+
+            # Restore before gen (fast ~0.1ms)
+            restore_graphs_for_bucket(context.model, bucket)
 
             generated = context.model.generate(**gen_args)  # No 'conds'; relies on internal model.conds
 

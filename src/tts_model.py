@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Optional, Any
 from loguru import logger
 import torch
+import copy  # For deepcopy of graph cache
 
 # Lazy globals (defaults; overridden by CONFIG in methods)
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -17,6 +18,11 @@ MULTILINGUAL = False  # Default; pulled from CONFIG in methods
 MODEL_LOCK = threading.RLock()
 # NEW: Add this lock specifically for generation operations
 GEN_ACTIVE_LOCK = threading.RLock()  # Global for gen/prepare concurrency
+
+# FIXED: Global graph cache (module-level; populated post-load/warmup)
+# Key: tuple (max_tokens, conds_state=0/1), Value: deepcopy of model.t3._bucket_graphs after capture
+GRAPH_CACHE = None  # Dict[(int, int), Dict] – e.g., {(250, 0): graphs_dict}
+
 
 def chatterbox_tts_to(model: Any, device: torch.device, dtype: torch.dtype):
     """Granular to() for Chatterbox: bfloat16 compute, fp32 audio (avoids cuFFT/STFT errors). DRY."""
@@ -45,8 +51,6 @@ def chatterbox_tts_to(model: Any, device: torch.device, dtype: torch.dtype):
         torch.cuda.empty_cache()
     logger.debug("ChatterboxTTS dtype/device applied (granular overrides applied)")
     return model
-
-
 
 
 def warmup_t3(model: Any, num_runs: int = 2):
@@ -79,7 +83,7 @@ def warmup_t3(model: Any, num_runs: int = 2):
             _ = model.generate(**dummy_args)
             logger.debug(f"T3 warmup run {i + 1}/{num_runs}: Graphs captured")  # FIXED:
         except Exception as warm_e:
-            logger.warning(f"T3 warmup run {i+1} failed (non-fatal): {warm_e}")
+            logger.warning(f"T3 warmup run {i + 1} failed (non-fatal): {warm_e}")
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -90,6 +94,7 @@ class SimpleModelState:
     """Simple internal state for model caching (adapted from original; no decorator needed)."""
 
     def __init__(self):
+        """Initialize state attributes (original; ensures self.model etc. exist)."""
         self.model: Optional[Any] = None
         self.model_type: Optional[str] = None  # 'english' or 'multilingual'
         self.optimized: bool = False  # TRACKER: For re-optimization on re-load
@@ -113,12 +118,53 @@ class SimpleModelState:
                 logger.error(f"from_pretrained returned None for {model_type}")
                 return None
 
-            # FIXED: Order: to() → warmup (inits graphs/T3) → compile (targets _step post-init)
+            # FIXED: Order: to() → warmup (inits graphs/T3) → cache graphs (post-capture)
             if not self.optimized:  # Simplified (always on first/re-optimize)
                 chatterbox_tts_to(self.model, device, dtype)
                 warmup_t3(self.model)
+
+                # FIXED: Cache graphs immediately after warmup (one-time, captures built graphs)
+                global GRAPH_CACHE
+                GRAPH_CACHE = {}
+                common_buckets = [(250, 0), (250, 1)]  # Common (max_tokens, conds_state); add more if needed
+                for bucket in common_buckets:
+                    try:
+                        # Re-use warmup-style dummy input to trigger capture for bucket
+                        dummy_input = torch.randint(0, 1000, (1, bucket[1] if bucket[1] else 1), dtype=torch.long,
+                                                    device=self.model.device)
+                        dummy_args = {
+                            "text": "Warmup for graph cache.",  # Short dummy
+                            "exaggeration": 0.5,
+                            "temperature": 0.8,
+                            "cfg_weight": 0.43,
+                            "min_p": 0.05,
+                            "top_p": 1.0,
+                            "repetition_penalty": 1.0,
+                            "t3_params": {
+                                "generate_token_backend": "cudagraphs-manual",
+                                "stride_length": 4,
+                                "skip_when_1": True
+                            }
+                        }
+                        with torch.no_grad():
+                            # Trigger capture (as in warmup, but targeted to bucket if exposed; otherwise dummy gen)
+                            _ = self.model.generate(**dummy_args, max_new_tokens=bucket[0])
+                            if hasattr(self.model.t3, '_bucket_graphs') and self.model.t3._bucket_graphs:
+                                GRAPH_CACHE[bucket] = copy.deepcopy(self.model.t3._bucket_graphs.copy())
+                                logger.info(
+                                    f"Graph captured and cached for bucket {bucket} (total keys: {len(GRAPH_CACHE)})")
+                            # Cleanup dummy
+                            gc.collect()
+                            if torch.cuda.is_available():
+                                torch.cuda.empty_cache()
+                    except Exception as cache_e:
+                        logger.warning(f"Graph cache for {bucket} failed: {cache_e} – will recapture in gen")
+                        GRAPH_CACHE[bucket] = None
+
                 self.optimized = True
-                logger.info(f"Model optimized (to()/warmup) for {model_type}")
+                logger.info(f"Model optimized (to()/warmup/graph cache) for {model_type}")
+            else:
+                logger.debug("Skipping optimization (already done)")
 
             self.model_type = model_type
             logger.info(
@@ -155,7 +201,7 @@ class SimpleModelState:
     def clear(self):
         # clear_cache_files()  # Clear conds/audio
         if self.model is not None:
-              # Del key parts to free memory
+            # Del key parts to free memory
             if hasattr(self.model, 't3'):
                 del self.model.t3
             if hasattr(self.model, 'conds'):
@@ -167,6 +213,42 @@ class SimpleModelState:
         self.model_type = None
         self.optimized = False  # Reset for next load
 
+
+# FIXED: Helper in tts_model.py (public; call from GenerationPhase or other consumers)
+def restore_graphs_for_bucket(model, bucket):
+    """Restore cached graphs to model.t3 for bucket (e.g., (250, 0)). If GRAPH_CACHE miss/None, recapture."""
+    global GRAPH_CACHE
+    if GRAPH_CACHE is None or bucket not in GRAPH_CACHE or GRAPH_CACHE[bucket] is None:
+        logger.debug(f"Graph cache MISS for {bucket} – triggering recapture")
+        # Fallback: Recapture as in warmup (calls internal capture via dummy gen)
+        dummy_args = {
+            "text": "Fallback gen for recapture.",
+            "exaggeration": 0.5,
+            "temperature": 0.8,
+            "cfg_weight": 0.43,
+            "min_p": 0.05,
+            "top_p": 1.0,
+            "repetition_penalty": 1.0,
+            "t3_params": {
+                "generate_token_backend": "cudagraphs-manual",
+                "stride_length": 4,
+                "skip_when_1": True
+            }
+        }
+        dummy_input = torch.randint(0, 1000, (1, bucket[1] if bucket[1] else 1), dtype=torch.long, device=model.device)
+        with torch.no_grad():
+            _ = model.generate(**dummy_args, max_new_tokens=bucket[0])  # Triggers capture
+        # Cache for next (deepcopy to avoid mutation)
+        if hasattr(model.t3, '_bucket_graphs'):
+            GRAPH_CACHE[bucket] = copy.deepcopy(model.t3._bucket_graphs.copy())
+            logger.debug(f"Recaptured and cached for {bucket}")
+    else:
+        # Fast copy (~0.1ms)
+        model.t3._bucket_graphs = copy.copy(GRAPH_CACHE[bucket])  # Shallow for tensors (device same)
+        logger.debug(f"Graph restored from cache for {bucket} (fast)")
+    # Ensure clean state
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
 
 
 class ModelManager:
@@ -190,7 +272,7 @@ class ModelManager:
     def load_model(self, model_type: Optional[str] = None, *args, **kwargs) -> bool:
         """Load model (lazy; use multilingual if flag set). Returns True if loaded/success.
         FIX: Lazy CONFIG import/access (breaks cycle)."""
-        from .config import get_config_value  # Lazy import (inside method; after config.py init)
+        from .config import get_config_value  # Lazy
         instance = self.get_instance()
         model_type = model_type or ('multilingual' if get_config_value('multilingual') else 'english')
         device = torch.device(get_config_value('device', 'cuda'))
@@ -206,7 +288,7 @@ class ModelManager:
 
     def get_model(self, model_type: Optional[str] = None) -> Optional[Any]:
         """Get loaded model (lazy-loads if None matching type); propagate optimized attr. FIX: Lazy CONFIG."""
-        from .config import get_config_value  # Lazy (inside method)
+        from .config import get_config_value  # Lazy
         instance = self.get_instance()
         if model_type is None:
             model_type = 'multilingual' if get_config_value('multilingual') else 'english'
@@ -240,7 +322,6 @@ class ModelManager:
         instance = cls.get_instance()
         instance.clear()
         return instance.load_model(model_type or ('multilingual' if get_config_value('multilingual') else 'english'))
-
 
 
 @staticmethod
@@ -288,13 +369,15 @@ def create_dummy_conds(model, device, dtype, reason="dummy"):
 def load_model(model_type: Optional[str] = None, *args, **kwargs):
     """Old API: Load via singleton. FIX: Lazy CONFIG."""
     from .config import get_config_value  # Lazy
-    return ModelManager.get_instance().load_model(model_type or ('multilingual' if get_config_value('multilingual') else 'english'), *args, **kwargs)
+    return ModelManager.get_instance().load_model(
+        model_type or ('multilingual' if get_config_value('multilingual') else 'english'), *args, **kwargs)
 
 
 def get_model(model_type: Optional[str] = None):
     """Old API: Get via singleton. FIX: Lazy CONFIG."""
     from .config import get_config_value  # Lazy
-    return ModelManager.get_instance().get_model(model_type or ('multilingual' if get_config_value('multilingual') else 'english'))
+    return ModelManager.get_instance().get_model(
+        model_type or ('multilingual' if get_config_value('multilingual') else 'english'))
 
 
 def clear_model():

@@ -1,6 +1,6 @@
 # In src/generate/pipeline/phases/voice_processing.py
 # (Updated VoiceProcessingPhase – FIXED: CUDA graph conflict in _prepare_conditionals by temp eager mode + sync;
-#  guard voice_params in execute/handle_error ('NoneType' no 'items'); safe config attrs.)
+#  guard voice_params in execute/handle_error ('NoneType' no 'items'); safe config attrs. NEW: Stable hash key + _get_or_prepare for atomic cache use.)
 
 import hashlib
 import os
@@ -47,7 +47,7 @@ class VoiceProcessingPhase(GenerationPhase):
             return 0.0
 
     def execute(self, context: AudioGenerationContext) -> AudioGenerationContext:
-        """If cache miss, prep conds on processed_path (reuse if HIT). FIXED: None-safe exag format."""
+        """If cache miss, prep conds on processed_path (reuse if HIT). FIXED: None-safe exag format; stable cond_key with hash."""
         start_time = time.perf_counter()
         config = get_config()
         stem = context.voice_stem or normalize_stem(context.audio_prompt_path or '')
@@ -72,127 +72,150 @@ class VoiceProcessingPhase(GenerationPhase):
             logger.warning("voice_params not dict; defaulting empty")
             context.text = pad_short_text(context.text, {})
 
-        # Conds: Reuse key from voice cache; load or prep on MISS
-        cond_key = getattr(context, 'conditionals_key', None)
-        if not cond_key:
-            # Fallback key gen (FIXED: None-safe exag)
-            content_hash = getattr(context, 'voice_content_hash', '') or f"hash_{hash(processed_path)}"[:12]
-            exag = voice_params.get('exaggeration', 1.0)
-            if exag is None:  # FIXED: Handle None
-                exag = 1.0
-                logger.warning("Exaggeration None; default 1.0")
-            cond_key = f"v2_{stem}_ref_{content_hash}_exag{exag:.2f}"
-
+        # NEW: Stable cond_key using voice_content_hash (from voice_reference; fallback MD5 on path for reuse)
+        content_hash = getattr(context, 'voice_content_hash', None)
+        if content_hash is None:
+            # Fallback: Compute MD5 on path (stable across uploads if content same)
+            try:
+                with open(processed_path, 'rb') as f:
+                    content_hash = hashlib.md5(f.read()).hexdigest()[:12]
+                context.voice_content_hash = content_hash  # Store for downstream
+            except Exception as hash_e:
+                logger.warning(f"Hash fallback failed: {hash_e}; using timestamp")
+                content_hash = f"hash_{int(time.time() % 1000000)}"[:12]
+        exag = voice_params.get('exaggeration', 1.0)
+        if exag is None:  # FIXED: Handle None
+            exag = 1.0
+            logger.warning("Exaggeration None; default 1.0")
+        temp = voice_params.get('temperature', 0.8)
+        topp = voice_params.get('top_p', 1.0)
+        cond_key = f"hash_{content_hash}_exag{exag:.2f}_temp{temp:.2f}_topp{topp:.2f}"  # TODO review do we need stem?
         context.conditionals_key = cond_key
-        conds = None
-        if self.conditionals_cache:
-            conds = self.conditionals_cache.get(cond_key, context.model, str(context.device), str(context.dtype))
-            if conds is not None:
-                logger.debug(f"Conds HIT from cache for {stem}: {cond_key[:20]}...")
 
-        if conds is None and not getattr(context, 'is_cached', False):
-            # MISS: Prep + cache
-            if not self._prepare_conditionals(context, processed_path, voice_params):
-                # Failed prep → dummy
-                create_dummy_conds(context.model, context.device, context.dtype, f"prep_fail_{stem}")
-                logger.warning(f"Prep failed for {stem} – dummy conds")
-            else:
-                logger.info(f"Prepared conds on {processed_path} for {stem} (key: {cond_key[:20]}...)")
+        # FIXED: Prep with cache integration (get_or_prep atomic; HIT skips prep)
+        prep_time = time.perf_counter()
+        conds_loaded = False
+        if self.conditionals_cache:
+            conds = self._prepare_conditionals(context, processed_path, voice_params)
+            if conds is not None:
+                conds_loaded = True
         else:
-            # Reuse HIT
-            logger.info(f"Conds reuse/HIT for {stem}: {cond_key[:20]}...")
-            if hasattr(context.model, 'set_conditionals') and conds is not None:
-                context.model.set_conditionals(conds)
-                chatterbox_tts_to(context.model, context.device, context.dtype)
+            # No cache: Always fresh prep (use fallback)
+            conds = self._prepare_fresh(context.model, processed_path, exag, context.device, context.dtype)
+            if conds is not None:
+                conds_loaded = True
+
+        prep_time = time.perf_counter() - prep_time
+        status = "reuse" if conds_loaded else "prep"
+        if conds_loaded and self.conditionals_cache:
+            status = "cache_reuse" if hasattr(context,
+                                              'conds_from_cache') and context.conds_from_cache else "fresh_prep"
+        logger.info(
+            f"Prepared conds on {processed_path} for {stem} (key: {cond_key[:20]}...) | time {prep_time:.3f}s ({status})")
+
+        if conds is None:
+            # Failed: Dummy fallback
+            logger.warning(f"Prep failed for {stem} – dummy conds")
+            create_dummy_conds(context.model, context.device, context.dtype, f"prep_fail_{stem}")
+            conds_loaded = False
 
         # FIXED: Ensure voice_params is always dict
         context.voice_params = voice_params or {}
         context.voice_ref_processed = True
         voice_time = time.perf_counter() - start_time
         logger.info(
-            f"Voice time: {voice_time:.3f}s ({'reuse' if conds else 'prep' if not getattr(context, 'is_cached', False) else 'cached'} for {stem})")
+            f"Voice time: {voice_time:.3f}s ({'reuse' if conds_loaded else 'prep'} for {stem})")
         return context
 
+
     def _prepare_conditionals(self, context: AudioGenerationContext, prep_path: str,
-                              voice_params: Dict[str, Any]) -> bool:
-        """OLD STYLE: Load cache or prepare_conditionals + to() + save. FIXED: Eager/sync for CUDA; guard 'params' attr."""
+                              voice_params: Dict[str, Any]) -> Optional[Any]:
+        """NEW: Atomic prepare with cache (_get_or_prepare); returns conds if success (loaded or fresh). FIXED: Eager/sync; set conds_loaded flag."""
         prep_start = time.perf_counter()
         exag = voice_params.get('exaggeration', 1.0)
         device = context.device
         dtype = context.dtype
-        cache_key = getattr(context, 'conditionals_key', None)
+        cache_key = context.conditionals_key  # Stable from execute
 
-        conditionals_loaded = False
-        if cache_key and self.conditionals_cache:
-            try:
-                conds = self.conditionals_cache.get(cache_key, context.model, str(device), str(dtype))
-                if conds is not None:
-                    context.model.set_conditionals(conds)
-                    chatterbox_tts_to(context.model, device, dtype)
-                    conditionals_loaded = True
-                    logger.info(f"Conds loaded from cache {cache_key[:20]}...")
-            except Exception as load_e:
-                logger.warning(f"Cache load fail: {load_e} – fresh prep")
+        if not self.conditionals_cache:
+            logger.warning("No cache; falling back to direct prep")
+            context.conds_from_cache = False
+            conds = self._prepare_fresh(context.model, prep_path, exag, device, dtype)
+            return conds
 
-        if not conditionals_loaded:
-            # FIXED: Clear graphs (always safe)
-            if hasattr(context.model, 't3') and hasattr(context.model.t3, '_bucket_graphs'):
-                context.model.t3._bucket_graphs.clear()
+        # FIXED: Use cache's _get_or_prepare (atomic: get → miss? prep + save → return)
+        conds = self.conditionals_cache._get_or_prepare(
+            model=context.model, audio_path=prep_path, exag=exag,
+            device=str(device), dtype=dtype, cache_key=cache_key
+        )
 
-            # FIXED: Temp eager if 'params' exists (guard no attr error)
-            original_params = None
-            if hasattr(context.model, 't3') and hasattr(context.model.t3, 'params') and isinstance(
-                    context.model.t3.params, dict):
-                original_params = context.model.t3.params.copy()
-                context.model.t3.params['generate_token_backend'] = 'eager'
-                logger.debug("Temp eager set for prep")
+        if conds is not None:
+            # Post-load/set: Set model state (as in cache.get)
+            context.model.conds = conds
+            if hasattr(context.model, 'set_conditionals'):
+                context.model.set_conditionals(conds)
+            context.conds_from_cache = True  # Flag for execute (HIT vs fresh)
+            chatterbox_tts_to(context.model, device, dtype)
 
+            # Log emb for validation
+            if hasattr(conds, 't3') and hasattr(conds.t3, 'speaker_emb'):
+                emb = conds.t3.speaker_emb
+                emb_nonzero = not torch.all(emb == 0)
+                emb_time = time.perf_counter() - prep_start
+                logger.info(f"Conds ready | emb {emb.shape} (non-zero: {emb_nonzero}) | time {emb_time:.3f}s")
+            else:
+                logger.debug(f"Conds ready (no emb attr) | time {time.perf_counter() - prep_start:.3f}s")
+            return conds
+
+        # Failed: Flag for fallback
+        context.conds_from_cache = False
+        logger.warning("Cache prep returned None – fallback to fresh")
+        conds = self._prepare_fresh(context.model, prep_path, exag, device, dtype)
+        return conds
+
+    def _prepare_fresh(self, model: Any, prep_path: str, exag: float, device: torch.device, dtype: torch.dtype) -> \
+    Optional[Any]:
+        """Fallback direct prep (no cache; for error cases). FIXED: Full guards (eager, sync, dummy)."""
+        # FIXED: Clear graphs (always safe)
+        if hasattr(model, 't3') and hasattr(model.t3, '_bucket_graphs'):
+            model.t3._bucket_graphs.clear()
+
+        # FIXED: Temp eager if 'params' exists (guard no attr error)
+        original_params = None
+        if hasattr(model, 't3') and hasattr(model.t3, 'params') and isinstance(model.t3.params, dict):
+            original_params = model.t3.params.copy()
+            model.t3.params['generate_token_backend'] = 'eager'
+            logger.debug("Temp eager set for prep")
+
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+            logger.debug("Sync before prep")
+
+        try:
+            # CORE OLD: prepare + to()
+            model.prepare_conditionals(prep_path, exaggeration=exag)
+            if dtype != torch.float32 and hasattr(model.conds, 't3'):
+                model.conds.t3.to(device=device, dtype=dtype)
+            chatterbox_tts_to(model, device, dtype)
+            logger.debug(f"Prepared conds fresh (exag {exag})")
+
+            # Return conds for caller
+            conds = model.conds
+            if hasattr(conds, 't3') and hasattr(conds.t3, 'speaker_emb'):
+                emb = conds.t3.speaker_emb
+                emb_nonzero = not torch.all(emb == 0)
+                logger.info(f"Fresh conds ready | emb {emb.shape} (non-zero: {emb_nonzero})")
+            return conds
+        except Exception as prep_e:
+            logger.error(f"Direct prep failed: {prep_e} – dummy fallback")
+            return None
+        finally:
+            # FIXED: Restore if set
+            if original_params is not None and hasattr(model, 't3') and hasattr(model.t3, 'params'):
+                model.t3.params = original_params
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
-                logger.debug("Sync before prep")
-
-            try:
-                # CORE OLD: prepare + to()
-                context.model.prepare_conditionals(prep_path, exaggeration=exag)
-                if dtype != torch.float32 and hasattr(context.model.conds, 't3'):
-                    context.model.conds.t3.to(device=device, dtype=dtype)
-                chatterbox_tts_to(context.model, device, dtype)
-                logger.debug(f"Prepared conds fresh (exag {exag})")
-            except Exception as prep_e:
-                logger.error(f"Prep failed: {prep_e} – dummy fallback")
-                if hasattr(context, 'model') and context.model:
-                    create_dummy_conds(context.model, device, dtype, f"prep_fail_{context.voice_stem or 'unknown'}")
-                return False
-            finally:
-                # FIXED: Restore if set
-                if original_params is not None and hasattr(context.model, 't3') and hasattr(context.model.t3, 'params'):
-                    context.model.t3.params = original_params
-                if torch.cuda.is_available():
-                    torch.cuda.synchronize()
-                    logger.debug("Restored params + final sync")
-
-            # Save cache
-            if cache_key and self.conditionals_cache:
-                try:
-                    self.conditionals_cache.save(cache_key, context.model.conds)
-                    logger.debug(f"Saved conds {cache_key[:20]}...")
-                except Exception as save_e:
-                    logger.warning(f"Cache save fail: {save_e}")
-
-        # FIXED: Basic validate/log
-        raw_conds = getattr(context.model, 'conds', None)
-        if raw_conds and hasattr(raw_conds, 't3') and hasattr(raw_conds.t3, 'speaker_emb'):
-            emb = raw_conds.t3.speaker_emb
-            emb_nonzero = not torch.all(emb == 0)
-            logger.info(
-                f"Conds ready | emb {emb.shape} (non-zero: {emb_nonzero}) | time {time.perf_counter() - prep_start:.3f}s")
-            return True
-        else:
-            logger.warning("Conds invalid after prep – dummy")
-            if hasattr(context, 'model') and context.model:
-                create_dummy_conds(context.model, device, dtype, f"invalid_{context.voice_stem or 'unknown'}")
-            return False
-
+                logger.debug("Restored params + final sync")
 
     def validate_voice_path(self, path: str, stem: str) -> Tuple[bool, str]:
         """Local FIXED: Basic validation (exists/dur/artifacts; from audio_utils move). Returns (valid, msg)."""
@@ -211,10 +234,10 @@ class VoiceProcessingPhase(GenerationPhase):
             waveform, _ = torchaudio.load(path)
             if torch.all(waveform == 0) or waveform.abs().max() < 1e-6:
                 return False, f"Silent/empty for {stem}"
-            # Optional advanced (if audio_utils has it)
+            # Optional advanced (if audio_utils has it – uncomment for stricter)
             # from src.audio_utils import is_artifact_laden
             # if is_artifact_laden(path, threshold_hz=config.sr // 3):
-            #     return False, f"Artifacts in {stem}"
+            #     return False, f"Artifacts in {stem} (threshold {config.sr // 3}Hz)"
 
             return True, f"Valid {stem} (dur {duration:.2f}s)"
         except Exception as v_e:
@@ -261,7 +284,7 @@ class VoiceProcessingPhase(GenerationPhase):
                 f"_temp{params.get('temperature', 0.8):.2f}_topp{params.get('top_p', 1.0):.2f}")
 
     def _cache_conditionals(self, context: AudioGenerationContext) -> bool:
-        """Cache conditionals with proper validation and logging. Fixed: enable_disk check. FIXED: Use model.conds (align with working snippet)."""
+        """Cache conditionals with proper validation and logging. Fixed: enable_disk check. FIXED: Use model.conds (align with working snippet); deprecated as _get_or_prepare handles save."""
         if not context.conditionals_key or not hasattr(context.model, 'conds') or context.model.conds is None:
             logger.debug("Skipping conditionals cache – no conditionals generated")
             return False
@@ -349,4 +372,3 @@ class VoiceProcessingPhase(GenerationPhase):
 
         logger.debug("Error fallback complete; proceeding with default (dummy conds + silence)")
         return context
-

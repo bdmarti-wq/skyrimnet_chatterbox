@@ -62,7 +62,7 @@ class GenerationCoordinator:
         logger.info("Coordinator initialized with injected cache_manager and loaded config")
 
     def _warmup_models(self):
-        """Warmup T3 models for performance (graphs captured)."""
+        """Warmup T3 models for performance (graphs captured). FIXED: Deprecated – call only if needed (e.g., new model load); global in tts_model.py."""
         logger.info("Warming up T3 models for improved performance")
         start_time = time.perf_counter()
         warmup_t3(self.model)  # From tts_model
@@ -70,7 +70,7 @@ class GenerationCoordinator:
         logger.info(f"T3 warmup complete (manual graphs ready) | time: {warmup_time:.2f}s")
 
     def run(self, context: AudioGenerationContext) -> AudioGenerationContext:
-        """Run full pipeline: Phases + timing/logs. FIXED: Safe attr access in fallbacks."""
+        """Run full pipeline: Phases + timing/logs. FIXED: Safe attr access in fallbacks; REMOVED per-run warmup (global in model load)."""
         start_total = time.perf_counter()
         context.model = self.model  # Ensure model in context
         context.cache_manager = self.cache_manager  # Direct access if needed (fallback)
@@ -78,7 +78,9 @@ class GenerationCoordinator:
         if context.config is None:
             context.config = self.config
 
-        self._warmup_models()  # If not pre-called (avoid double-warmup with flag if needed)
+        # FIXED: Skip per-run warmup – already done in tts_model.py load() (global, one-time)
+        # Optional: If context.needs_warmup (e.g., new multilingual): self._warmup_models()
+        # self._warmup_models()  # REMOVED: Causes 4-6s overhead per gen
 
         phase_times = {}
         for phase in self.phases:
@@ -127,7 +129,7 @@ class GenerationCoordinator:
         return context
 
     def _log_pipeline_results(self, total_time: float, phase_times: Dict[str, float], context: AudioGenerationContext):
-        """Log performance: Total RTF, phase times, cache status. FIXED: Nested globals.sr."""
+        """Log performance: Total RTF, phase times, cache status. FIXED: Nested globals.sr; ADDED conds stats."""
         globals_config = getattr(self.config.app_config, 'globals', None)
         sr = getattr(globals_config, 'sr', 24000) if globals_config else 24000
         audio_dur = context.audio_duration  # Use attr (set by phases or property)
@@ -142,4 +144,11 @@ class GenerationCoordinator:
             log_msg += f" | {phase}: {t:.2f}s"
         if cache_type != 'miss':
             log_msg += f" | cache: {cache_type}"
+
+        # NEW: Log conds cache stats (hits/misses for debugging)
+        conds_stats = {}
+        if hasattr(context, 'cache_manager') and hasattr(context.cache_manager, 'conditionals_cache'):
+            conds_stats = context.cache_manager.conditionals_cache.get_stats().get('stats', {})
+        log_msg += f" | conds cache: hits={conds_stats.get('disk_hits', 0)+conds_stats.get('memory_hits', 0)}, misses={conds_stats.get('misses', 0)}"
+
         logger.info(log_msg)
