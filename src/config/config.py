@@ -63,6 +63,7 @@ class Config:
         self._global_hash: Optional[str] = None
         self._voice_hashes: Dict[str, str] = {}
         self._is_modified = False
+        self._is_initialized = False  # NEW: Initialize flag
         logger.debug("Config initialized (Pydantic single-JSON)")
 
     def load_config(self):
@@ -148,6 +149,8 @@ class Config:
             f"Config loaded: {voices_count} voices (keys: {voices_keys}), "
             f"logging_level={logging_level}; device={globals_config.device}; "
             f"dtype={globals_config.dtype}; multilingual={globals_config.multilingual}")
+
+        self._is_initialized = True
         return True
 
     # In src/config/config.py: save_config (around line 152)
@@ -237,6 +240,7 @@ class Config:
             if val is None:
                 return default
         return val
+
 
     def set_value(self, key: str, value: Any, voice: Optional[str] = None) -> bool:
         """Set value: To globals or specific voice (via model_copy for immutability)."""
@@ -344,147 +348,120 @@ class Config:
 
 
     # Merged audio params (use models)
-    def get_voice_params(self, voice_name: Optional[str] = None, overrides: Optional[Dict] = None) -> Dict[
+    def get_voice_params(self, voice_name: Optional[str] = None, overrides: Optional[Dict[str, Any]] = None) -> Dict[
         str, Any]:
-        """Get voice params with proper initialization safety check."""
-        # Critical safety check - must be first thing in method
-        if not self._is_initialized or self.app_config is None:
+        """Get voice params with proper initialization safety check. Always returns complete dict."""
+        # Safety check
+        if not hasattr(self, '_is_initialized') or not self._is_initialized or self.app_config is None:
             logger.warning("Config not initialized - using fallback voice params")
-            voice_name = voice_name or 'default_fallback'
-
-            return {
-                'temperature': 0.8,
-                'exaggeration': 0.5,
-                'top_p': 1.0,
-                'min_p': 0.05,
-                'repetition_penalty': 1.2,
-                'cfgw': 0.0,
-                'speaking_rate': 1.0,
-                'language_id': 'en',
-                'enable_pre_adjustment': True,
-                'sr': 24000,
-                'min_ref_duration': 3.0,
-                'check_artifacts': True,
-                'hop_length': 256,
-                'n_fft': 1024,
-                'normalize_method': 'peak',
-                'post_gain': 0.0,
-                'voice_name': voice_name
+            fallback = {
+                'temperature': 0.8, 'exaggeration': 0.5, 'top_p': 1.0, 'min_p': 0.05,
+                'repetition_penalty': 1.2, 'cfgw': 0.0, 'speaking_rate': 1.0, 'language_id': 'en',
+                'enable_pre_adjustment': True, 'sr': 24000, 'min_ref_duration': 3.0,
+                'check_artifacts': True, 'hop_length': 256, 'n_fft': 1024, 'normalize_method': 'peak',
+                'post_gain': 0.0,  # NEW: For post-processing
+                'min_post_duration': 1.0,  # NEW: Prevents None > int
+                'gain_max_limit': 1.0, 'noise_floor_db': -60.0,  # NEW: Common post keys
+                'voice_name': voice_name or 'default_fallback'
             }
+            if overrides:
+                # Safe update: Clamp types
+                for k, v in overrides.items():
+                    if k in fallback:
+                        if isinstance(fallback[k], float):
+                            fallback[k] = float(v)
+                        elif isinstance(fallback[k], int):
+                            fallback[k] = int(float(v))
+                        elif isinstance(fallback[k], bool):
+                            fallback[k] = bool(v)
+                fallback.update({k: v for k, v in overrides.items() if k not in fallback})
+            return fallback
 
-        # Define EXACTLY which parameters we need with their expected types
-        # EXCLUDE 'voice_name' as it's handled separately
+        # param specs (as yours, expanded)
         PARAM_SPECS = {
-            'temperature': float,
-            'exaggeration': float,
-            'top_p': float,
-            'min_p': float,
-            'repetition_penalty': float,
-            'cfgw': float,
-            'speaking_rate': float,
-            'language_id': str,
-            'enable_pre_adjustment': bool,
-            'sr': int,
-            'min_ref_duration': float,
-            'check_artifacts': bool,
-            'hop_length': int,
-            'n_fft': int,
-            'normalize_method': str,
-            'post_gain': float
+            'temperature': float, 'exaggeration': float, 'top_p': float, 'min_p': float,
+            'repetition_penalty': float, 'cfgw': float, 'speaking_rate': float, 'language_id': str,
+            'enable_pre_adjustment': bool, 'sr': int, 'min_ref_duration': float,
+            'check_artifacts': bool, 'hop_length': int, 'n_fft': int, 'normalize_method': str,
+            'post_gain': float, 'min_post_duration': float,  # NEW: Essentials for post
+            'gain_max_limit': float, 'noise_floor_db': float,
+            'voice_name': str
         }
 
-        DEFAULT_VALUES = {
-            'temperature': 0.8,
-            'exaggeration': 0.5,
-            'top_p': 1.0,
-            'min_p': 0.05,
-            'repetition_penalty': 1.2,
-            'cfgw': 0.0,
-            'speaking_rate': 1.0,
-            'language_id': 'en',
-            'enable_pre_adjustment': True,
-            'sr': 24000,
-            'min_ref_duration': 3.0,
-            'check_artifacts': True,
-            'hop_length': 256,
-            'n_fft': 1024,
-            'normalize_method': 'peak',
-            'post_gain': 0.0
+        DEFAULT_VALUES = {  # Full defaults (as yours + new)
+            'temperature': 0.8, 'exaggeration': 0.5, 'top_p': 1.0, 'min_p': 0.05,
+            'repetition_penalty': 1.2, 'cfgw': 0.0, 'speaking_rate': 1.0, 'language_id': 'en',
+            'enable_pre_adjustment': True, 'sr': 24000, 'min_ref_duration': 3.0,
+            'check_artifacts': True, 'hop_length': 256, 'n_fft': 1024, 'normalize_method': 'peak',
+            'post_gain': 0.0, 'min_post_duration': 1.0, 'gain_max_limit': 1.0, 'noise_floor_db': -60.0,
+            'voice_name': voice_name or 'default'
         }
 
         voice_name = voice_name or 'default'
         params = {}
 
-        # Helper function to safely get typed values
         def _get_value(config_obj, param, param_type, default):
-            """Safely get parameter from config, preserving type"""
+            """Safely get, ensure no None."""
             if config_obj is None:
                 return default
-
             try:
                 value = getattr(config_obj, param, None)
-                if value is not None:
-                    # Handle type conversion based on expected type
-                    if param_type == bool:
-                        return bool(value)
-                    elif param_type == int:
-                        return int(float(value))  # Handle float→int conversion
-                    elif param_type == float:
-                        return float(value)
-                    else:  # str or other
-                        return str(value) if value is not None else default
-                return default
+                if value is None:
+                    return default
+                # Convert (as yours)
+                if param_type == bool:
+                    return bool(value)
+                elif param_type == int:
+                    return int(float(value))
+                elif param_type == float:
+                    return float(value)
+                else:
+                    return str(value)
             except (TypeError, ValueError, AttributeError):
+                logger.debug(f"Failed to get {param}; using default {default}")
                 return default
 
-        # Get globals config values with proper types
+        # Globals
         for param, param_type in PARAM_SPECS.items():
             params[param] = _get_value(self.app_config.globals, param, param_type, DEFAULT_VALUES[param])
 
-        # Override with voice-specific config if available
+        # Voice override (if exists)
         if voice_name != 'default' and voice_name in self.app_config.voices:
             voice = self.app_config.voices[voice_name]
             for param, param_type in PARAM_SPECS.items():
                 value = _get_value(voice, param, param_type, None)
-                if value is not None:
+                if value is not None:  # Strict: Only if set
                     params[param] = value
 
-        # Apply API overrides with proper type handling
+        # Overrides (safe, as above)
         if overrides:
             for param, value in overrides.items():
                 if param in PARAM_SPECS:
+                    param_type = PARAM_SPECS[param]
                     try:
-                        if PARAM_SPECS[param] == bool:
+                        if param_type == bool:
                             params[param] = bool(value)
-                        elif PARAM_SPECS[param] == int:
+                        elif param_type == int:
                             params[param] = int(float(value))
-                        elif PARAM_SPECS[param] == float:
+                        elif param_type == float:
                             params[param] = float(value)
-                        else:  # str
+                        else:
                             params[param] = str(value)
-                    except (TypeError, ValueError):
-                        logger.warning(f"Invalid override for {param} - keeping current value", exc_info=True)
+                    except:
+                        logger.warning(f"Invalid override {param}={value}; keeping {params[param]}")
 
-        # SPECIAL HANDLING FOR VOICE_NAME (done after all other params)
+        # Clamps (prevent extremes)
+        params['exaggeration'] = max(0.0, min(2.0, params['exaggeration']))  # For cloning
+        params['min_post_duration'] = max(0.5, params['min_post_duration'])  # Safe min
+        params['sr'] = int(params['sr'])
+        if params['normalize_method'] not in ['peak', 'rms', 'none']:
+            params['normalize_method'] = 'peak'
         params['voice_name'] = voice_name
 
-        # Special handling for known parameters
-        try:
-            params['sr'] = int(params['sr'])
-            params['exaggeration'] = max(0.0, min(1.0, float(params['exaggeration'])))
-        except (TypeError, ValueError) as e:
-            logger.error(f"Error with voice parameter values: {str(e)}")
-            # Set safe defaults if conversion fails
-            params['sr'] = 24000
-            params['exaggeration'] = 0.5
-
-        # Ensure normalize_method has valid value
-        valid_methods = ['peak', 'rms', 'none']
-        if params['normalize_method'] not in valid_methods:
-            logger.warning(f"Invalid normalize_method '{params['normalize_method']}' - using 'peak'")
-            params['normalize_method'] = 'peak'
-
+        logger.trace(
+            f"Voice params for '{voice_name}': { {k: v for k, v in params.items() if k != 'voice_name'} }")  # Debug (trace to avoid spam)
         return params
+
 
 
     def get_voice_parameters(self, voice_name: str) -> Dict[str, Any]:

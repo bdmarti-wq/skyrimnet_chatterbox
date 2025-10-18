@@ -1,3 +1,4 @@
+#audio_cache.py
 import os
 import json
 import time
@@ -112,3 +113,42 @@ class AudioCache:
                 "disk_entries": 0,
                 "disk_size": 0
             }
+
+def save(self, key: str, path: str) -> None:
+    """Cache an audio path for a given key with proper validation and eviction."""
+    if not os.path.exists(path):
+        logger.warning(f"Cannot cache non-existent path: {path}")
+        return
+
+    file_size = os.path.getsize(path)
+
+    with self.cache_lock:
+        # Apply dual-limit condition (configurable via config)
+        max_entries = self.config.audio.max_cache_entries
+        max_total_size = self.config.audio.max_cache_size_mb * 1024 * 1024
+
+        # Evict until below limit
+        while (len(self.audio_cache) >= max_entries or
+               self.total_size + file_size > max_total_size) and self.audio_cache:
+            # Find oldest entry
+            oldest_key = min(
+                self.audio_cache.items(),
+                key=lambda x: x[1]["added_time"]
+            )[0]
+            self._remove_entry(oldest_key)
+
+        # Add new cache entry
+        self.audio_cache[key] = {
+            "path": path,
+            "size": file_size,
+            "added_time": time.time(),
+            "last_used": time.time()
+        }
+        self.total_size += file_size
+
+        # Persist immediately if memory cache is full
+        if len(self.audio_cache) >= self.config.audio.max_cache_entries * 0.8:
+            self.save_cache()
+
+        logger.debug(f"Audio cached: {key} → {path} ({file_size/1024/1024:.1f}MB)")
+        logger.debug(f"Cache stats: {len(self.audio_cache)} entries, {self.total_size/(1024*1024):.1f}MB")

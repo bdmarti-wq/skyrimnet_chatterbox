@@ -1,31 +1,27 @@
+# Revised src/normalize_stem.py (simplified; drop unused params if no callers use them)
 import re
-import loguru
 from pathlib import Path
+from loguru import logger  # Use logger instead of loguru (it's an alias)
 
-
-def normalize_stem(audio_path: str, provided_stem: str | None = None, min_len: int = 3) -> str:
-    """Derive/clean stem from path or provided; handles temps/UUIDs. Returns str >= min_len or fallback."""
-    if provided_stem is not None and isinstance(provided_stem, (int, float)):
-        provided_stem = str(provided_stem)  # Handle old int calls
-
-    if provided_stem and len(str(provided_stem)) >= min_len:
-        # Clean if provided (remove suffixes)
-        stem = str(provided_stem).replace('_fixed', '').replace('_padded', '').replace('_resampled', '').replace(
-            '_ui_resampled', '').replace('_export', '')
-        if len(stem) >= min_len:
-            return stem
-        loguru.logger.debug(f"Provided stem '{provided_stem}' too short/invalid → derive from path")
-
+def normalize_stem(audio_path: str, min_len: int = 3) -> str:
+    """Derive/clean stem from path; handles temps/UUIDs. Returns str >= min_len or fallback."""
     if not audio_path:
         raise ValueError("No audio_path for stem derivation")
 
     basename = Path(audio_path).stem
-    # Regex extract voice before UUID/temp (e.g., 'vp_11_lilia_123hex' → 'vp_11_lilia')
-    match = re.match(r'([a-zA-Z0-9_]+[voice]?)(_?[0-9a-f]{15,})?$', basename)
-    stem = match.group(1) if match else basename.replace('_fixed', '').replace('_padded', '').replace('_resampled',
-                                                                                                  '').replace(
-        '_ui_resampled', '').replace('_temp', '')
+    # Regex: Extract base before UUID/temp suffix (e.g., 'jjsofiavoicetype_upload_123hex' → 'jjsofiavoicetype_upload')
+    # Simplified regex: Assumes UUID is hex >10 chars at end; adjust if needed.
+    match = re.match(r'([a-zA-Z0-9_]+(?:_upload_[a-f0-9]+)?)(_?[0-9a-f]{10,})?$', basename)
+    stem = match.group(1) if match else basename
+
+    # Clean common suffixes (legacy from old code)
+    suffixes = ['_fixed', '_padded', '_resampled', '_ui_resampled', '_export', '_temp']
+    for suffix in suffixes:
+        stem = stem.replace(suffix, '')
+
+    # Ensure min length (for uploads/short names)
     if len(stem) < min_len:
         stem = basename  # Fallback to full
-    loguru.logger.trace(f"Normalized stem for '{basename}': '{stem}'")
+
+    logger.trace(f"Normalized stem for '{basename}': '{stem}'")
     return stem

@@ -16,7 +16,7 @@ from .cache_transition import (
     validate_voice_path, create_dummy_conds, load_conditionals_cache, save_conditionals_cache,
     get_cache_stats, check_and_update_ref, save_torchaudio_wav
 )
-from .fuzzy_cache import try_fuzzy_audio_cache, FUZZY_QUEUE
+from src.cache.fuzzy_cache import try_fuzzy_audio_cache, FUZZY_QUEUE
 
 from loguru import logger  # FIXED: Use loguru consistently (remove logging import/getLogger)
 

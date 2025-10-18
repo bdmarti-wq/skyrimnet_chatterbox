@@ -18,28 +18,18 @@ import functools
 import tempfile
 import time
 import warnings
-import hashlib
-import threading
 import re
-from collections import OrderedDict
 from difflib import SequenceMatcher
-from threading import Lock, Thread
-from queue import Queue
 import torch
 import torch.nn.functional as F
 import torchaudio
 from torch.serialization import safe_globals  # For whitelisting in load
-from torchaudio.io import StreamReader  # For non-blocking SR probe in async
-import numpy as np
-from pathlib import Path
 from collections import OrderedDict
-from typing import Dict, Any, Optional, Tuple, Union, List
-from loguru import logger  # Assume available; fallback to print if not
+from typing import Dict, Any, Optional, Tuple
 import threading  # Ensure imported (likely already is)
 from .config import get_config, get_config_value, find_project_root
 from src.audio_utils import is_artifact_laden  # Import for artifact check
 import hashlib
-from threading import Thread
 from pathlib import Path
 from loguru import logger
 
@@ -1648,7 +1638,7 @@ def is_cache_key_loaded(cache_key):
 
 def get_cache_stats() -> Dict[str, Any]:
     """Global facade: Merge conditionals + audio + fuzzy stats (guarded, no recursion)."""
-    from src.fuzzy_cache import FUZZY_AUDIO_DICT, FUZZY_LOCK  # Safe import; fallback if missing
+    from src.cache.fuzzy_cache import FUZZY_AUDIO_DICT, FUZZY_LOCK  # Safe import; fallback if missing
 
     # Call class method safely (now conds-only, no self-loop)
     try:
@@ -1701,7 +1691,7 @@ def clear_output_directories():
 
 
 def clear_cache_files():
-    from src.fuzzy_cache import FUZZY_AUDIO_DICT, FUZZY_LOCK
+    from src.cache.fuzzy_cache import FUZZY_AUDIO_DICT, FUZZY_LOCK
     removed_count = 0
     try:
         for pt_file in CACHE_DIR.glob("*.pt"):

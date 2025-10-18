@@ -1,7 +1,7 @@
 import asyncio
 import os
 import time
-from typing import Optional
+from typing import Optional, Dict, Any, Tuple
 from pathlib import Path
 from loguru import logger
 import numba
@@ -13,6 +13,11 @@ import soundfile as sf
 import tempfile
 from scipy.signal import sosfilt, butter, iirnotch
 from src.config import CONFIG, get_config_value  # Adjusted import (from .config if package)
+import os
+os.environ['TORCH_LOGS'] = ""
+
+import warnings
+warnings.filterwarnings("ignore", message="torchaudio._backend.*")
 
 # UTILITY: Cleanup function for test files
 def cleanup_old_test_files(max_age_hours: int = 1):
@@ -147,11 +152,11 @@ async def denoise_and_normalize_in_memory(
     return np.clip(audio, -1.0, 1.0)
 
 
-def is_artifact_laden(wav_path: str, threshold_hz: float = None, ratio_threshold: float = 0.5, sr: int = 24000) -> bool:
+def is_artifact_laden(wav_path: str, threshold_hz: float = None, ratio_threshold: float = 0.6, sr: int = 24000) -> bool:
     """Detect artifacts. FIXED: Default from config; accurate log/comp (no '8000'). Keep one version."""
-    threshold_hz = threshold_hz or CONFIG.get_value('fuzzy_artifact_threshold_hz', 7000.0)
+    threshold_hz = threshold_hz or CONFIG.get_value('fuzzy_artifact_threshold_hz', 9000.0)
     # threshold_hz = CONFIG.clamp_value('fuzzy_artifact_threshold_hz', threshold_hz)  # Assume CAP added
-    ratio_threshold = 0.5  # Fixed; add CAP 'FUZZY_RATIO_THRESHOLD' if tune
+    ratio_threshold = 0.7  # Fixed; add CAP 'FUZZY_RATIO_THRESHOLD' if tune
 
     try:
         y, actual_sr = torchaudio.load(wav_path)
@@ -179,6 +184,35 @@ def is_artifact_laden(wav_path: str, threshold_hz: float = None, ratio_threshold
         logger.trace(f"Check failed {wav_path}: {e} – clean")
         return False
 
+
+def pad_short_text(text: str, params: Dict[str, Any]) -> str:
+    """Pad short/vocalise text to reduce artifacts (e.g., 'ah' → '... ah ...'; from params)."""
+    enable = params.get('enable_text_padding', True)
+    if not enable:
+        logger.debug("Text padding skipped")
+        return text
+    ellipses = params.get('text_ellipses_count', 2)
+    max_len = params.get('max_short_word_len', 3)
+    patterns = params.get('vocalise_patterns', ['ah', 'oh', 'aah', 'mmm'])
+
+    words = text.strip().split()
+    if (len(words) == 1 and len(words[0]) <= max_len and words[0].lower() in patterns) or '...' in text:
+        pad = '.' * (3 * ellipses)  # 3 dots per ellipses
+        padded = f"{pad} {text.strip()} {pad}".strip()
+        logger.debug(f"Text padded: '{text}' → '{padded}' (patterns={patterns})")
+        return padded
+    return text
+
+
+def create_silence_tensor(sr: int, duration_s: float = 2.0, device: str = 'cpu') -> torch.Tensor:
+    """Sample silence (1D fp32 mono; [samples])."""
+    if device == 'cuda' and torch.cuda.is_available():
+        device = 'cuda:0'
+    else:
+        device = 'cpu'  # Safe for save
+    dev = torch.device(device)
+    samples = int(sr * duration_s)
+    return torch.zeros(samples, dtype=torch.float32, device=dev)
 
 # Modular Post-Processing Functions
 def trim_silence(audio: np.ndarray, threshold_db: float | None = -25.0) -> np.ndarray:
@@ -330,6 +364,154 @@ def _get_audio_param(key: str, param_dict: dict, default=None, target_type=float
     except (ValueError, TypeError) as e:
         logger.warning(f"Invalid config/default '{key}' (type error: {e}); using raw default {default}")
         return target_type(default)
+
+
+def trim_silence(waveform: torch.Tensor, sr: int, threshold_db: float = -40.0, min_silence_samples: int = 200) -> torch.Tensor:
+    """Manual trim leading/trailing silence (energy/RMS threshold; no torchaudio dep)."""
+    if waveform.dim() > 1:
+        waveform = waveform.mean(0, keepdim=True)  # Mono
+
+    threshold = 10 ** (threshold_db / 20.0)  # dB to linear amplitude
+    def find_start_end(sig: torch.Tensor) -> Tuple[int, int]:
+        # Energy window (sr/10 ~100ms)
+        window_size = max(sr // 10, 512)
+        for i in range(0, sig.shape[1] - window_size, window_size // 4):  # Overlap 25%
+            window = sig[:, i:i + window_size].abs()
+            rms = torch.sqrt(torch.mean(window ** 2))
+            if rms > threshold:
+                start = i
+                break
+        else:
+            start = 0
+
+        for i in range(sig.shape[1] - window_size, 0, -window_size // 4):
+            window = sig[:, i:i + window_size].abs()
+            rms = torch.sqrt(torch.mean(window ** 2))
+            if rms > threshold:
+                end = i + window_size
+                break
+        else:
+            end = sig.shape[1]
+
+        # Min silence pad
+        start = max(start - min_silence_samples, 0)
+        end = min(end + min_silence_samples, sig.shape[1])
+        return start, end
+
+    orig_len = waveform.shape[1]
+    start, end = find_start_end(waveform)
+    trimmed = waveform[:, start:end]
+    trim_samples = orig_len - trimmed.shape[1]
+    trim_ms = trim_samples * 1000 / sr
+    if trim_samples > 0:
+        logger.debug(f"Trimmed {trim_ms:.0f}ms ({trim_samples} samples) silence (threshold={threshold_db}dB)")
+    return trimmed
+
+
+def reduce_noise_simple(waveform: torch.Tensor, sr: int, noise_factor: float = 0.5) -> torch.Tensor:
+    """Basic noise reduction (simple gating; future: add Biquad highpass). No cleaning now."""
+    if waveform.dim() > 1:
+        waveform = waveform.mean(0, keepdim=True)  # Mono
+
+    # Simple soft gate (zero below threshold; basic artifact reduce)
+    threshold = noise_factor * waveform.abs().mean()
+    gated = waveform.where(waveform.abs() > threshold, torch.zeros_like(waveform))
+    noise_reduction = ((waveform.abs() - gated.abs()).mean() / waveform.abs().mean()) * 100 if waveform.abs().mean() > 0 else 0
+    logger.debug(f"Simple noise gate applied (reduction ~{noise_reduction:.1f}%, factor={noise_factor})")
+
+    # Future: Uncomment for filter (torchaudio Biquad highpass for low noise cut)
+    # from torchaudio.transforms import Biquad
+    # highpass = Biquad(
+    #     filter_type='highpass',  # Or 'lowpass' if needed
+    #     cutoff_freq=300,  # Cut below 300Hz noise
+    #     sample_rate=sr, Q=0.707, central_freq=300
+    # )
+    # gated = highpass(gated)
+
+    return gated
+
+def process_voice_cleanup(waveform: torch.Tensor, sr: int, params: Dict[str, Any]) -> Tuple[torch.Tensor, Dict[str, Any]]:
+    """Cleanup chain: Trim + noise reduce (from params; returns updated waveform + metadata)."""
+    enable_trim = params.get('enable_trim_silence', True)
+    enable_noise = params.get('enable_noise_reduce', True)
+    trim_db = params.get('trim_threshold_db', -40.0)
+    noise_factor = params.get('noise_reduction_factor', 0.5)
+    metadata = {'trimmed': False, 'noise_reduced': False, 'trim_dur_ms': 0.0}
+
+    orig_dur = waveform.shape[1] / sr
+    if enable_trim:
+        waveform = trim_silence(waveform, sr, trim_db)
+        metadata['trimmed'] = True
+        metadata['trim_dur_ms'] = (orig_dur - waveform.shape[1]/sr) * 1000
+
+    if enable_noise:
+        waveform = reduce_noise_simple(waveform, sr, noise_factor)
+        metadata['noise_reduced'] = True
+
+    new_dur = waveform.shape[1] / sr
+    logger.info(f"Cleanup: {orig_dur:.2f}s → {new_dur:.2f}s (trim={metadata['trim_dur_ms']:.0f}ms, noise={enable_noise})")
+    return waveform, metadata
+
+
+
+def get_silence(duration: float = 2.0, sr: int = 24000, dtype: torch.dtype = torch.float32,
+                device: torch.device = torch.device("cpu")) -> torch.Tensor:
+    """
+    Get a silence WAV tensor (cached for reuse). Creates a single persistent file per SR if not exists.
+
+    Args:
+        duration: Length in seconds (default 2.0s).
+        sr: Sample rate in Hz (default 24000Hz; file named per SR).
+        dtype: Tensor dtype (default float32 for WAV; converts on load).
+        device: Tensor device (default CPU; moves on load).
+
+    Returns:
+        torch.Tensor: Silence [1, T] on device/dtype.
+
+    Notes:
+        - Saves/loads to/from cache/fallback/silence_{sr}Hz.wav (one file per SR).
+        - Uses torchaudio for save/load (ensures compatibility).
+    """
+    cache_dir = Path(get_config_value('app_config.globals.cache_dir')) / "fallback"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    filename = f"silence_{sr}Hz.wav"
+    silence_path = cache_dir / filename
+
+    # Check if cached file exists
+    if silence_path.exists():
+        try:
+            logger.debug(f"Loading cached silence: {silence_path}")
+            wav, loaded_sr = torchaudio.load(str(silence_path))
+            if loaded_sr != sr:
+                logger.warning(f"Cached SR {loaded_sr} != requested {sr}; ignoring cache")
+                raise ValueError("SR mismatch")
+
+            # Load to tensor, reshape to [1, T] if needed, move to device/dtype
+            wav = wav.mean(0, keepdim=True) if wav.shape[0] > 1 else wav  # Mono if stereo
+            silence = wav.to(device=device, dtype=dtype)
+            logger.debug(f"Loaded silence: {silence.shape}, dur={silence.shape[1] / sr:.2f}s")
+            return silence
+        except Exception as load_e:
+            logger.warning(f"Failed to load cached silence {silence_path}: {load_e}; regenerating")
+
+    # Create if no cache
+    logger.info(f"Creating new silence cache: {silence_path} (dur={duration}s, sr={sr}Hz)")
+    samples = int(sr * duration)
+    silence_save = torch.zeros((1, samples), dtype=torch.float32)  # Float32 for WAV save
+
+    try:
+        # Save to cache (CPU float32 for persistence)
+        torchaudio.save(str(silence_path), silence_save, sr)
+        logger.debug(f"Saved silence cache: {silence_path}, size={silence_path.stat().st_size / 1024:.1f}KB")
+    except Exception as save_e:
+        logger.error(f"Failed to save silence cache: {save_e}")
+        # Don't raise; proceed to return in-memory tensor
+
+    # Return moved to requested device/dtype
+    silence = silence_save.to(device=device, dtype=dtype)
+    logger.debug(f"Returned silence: {silence.shape}, dur={duration}s")
+    return silence
 
 
 async def apply_post_processing(wav: torch.Tensor, sr: int, params: dict | None = None) -> np.ndarray:

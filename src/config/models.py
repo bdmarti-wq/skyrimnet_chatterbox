@@ -273,6 +273,7 @@ class Globals(BaseModel):
     voices_cache_dir: Optional[Path] = Field(default=None, description="Voice-specific audio cache")
     output_cache_dir: Optional[Path] = Field(default=None, description="Final audio output")
     conditionals_cache_dir: Optional[Path] = Field(default=None, description="Conditionals cache")
+    fallbacks_dir: Optional[Path] = Field(default=None, description="fallbacks directory")
 
     # Core validators (coercion for device/dtype)
     @field_validator('device', mode='before')
@@ -335,6 +336,7 @@ class Globals(BaseModel):
             self.voices_cache_dir = self._resolve_dir(self.voices_cache_dir, self.audio_cache_dir / "voices")
             self.output_cache_dir = self._resolve_dir(self.output_cache_dir, self.audio_cache_dir / "output")
             self.conditionals_cache_dir = self._resolve_dir(self.conditionals_cache_dir, self.cache_dir / "conditionals")
+            self.fallbacks_dir = self._resolve_dir(self.fallbacks_dir, self.cache_dir / "fallbacks")
 
             # 4. Ensure all directories exist
             self._create_directories()
@@ -362,7 +364,8 @@ class Globals(BaseModel):
             ("audio cache", self.audio_cache_dir),
             ("voices cache", self.voices_cache_dir),
             ("output cache", self.output_cache_dir),
-            ("conditionals cache", self.conditionals_cache_dir)
+            ("conditionals cache", self.conditionals_cache_dir),
+            ("fallbacks_dir", self.fallbacks_dir)
         ]
 
         for name, path in directories:

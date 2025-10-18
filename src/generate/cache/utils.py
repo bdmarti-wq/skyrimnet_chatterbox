@@ -217,7 +217,7 @@ def save_torchaudio_wav(
         cache: bool = True
 ):
     """Save WAV tensor to file with proper directory structure."""
-    from . import set_audio_cache
+    from cache_manager import CacheManager
     """
     Save WAV tensor to file and return path (fallback to temp if issues).
     FIXED: Proper directory structure with cache/audio/output

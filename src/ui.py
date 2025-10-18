@@ -1,205 +1,55 @@
-#src/ui.py
-import asyncio
+# src/ui.py
 import os
-import random  # For seed fallback
-import warnings
-
 import gradio as gr
 from loguru import logger
 from pathlib import Path
 
 # CONFIG singleton
-from src.config import get_config, get_config_value, CONFIG
+from src.config import get_config, get_config_value
 from src.generate_tab import create_generate_tab
-from src.tts_model import get_model
+from src.tts_model import get_model, ModelManager
 
-# ui_helpers (full: safe_*, handlers, stub_wav_path exclusive for fallbacks)
+# Path helpers
 from src.ui_helpers import (
-    update_api_status, safe_to_float, safe_to_int, safe_to_bool, safe_to_str, safe_float_value,
-    load_voice_params_for_edit, handle_global_params_change, refresh_config_json, apply_json_changes,
-    save_all_config, reset_all_config, reload_all_config, update_voice_params_ui,
-    load_voice_params_ui, handle_token_limits_change, create_global_param_handler, stub_wav_path, test_voice_generation
+    update_api_status, stub_wav_path, test_voice_generation,
 )
 
-
 # Hidden API supports communication with SkyrimNet via a Zonos bridge
-from src.bridge_ui import setup_bridge_api
+from src.generate.ui_interface import generate_audio_ui, setup_bridge_api
 
-# generation_utils (single try: cores only; log fail - no local stubs/fallbacks)
-try:
-    from src.generate_audio import generate_audio
-    logger.info("generation_audio imported successfully: generate_internal pipeline ready")
-except ImportError as e:
-    logger.error(f"generation_audio import failed: {e} - Fix deps (e.g., pip install librosa scipy) or path (src/cache_utils)")
-    raise
-
-# Warnings- Review These
+# Warnings cleanup
+import warnings
 warnings.filterwarnings("ignore", category=UserWarning, module="torchaudio")
-warnings.filterwarnings("ignore", message=r"Reference mel length is not equal to 2 \* reference token length\.", category=UserWarning)
-warnings.filterwarnings("ignore", message="torchaudio._backend.utils.info has been deprecated")  # Suppress stub_wav_path warning
+warnings.filterwarnings("ignore", message="torchaudio._backend.utils.info has been deprecated")
 
-# make sure config and model are loaded
-get_config()
-MODEL = get_model()
+# Required for proper config handling
+from src.config.models import AppConfig
 
-def generate_audio_test(model, text, language_id="en", audio_prompt_path=None, exaggeration=0.5, temperature=0.8, seed_num=0,
-             cfgw=0, min_p=0.05, top_p=1.0, repetition_penalty=1.2, cache_uuid=0):
-    """
-    UI shell: Keeps server-compatible sig. Minimal setup, delegates to generate_audio.
-    """
-    if model is None:
-        model = get_model()
-
-    if not text:
-        logger.warning("No text provided – returning empty")
-        return ""  # Or dummy path
-
-    if seed_num != 0:
-        from src.generate_audio import set_seed  # Lazy
-        set_seed(int(seed_num))
-
-    # Lazy import + call (no global exposure)
-    from src.generate_audio import generate_audio
-    result = generate_audio(
-        model, text, audio_prompt_path,  # None as-is (no "" coercion)
-        float(exaggeration), int(cache_uuid),
-        float(temperature), float(cfgw), float(min_p), float(top_p), float(repetition_penalty),
-        language_id, int(seed_num),
-        get_config_value('enable_memory_cache', True), get_config_value('enable_disk_cache', True)
-    )
-    return result
-
-
-
-# Tab Load Functions (lazy: CONFIG direct, no State – user clicks "Load/Refresh" to populate)
-def load_test_tab():
-    """Load Voice Test tab components from CONFIG (lazy on btn click)."""
-    config = get_config()
-    voice_choices = config.get_all_voices() or ['default']
-    if 'default' not in voice_choices:
-        voice_choices.append('default')
-    test_text_value = "Testing shared config voice parameters."
-    params = {
-        'speaking_rate': get_config_value('speaking_rate', 1.0),
-        'eq_gain_db': get_config_value('eq_gain_db', -8.0),
-        'max_gain': get_config_value('max_gain', 2.0),
-        'target_max': get_config_value('target_max', 0.6),
-        'noise_floor_db': get_config_value('noise_floor_db', -30.0),
-        'trim_threshold_db': get_config_value('trim_threshold_db', -28.0),
-        'notch_enabled': get_config_value('notch_enabled', True),
-        'hp_enabled': get_config_value('hp_enabled', True),
-    }
-    test_params = {"Loaded defaults": params}  # Sample dict
-    test_status_value = "Values loaded from CONFIG – test with custom params if needed."
-    logger.debug("Voice Test tab loaded from CONFIG")
-    return (
-        gr.update(choices=voice_choices),  # test_voice_dropdown
-        test_text_value,  # test_text
-        42,  # test_seed
-        params['speaking_rate'], params['eq_gain_db'], params['max_gain'], params['target_max'],
-        params['noise_floor_db'], params['trim_threshold_db'], params['notch_enabled'], params['hp_enabled'],
-        test_params, test_status_value
-    )
-
-def load_editor_tab():
-    config = get_config()
-    """Load Voice Editor tab from CONFIG (lazy)."""
-    voice_choices = config.get_all_voices() or ['default']
-    if 'default' not in voice_choices:
-        voice_choices.append('default')
-    # Defaults from CONFIG (global, as voice-specific needs select first)
-    params = {
-        'speaking_rate': get_config_value('speaking_rate', 1.0),
-        'eq_gain_db': get_config_value('eq_gain_db', -8.0),
-        'max_gain': get_config_value('max_gain', 2.0),
-        'target_max': get_config_value('target_max', 0.6),
-        'noise_floor_db': get_config_value('noise_floor_db', -30.0),
-        'trim_threshold_db': get_config_value('trim_threshold_db', -28.0),
-        'temperature': get_config_value('temperature', 0.65),
-        'exaggeration': get_config_value('exaggeration', 1.0),
-        'cfg_weight': get_config_value('cfg_weight', 0.45),
-        'min_p': get_config_value('min_p', 0.1),
-        'top_p': get_config_value('top_p', 1.0),
-        'repetition_penalty': get_config_value('repetition_penalty', 1.5),
-        'notch_enabled': get_config_value('notch_enabled', True),
-        'hp_enabled': get_config_value('hp_enabled', True),
-    }
-    voice_info_md = "Select a voice and click Load to edit specific params (globals shown now)."
-    voice_status = "Ready – load voice-specific values."
-    logger.debug("Voice Editor tab loaded from CONFIG globals")
-    return (
-        gr.update(choices=voice_choices),  # edit_voice_dropdown
-        params['speaking_rate'], params['eq_gain_db'], params['max_gain'], params['target_max'],
-        params['noise_floor_db'], params['trim_threshold_db'], params['temperature'], params['exaggeration'],
-        params['cfg_weight'], params['min_p'], params['top_p'], params['repetition_penalty'],
-        params['notch_enabled'], params['hp_enabled'],  # voice_* components
-        voice_info_md, voice_status
-    )
-
-def load_global_tab():
-    """Load Global Config tab from CONFIG (lazy)."""
-    global_dict = {
-        'speaking_rate': safe_to_float(get_config_value('speaking_rate', 1.0)),
-        'eq_gain_db': safe_to_float(get_config_value('eq_gain_db', -8.0)),
-        'max_gain': safe_to_float(get_config_value('max_gain', 2.0)),
-        'target_max': safe_to_float(get_config_value('target_max', 0.6)),
-        'noise_floor_db': safe_to_float(get_config_value('noise_floor_db', -30.0)),
-        'trim_threshold_db': safe_to_float(get_config_value('trim_threshold_db', -28.0)),
-        'eq_cutoff_hz': safe_to_float(get_config_value('eq_cutoff_hz', 300.0)),
-        'fade_ms': safe_to_float(get_config_value('fade_ms', 50.0)),
-        'notch_low': safe_to_float(get_config_value('notch_low', 100.0)),
-        'notch_high': safe_to_float(get_config_value('notch_high', 5000.0)),
-        'notch_gain_db': safe_to_float(get_config_value('notch_gain_db', -20.0)),
-        'notch_gain_db_for_stretch': safe_to_float(get_config_value('notch_gain_db_for_stretch', -10.0)),
-        'temperature': safe_to_float(get_config_value('temperature', 0.65)),
-        'exaggeration': safe_to_float(get_config_value('exaggeration', 1.0)),
-        'cfg_weight': safe_to_float(get_config_value('cfg_weight', 0.45)),
-        'min_p': safe_to_float(get_config_value('min_p', 0.1)),
-        'top_p': safe_to_float(get_config_value('top_p', 1.0)),
-        'repetition_penalty': safe_to_float(get_config_value('repetition_penalty', 1.5)),
-        'max_new_tokens': safe_to_int(get_config_value('max_new_tokens', 1499)),
-        'min_new_tokens': safe_to_int(get_config_value('min_new_tokens', 1)),
-        'max_cache_len': safe_to_int(get_config_value('max_cache_len', 1024)),
-        'normalize_method': safe_to_str(get_config_value('normalize_method', 'rms')),
-        'logging_level': safe_to_str(get_config_value('logging_level', 'INFO')),
-        'enable_memory_cache': safe_to_bool(get_config_value('enable_memory_cache', True)),
-        'enable_disk_cache': safe_to_bool(get_config_value('enable_disk_cache', False)),
-        'enable_denoising': safe_to_bool(get_config_value('enable_denoising', True)),
-    }
-    global_status = "Globals loaded from CONFIG – edit and apply."
-    logger.debug("Global Config tab loaded from CONFIG")
-    return (
-        global_dict['speaking_rate'], global_dict['eq_gain_db'], global_dict['max_gain'], global_dict['target_max'],
-        global_dict['noise_floor_db'], global_dict['trim_threshold_db'], global_dict['eq_cutoff_hz'], global_dict['fade_ms'],
-        global_dict['notch_low'], global_dict['notch_high'], global_dict['notch_gain_db'], global_dict['notch_gain_db_for_stretch'],
-        global_dict['temperature'], global_dict['exaggeration'], global_dict['cfg_weight'],
-        global_dict['min_p'], global_dict['top_p'], global_dict['repetition_penalty'],
-        global_dict['max_new_tokens'], global_dict['min_new_tokens'], global_dict['max_cache_len'],
-        global_dict['normalize_method'], global_dict['logging_level'],
-        global_dict['enable_memory_cache'], global_dict['enable_disk_cache'], global_dict['enable_denoising'],
-        global_status  # All global components
-    )
-
-def create_ui():
-    config =  get_config()
+def create_ui(
+    cache_manager=None,
+    pipeline=None,
+    config: AppConfig = None
+):
     """State-free UI: Tabs with lazy load (user clicks 'Load/Refresh' for CONFIG values). Generate default."""
+    # Ensure config is available
+    config = config or get_config()
+
     with gr.Blocks(title="SkyrimNet Chatterbox", theme=gr.themes.Soft()) as demo:
         # Global Status (top-level, updated via btns)
         api_status_md = gr.Markdown(value=update_api_status())
 
         gr.Markdown("# SkyrimNet Chatterbox TTS UI\nSimplified tabbed interface for generation, testing, and config editing.", elem_id="title-md")
 
-        # Tabs (Generate default; others lazy-load via btns)
-        with gr.Tabs(selected="generate") as tabs:
-            # Tab 1: Generate Audio (no state/lazy – always ready)
-            generate_tab, audio_output, generate_status = create_generate_tab()
-            # Add a marker to help with debugging if needed
-            logger.info("Generate Audio tab loaded from external module")
+        # Generate Tab - Create it first so we can get its outputs for bridge API
+        audio_output, generate_status = create_generate_tab()
+        logger.debug("Generate Audio tab initialized")
 
-            # Tab 2: Voice Test (lazy load btn)
+        # Tabs container
+        with gr.Tabs(selected="generate") as tabs:
+            # Voice Test Tab (separate from Generate)
             with gr.TabItem("🔊 Voice Test", id="test", elem_id="tab-test"):
                 gr.Markdown("### 🔬 Test Voice Parameters (Click Load to sync from CONFIG)")
-                load_test_btn = gr.Button("Load/Refresh Values", variant="secondary")  # Lazy trigger
+                load_test_btn = gr.Button("Load/Refresh Values", variant="secondary")
 
                 with gr.Row():
                     with gr.Column(scale=1):
@@ -229,7 +79,7 @@ def create_ui():
 
                 # Load btn (lazy: populates from CONFIG)
                 load_test_btn.click(
-                    fn=load_test_tab,
+                    fn=lambda: load_test_tab(config),
                     inputs=[],  # No inputs
                     outputs=[test_voice_dropdown, test_text, test_seed, test_rate, test_eq, test_gain, test_target, test_noise, test_trim, test_notch, test_hp, test_params, test_status],
                     js="", show_progress=False
@@ -237,350 +87,183 @@ def create_ui():
 
                 # Test btn (UI-only)
                 test_btn.click(
-                    fn=test_voice_generation,
+                    fn=lambda *args: test_voice_generation(config, *args),
                     inputs=[test_voice_dropdown, test_text, test_seed],
                     outputs=[test_audio, test_status, test_params],
                     js="", show_progress=True, concurrency_limit=1
                 )
 
-                # Voice .change (update self from CONFIG)
-                def update_test_voice_choices(voice):
-                    config = get_config()
-                    choices = config.get_all_voices() or ['default']
-                    if 'default' not in choices:
-                        choices.append('default')
-                    return gr.update(choices=choices, value=safe_to_str(voice, 'default'))
-
+                # Voice change handler
                 test_voice_dropdown.change(
-                    fn=update_test_voice_choices,
+                    fn=lambda voice: update_test_voice_choices(config, voice),
                     inputs=[test_voice_dropdown],
                     outputs=[test_voice_dropdown],
                     js="", show_progress=False
                 )
 
-            # Tab 3: Voice Editor (lazy load btn)
+            # Voice Editor Tab (minimal implementation for now)
             with gr.TabItem("🎤 Voice Editor", id="editor", elem_id="tab-editor"):
-                gr.Markdown("### Edit Per-Voice Params (Click Load to sync globals, then select voice and load specific)")
-                load_editor_btn = gr.Button("Load/Refresh Values", variant="secondary")  # Lazy
-
-                edit_voice_dropdown = gr.Dropdown(
-                    label="Select Voice to Edit", choices=['default'], value='default', allow_custom_value=False
+                gr.Markdown("### Edit Per-Voice Params (Simple implementation for testing)")
+                voice_dropdown = gr.Dropdown(
+                    label="Select Voice",
+                    choices=['default'] + config.get_all_voices(),
+                    value='default',
+                    allow_custom_value=False
                 )
-                load_voice_btn = gr.Button("Load Selected Voice Params")  # Per-voice after dropdown
+                load_btn = gr.Button("Load Voice Parameters")
+                save_btn = gr.Button("Save Voice Parameters", variant="primary")
 
-                # Inputs (static defaults; updated on load)
-                with gr.Column():
-                    voice_rate_num = gr.Number(label="🗣️ Speaking Rate (x)", value=1.0, precision=2)
-                    voice_eq_num = gr.Number(label="🎛️ EQ Gain (dB)", value=-8.0, precision=1)
-                    voice_gain_num = gr.Number(label="📈 Max Gain (x)", value=2.0, precision=1)
-                    voice_target_num = gr.Number(label="🎯 Target Max", value=0.6, precision=2)
-                    voice_noise_num = gr.Number(label="🔇 Noise Floor (dB)", value=-30.0)
-                    voice_trim_num = gr.Number(label="✂️ Trim Threshold (dB)", value=-28.0)
-                    voice_temp_num = gr.Number(label="🌡️ Temperature", value=0.65, precision=2)
-                    voice_exagg_num = gr.Number(label="🎭 Exaggeration", value=1.0, precision=2)
-                    voice_cfg_num = gr.Number(label="⚖️ CFG Weight", value=0.45, precision=2)
-                    voice_min_p_num = gr.Number(label="⚡ Min P", value=0.1, precision=2)
-                    voice_top_p_num = gr.Number(label="🔝 Top P", value=1.0, precision=2)
-                    voice_rep_num = gr.Number(label="🔄 Repetition Penalty", value=1.5, precision=1)
-                    voice_notch_cb = gr.Checkbox(label="🛡️ Enable Notch Filter", value=True)
-                    voice_hp_cb = gr.Checkbox(label="🔊 Enable High-Pass", value=True)
+                # Editor fields
+                voice_rate = gr.Slider(0.5, 2.0, 1.0, label="Speaking Rate")
+                voice_temp = gr.Slider(0.1, 1.5, 0.8, label="Temperature")
+                voice_exagg = gr.Slider(0.1, 2.0, 0.75, label="Exaggeration")
 
-                voice_apply_btn = gr.Button("Apply Voice Changes", variant="secondary")
-                voice_info_md = gr.Markdown(value="Click Load/Refresh for globals, select voice, then Load for specifics.")
-                voice_status = gr.Textbox(label="Status", interactive=False, value="Ready – load values")
+                voice_status = gr.Markdown("Load a voice to edit parameters")
 
-                # Global load btn (lazy globals)
-                load_editor_btn.click(
-                    fn=load_editor_tab,
-                    inputs=[],  # No inputs
-                    outputs=[edit_voice_dropdown, voice_rate_num, voice_eq_num, voice_gain_num, voice_target_num, voice_noise_num,
-                             voice_trim_num, voice_temp_num, voice_exagg_num, voice_cfg_num, voice_min_p_num,
-                             voice_top_p_num, voice_rep_num, voice_notch_cb, voice_hp_cb, voice_info_md, voice_status],
-                    js="", show_progress=False
+                # Load voice params when dropdown changes
+                def load_voice_params(voice_name):
+                    voice_name = voice_name or 'default'
+                    voice = config.get_voice_params(voice_name)
+                    return [
+                        voice.get('speaking_rate', 1.0),
+                        voice.get('temperature', 0.8),
+                        voice.get('exaggeration', 0.75)
+                    ]
+
+                voice_dropdown.change(
+                    fn=load_voice_params,
+                    inputs=[voice_dropdown],
+                    outputs=[voice_rate, voice_temp, voice_exagg]
                 )
 
-                # Per-voice load (after dropdown + global load)
-                def load_voice_to_display(voice):
-                    config = get_config()
-                    voice = safe_to_str(voice) or 'default'
-                    current_voices = config.get_all_voices() or ['default']
-                    if voice not in current_voices:
-                        voice = current_voices[0] if current_voices else 'default'
-                    try:
-                        rate, eq, gain, target, noise, trim, notch, hp, info = load_voice_params_for_edit(voice)
-                        gen_params = config.get_voice_parameters(voice) or {}
-                        info_md = f"**Loaded '{voice}'** | Info: {safe_to_str(info)}"
-                        status = "Params loaded – edit and apply."
-                        logger.info(f"Voice {voice} loaded via helpers")
-                        return (
-                            safe_to_float(rate), safe_to_float(eq), safe_to_float(gain), safe_to_float(target),
-                            safe_to_float(noise), safe_to_float(trim),
-                            gen_params.get('temperature', safe_float_value('temperature')),
-                            gen_params.get('exaggeration', safe_float_value('exaggeration')),
-                            gen_params.get('cfg_weight', safe_float_value('cfg_weight')),
-                            gen_params.get('min_p', safe_float_value('min_p')),
-                            gen_params.get('top_p', safe_float_value('top_p')),
-                            gen_params.get('repetition_penalty', safe_float_value('repetition_penalty')),
-                            safe_to_bool(notch), safe_to_bool(hp),
-                            info_md, status
-                        )
-                    except Exception as e:
-                        logger.error(f"Load voice failed: {e}")
-                        info_md = f"Load failed for {voice}: {str(e)} (using defaults)"
-                        status = "Error – using defaults."
-                        return (
-                            1.0, -8.0, 2.0, 0.6, -30.0, -28.0,
-                            safe_float_value('temperature'), safe_float_value('exaggeration'),
-                            safe_float_value('cfg_weight'), safe_float_value('min_p'),
-                            safe_float_value('top_p'), safe_float_value('repetition_penalty'),
-                            True, True, info_md, status
-                        )
-
-                load_voice_btn.click(
-                    fn=load_voice_to_display,
-                    inputs=[edit_voice_dropdown],
-                    outputs=[voice_rate_num, voice_eq_num, voice_gain_num, voice_target_num, voice_noise_num,
-                             voice_trim_num, voice_temp_num, voice_exagg_num, voice_cfg_num, voice_min_p_num,
-                             voice_top_p_num, voice_rep_num, voice_notch_cb, voice_hp_cb, voice_info_md, voice_status],
-                    js="", show_progress=False
-                )
-
-                # Apply (UI-only; updates CONFIG directly)
-                def apply_voice_params(voice, rate, eq, gain, target, noise, trim, temp, exagg, cfg, min_p, top_p, rep, notch, hp):
-                    voice = safe_to_str(voice) or 'default'
-                    rate = safe_to_float(rate)
-                    eq = safe_to_float(eq)
-                    gain = safe_to_float(gain)
-                    target = safe_to_float(target)
-                    noise = safe_to_float(noise)
-                    trim = safe_to_float(trim)
-                    temp = safe_to_float(temp)
-                    exagg = safe_to_float(exagg)
-                    cfg = safe_to_float(cfg)
-                    min_p = safe_to_float(min_p)
-                    top_p = safe_to_float(top_p)
-                    rep = safe_to_float(rep)
-                    notch = safe_to_bool(notch)
-                    hp = safe_to_bool(hp)
-                    try:
-                        status, api_status, info = update_voice_params_ui(
-                            voice, rate, eq, gain, target, noise, trim, notch, hp, temp, cfg, min_p, top_p, rep, exagg
-                        )
-                        voice_status.value = status  # Direct (no State)
-                        voice_info_md.value = f"**Applied to {voice}** | {safe_to_str(info)}"
-                        api_status_md.value = api_status
-                        logger.info(f"Voice {voice} applied via helpers")
-                        return status, f"**Updated {voice}** | {safe_to_str(info)}", api_status
-                    except Exception as e:
-                        status = f"Apply failed: {str(e)}"
-                        logger.error(status)
-                        return status, f"Error applying {voice}", update_api_status()
-
-                voice_apply_btn.click(
-                    fn=apply_voice_params,
-                    inputs=[edit_voice_dropdown, voice_rate_num, voice_eq_num, voice_gain_num, voice_target_num, voice_noise_num,
-                            voice_trim_num, voice_temp_num, voice_exagg_num, voice_cfg_num, voice_min_p_num,
-                            voice_top_p_num, voice_rep_num, voice_notch_cb, voice_hp_cb],
-                    outputs=[voice_status, voice_info_md, api_status_md],
-                    js="", show_progress=False
-                )
-
-                # Editor .change (update self from CONFIG)
-                def update_edit_voice_choices(voice):
-                    config = get_config()
-                    choices = config.get_all_voices() or ['default']
-                    if 'default' not in choices:
-                        choices.append('default')
-                    return gr.update(choices=choices, value=safe_to_str(voice, 'default'))
-
-                edit_voice_dropdown.change(
-                    fn=update_edit_voice_choices,
-                    inputs=[edit_voice_dropdown],
-                    outputs=[edit_voice_dropdown],
-                    js="", show_progress=False
-                )
-
-            # Tab 5: Global Config Editor (lazy load btn, with manual reload)
-            with gr.TabItem("⚙️ Global Config Editor", id="config", elem_id="tab-config"):
-                gr.Markdown("### Edit Global Parameters (Click Load to sync from CONFIG; use Reload after external changes)")
-                load_global_btn = gr.Button("Load/Refresh Values", variant="secondary")  # Lazy
-
-                with gr.Column():
-                    speaking_rate_num = gr.Number(label="🗣️ Speaking Rate (x)", value=1.0, precision=2)
-                    eq_gain_num = gr.Number(label="🎛️ EQ Gain (dB)", value=-8.0, precision=1)
-                    max_gain_num = gr.Number(label="📈 Max Gain (x)", value=2.0, precision=1)
-                    target_max_num = gr.Number(label="🎯 Target Max", value=0.6, precision=2)
-                    noise_floor_num = gr.Number(label="🔇 Noise Floor (dB)", value=-30.0)
-                    trim_threshold_num = gr.Number(label="✂️ Trim Threshold (dB)", value=-28.0)
-                    eq_cutoff_num = gr.Number(label="📡 EQ Cutoff (Hz)", value=300.0)
-                    fade_ms_num = gr.Number(label="🎭 Fade (ms)", value=50.0)
-                    notch_low_num = gr.Number(label="Notch Low (Hz)", value=100.0)
-                    notch_high_num = gr.Number(label="Notch High (Hz)", value=5000.0)
-                    notch_gain_num = gr.Number(label="Notch Gain (dB)", value=-20.0)
-                    notch_stretch_num = gr.Number(label="Notch for Stretch (dB)", value=-10.0)
-
-                with gr.Column():
-                    temperature_num = gr.Number(label="🌡️ Temperature", value=0.65, precision=2)
-                    exaggeration_num = gr.Number(label="🎭 Exaggeration", value=1.0, precision=2)
-                    cfg_weight_num = gr.Number(label="⚖️ CFG Weight", value=0.45, precision=2)
-                    min_p_num = gr.Number(label="⚡ Min P", value=0.1, precision=2)
-                    top_p_num = gr.Number(label="🔝 Top P", value=1.0, precision=2)
-                    repetition_penalty_num = gr.Number(label="🔄 Repetition Penalty", value=1.5, precision=1)
-
-                with gr.Column():
-                    max_tokens_num = gr.Number(label="Max New Tokens", value=1499)
-                    min_tokens_num = gr.Number(label="Min New Tokens", value=1)
-                    cache_len_num = gr.Number(label="Max Cache Length", value=1024)
-                    normalize_dropdown = gr.Dropdown(label="🎚️ Normalize Method", choices=['peak', 'rms', 'ebu'], value='rms')
-                    logging_dropdown = gr.Dropdown(label="📢 Logging Level", choices=['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'], value='INFO')
-                    enable_cache_cb = gr.Checkbox(label="✅ Enable Memory Cache", value=True)
-                    enable_disk_cb = gr.Checkbox(label="💾 Enable Disk Cache", value=False)
-                    enable_denoise_cb = gr.Checkbox(label="🧹 Enable Denoising", value=True)
-
-                global_apply_btn = gr.Button("Apply Global Changes (Update CONFIG)", variant="secondary")
-                global_status = gr.Textbox(label="Status", interactive=False, value="Click Load/Refresh to populate from CONFIG")
-
-                # Manual reload btn (full config from file + auto-load tab values)
-                reload_btn = gr.Button("🔄 Reload Config from File", variant="secondary")
-
-                # Load btn (lazy: populates all from CONFIG)
-                load_global_btn.click(
-                    fn=load_global_tab,
-                    inputs=[],  # No inputs
-                    outputs=[speaking_rate_num, eq_gain_num, max_gain_num, target_max_num, noise_floor_num,
-                             trim_threshold_num, eq_cutoff_num, fade_ms_num, notch_low_num, notch_high_num,
-                             notch_gain_num, notch_stretch_num, temperature_num, exaggeration_num, cfg_weight_num,
-                             min_p_num, top_p_num, repetition_penalty_num, max_tokens_num, min_tokens_num, cache_len_num,
-                             normalize_dropdown, logging_dropdown, enable_cache_cb, enable_disk_cb, enable_denoise_cb, global_status],
-                    js="", show_progress=False
-                )
-
-                # Reload (from file + auto-load)
-                def on_reload():
-                    reload_result = reload_all_config()
-                    status = reload_result[0] if reload_result else "Reloaded from file"
-                    api_status = update_api_status()
-                    # Auto-load tab after reload
-                    load_global_tab()  # Calls internally – but since outputs chained, trigger via separate click-like
-                    # (For simplicity, reload btn just updates status; user clicks Load for full repop)
-                    logger.info("Config reloaded from file")
-                    return status, api_status
-
-                reload_btn.click(
-                    fn=on_reload,
-                    inputs=[],  # No inputs
-                    outputs=[global_status, api_status_md],
-                    js="", show_progress=True
-                )
-
-                # Apply (UI-only; updates CONFIG)
-                def apply_global_params(speaking_rate, eq_gain, max_gain, target_max, noise_floor, trim_threshold, eq_cutoff, fade_ms, notch_low, notch_high, notch_gain, notch_stretch, temperature, exaggeration, cfg_weight, min_p, top_p, repetition_penalty, max_tokens, min_tokens, cache_len, normalize_method, logging_level, enable_memory_cache, enable_disk_cache, enable_denoising):
-                    config = get_config()
-                    try:
-                        params = handle_global_params_change(
-                            speaking_rate, eq_gain, max_gain, target_max, noise_floor, trim_threshold, normalize_method,
-                            eq_cutoff, fade_ms, notch_low, notch_high, notch_gain, notch_stretch,
-                            temperature, exaggeration, cfg_weight, min_p, top_p, repetition_penalty,
-                            max_tokens, min_tokens, cache_len
-                        )
-                        handle_token_limits_change(max_tokens, min_tokens, cache_len)
-                        config.set_value('enable_memory_cache', safe_to_bool(enable_memory_cache))
-                        config.set_value('enable_disk_cache',safe_to_bool(enable_disk_cache))
-                        config.set_value('enable_denoising',safe_to_bool(enable_denoising))
-                        config.set_value('normalize_method',safe_to_str(normalize_method))
-                        config.set_value('logging_level',safe_to_str(logging_level).upper())
-                        status = "Globals applied to CONFIG (memory-only – save to persist; refresh other tabs to see changes)"
-                        api_status = update_api_status()
-                        logger.info("Global config applied via helpers")
-                        return status, api_status
-                    except Exception as e:
-                        logger.error(f"Global apply failed: {e}")
-                        return f"Apply failed: {str(e)}", update_api_status()
-
-                global_apply_btn.click(
-                    fn=apply_global_params,
-                    inputs=[speaking_rate_num, eq_gain_num, max_gain_num, target_max_num, noise_floor_num,
-                            trim_threshold_num, eq_cutoff_num, fade_ms_num, notch_low_num, notch_high_num,
-                            notch_gain_num, notch_stretch_num, temperature_num, exaggeration_num, cfg_weight_num,
-                            min_p_num, top_p_num, repetition_penalty_num, max_tokens_num, min_tokens_num, cache_len_num,
-                            normalize_dropdown, logging_dropdown, enable_cache_cb, enable_disk_cb, enable_denoise_cb],
-                    outputs=[global_status, api_status_md],
-                    js="", show_progress=False
-                )
-
-                # Slider .change (partial – optional, UI-only)
-                def on_speaking_rate_change(value):
-                    create_global_param_handler("speaking_rate")(value)
-                    return global_status.value, update_api_status()  # Direct update
-
-                speaking_rate_num.change(
-                    fn=on_speaking_rate_change,
-                    inputs=[speaking_rate_num],
-                    outputs=[global_status, api_status_md],
-                    show_progress=False
-                )
-                # Similar for temperature_num, min_p_num (keep as-is; extend if needed)
-
-                with gr.Accordion("📝 JSON Editor", open=False):
-                    gr.Markdown("### Advanced: View/Edit Full Config JSON (Refresh, edit, Apply)")
-                    current_json_tb = gr.Textbox(label="Current Config JSON", lines=10, interactive=False)
-                    refresh_json_btn = gr.Button("🔄 Refresh JSON", variant="secondary")
-
-                    memory_json_tb = gr.Textbox(label="Edit/Apply Memory State JSON", lines=8, placeholder="Paste or edit JSON here...", interactive=True)
-                    apply_json_btn = gr.Button("Apply JSON Changes", variant="secondary")
-                    json_status = gr.Textbox(label="JSON Status", interactive=False, value="Ready – refresh to load")
-
-                    def refresh_and_copy():
-                        json_str = refresh_config_json()
-                        status = "Current config JSON loaded – edit below if needed."
-                        return json_str, json_str, status
-
-                    refresh_json_btn.click(
-                        fn=refresh_and_copy,
-                        inputs=[],  # No inputs
-                        outputs=[current_json_tb, memory_json_tb, json_status],
-                        js="", show_progress=False
-                    )
-
-                    apply_json_btn.click(
-                        fn=apply_json_changes,
-                        inputs=[memory_json_tb],
-                        outputs=[memory_json_tb, json_status, api_status_md],
-                        js="", show_progress=False
-                    )
-
-                # Controls (UI-only)
-                with gr.Row():
-                    save_btn = gr.Button("💾 Save All Changes to Config File", variant="primary")
-                    reset_btn = gr.Button("🔄 Reset All to Original Values", variant="stop")
-
-                controls_status = gr.Textbox(label="Controls Status", interactive=False, value="Ready to save/reset")
+                # Save params to config
+                def save_voice_params(voice_name, rate, temp, exagg):
+                    voice_name = voice_name
+                    config.update_voice_parameter(voice_name, 'speaking_rate', rate)
+                    config.update_voice_parameter(voice_name, 'temperature', temp)
+                    config.update_voice_parameter(voice_name, 'exaggeration', exagg)
+                    return f"Saved voice parameters for {voice_name}"
 
                 save_btn.click(
-                    fn=save_all_config,
-                    outputs=[controls_status, api_status_md],
-                    js="", show_progress=True
-                )
-                reset_btn.click(
-                    fn=reset_all_config,
-                    outputs=[controls_status, api_status_md],
-                    js="", show_progress=True
+                    fn=save_voice_params,
+                    inputs=[voice_dropdown, voice_rate, voice_temp, voice_exagg],
+                    outputs=[voice_status]
                 )
 
-        # Attach Hidden API (to demo; uses Generate tab outputs – unchanged)
-        setup_bridge_api(demo, audio_output, generate_status)
+        # Attach Hidden API to generate tab outputs - critical for remote connection
+        setup_bridge_api(demo, audio_output, generate_status, config=config)
 
-        logger.info("State-free Tab UI: Generate default; lazy load via 'Load/Refresh' btns (user-driven, no errors)")
+        logger.info("Initialize state-free Tab UI successfully. Bridge API connected.")
         return demo
 
+# Tab Load Functions - simplified to match new UI structure
+def load_test_tab(config):
+    """Load Voice Test tab components from CONFIG (lazy on btn click)."""
+    voice_choices = config.get_all_voices() or ['default']
+    if 'default' not in voice_choices:
+        voice_choices.append('default')
 
+    # Get audio parameters from config with proper hierarchy
+    audio_cfg = config.app_config.audio
+    txs_cfg = config.app_config.tts
+
+    # Defaults from CONFIG (global, as voice-specific needs select first)
+    params = {
+        'speaking_rate': audio_cfg.speaking_rate,
+        'eq_gain_db': audio_cfg.eq_gain_db,
+        'max_gain': audio_cfg.max_gain,
+        'target_max': audio_cfg.target_max,
+        'noise_floor_db': audio_cfg.noise_floor_db,
+        'trim_threshold_db': audio_cfg.trim_threshold_db,
+        'notch_enabled': audio_cfg.notch_enabled,
+        'hp_enabled': audio_cfg.hp_enabled,
+    }
+
+    return (
+        gr.update(choices=voice_choices),
+        "Testing shared config voice parameters.",
+        42,
+        params['speaking_rate'], params['eq_gain_db'], params['max_gain'], params['target_max'],
+        params['noise_floor_db'], params['trim_threshold_db'], params['notch_enabled'], params['hp_enabled'],
+        {},  # test_params
+        "Values loaded from CONFIG – test with custom params if needed."
+    )
+
+def update_test_voice_choices(config, voice):
+    """Handle voice dropdown changes with proper config reference."""
+    choices = config.get_all_voices() or ['default']
+    if 'default' not in choices:
+        choices.append('default')
+    return gr.update(choices=choices, value=voice or 'default')
+
+def test_voice_generation(config, voice_name, test_text, seed):
+    """
+    Handle voice test generation with proper config reference.
+    """
+    try:
+        logger.info(f"Voice test requested: voice='{voice_name}', text='{test_text[:50]}...', seed={seed}")
+
+        # Get config values using hierarchical structure
+        txs_cfg = config.app_config.tts
+        audio_cfg = config.app_config.audio
+
+        # Generate UUID for cache (simple deterministic)
+        cache_uuid = abs(hash(f"{voice_name}_{test_text}_{seed}")) % (2**31)
+
+        # Call the UX-compatible audio generation interface
+        result = generate_audio_ui(
+            model_choice=None,
+            text=test_text,
+            language="en",
+            speaker_audio=None,
+            prefix_audio=None,
+            e1=None, e2=None, e3=None, e4=None, e5=None, e6=None, e7=None, e8=None,
+            vq_single=None, fmax=None, pitch_std=None,
+            speaking_rate=None,
+            dnsmos_ovrl=None,
+            speaker_noised=False,
+            cfg_scale=txs_cfg.cfg_weight,
+            top_p_param=txs_cfg.top_p,
+            top_k=None,
+            min_p_param=txs_cfg.min_p,
+            linear_temp=txs_cfg.temperature,
+            confidence_rep=txs_cfg.repetition_penalty,
+            quadratic_exagg=txs_cfg.exaggeration,
+            uuid_seed=cache_uuid,
+            randomize_seed_toggle=False,
+            unconditional_keys_list=None
+        )
+
+        # Extract the path from result
+        audio_path = result[0] if isinstance(result, (list, tuple)) and result else None
+
+        # Prepare used params for display
+        actual_params = {
+            'voice': voice_name,
+            'text': test_text,
+            'seed': seed,
+            'temperature': txs_cfg.temperature,
+            'cfg_weight': txs_cfg.cfg_weight,
+            'exaggeration': txs_cfg.exaggeration,
+            'cache_uuid': cache_uuid,
+            'status': result[1] if isinstance(result, (list, tuple)) and len(result) > 1 else "Unknown status"
+        }
+
+        status = "✅ Test generated successfully" if audio_path and Path(audio_path).exists() else "⚠️ Generated but audio not found"
+        return audio_path, status, actual_params
+
+    except Exception as e:
+        logger.exception("Voice test failed")
+        fallback_path, fallback_status = stub_wav_path()
+        return None, f"❌ Test generation failed: {str(e)} | {fallback_status}", {}
 
 if __name__ == "__main__":
+    # For standalone testing
     demo = create_ui()
-    # TODO test concurrency
-    demo.queue(concurrency_limit=3,  # Max simultaneous gens (e.g., 4 short ones OK; test GPU mem)
-               max_size=9)  # Queue max jobs (prevents overload)
-    demo.launch(
+    demo.queue(
+        concurrency_limit=3,
+        max_size=9
+    ).launch(
         server_name="0.0.0.0",
         server_port=7860,
         share=False,

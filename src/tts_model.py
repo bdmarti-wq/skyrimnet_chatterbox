@@ -1,6 +1,7 @@
 import gc  # NEW: For warmup cleanup
 import threading
 import functools
+from pathlib import Path
 from typing import Optional, Any
 from loguru import logger
 import torch
@@ -12,6 +13,10 @@ MULTILINGUAL = False  # Default; pulled from CONFIG in methods
 
 # from src.cache import clear_cache_files  # Clear conds/audio on unload
 
+# Add these near the top with similar locks
+MODEL_LOCK = threading.RLock()
+# NEW: Add this lock specifically for generation operations
+GEN_ACTIVE_LOCK = threading.RLock()  # Global for gen/prepare concurrency
 
 def chatterbox_tts_to(model: Any, device: torch.device, dtype: torch.dtype):
     """Granular to() for Chatterbox: bfloat16 compute, fp32 audio (avoids cuFFT/STFT errors). DRY."""
@@ -46,6 +51,9 @@ def chatterbox_tts_to(model: Any, device: torch.device, dtype: torch.dtype):
 
 def warmup_t3(model: Any, num_runs: int = 2):
     """Warm-up T3 graphs/buckets with dummy (built-in inductor for fusion). DRY."""
+    if not hasattr(model, 'conds') or model.conds is None:
+        logger.warning("Warmup skip – no conds (dummy state)")
+        return
     from .config import get_config_value
     if not get_config_value('warmup_t3', True) or not torch.cuda.is_available():
         logger.debug("Skipping T3 warmup (disabled or no CUDA)")
@@ -126,7 +134,20 @@ class SimpleModelState:
     def get_model(self) -> Optional[Any]:
         if self.model is not None:
             self.model.optimized = self.optimized  # Propagate for gen skip (idempotent)
-        return self.model
+
+        model = self.model
+        if model is not None:
+            # NEW: Ensure default neutral state if no conds (old: text-only skips prep, generate uses default self.conds=None)
+            # This mirrors old generator (no path = no prep = audible neutral)
+            if not hasattr(model, 'conds') or model.conds is None:
+                model.conds = None  # Explicit for state-based gen
+                if hasattr(model, 'set_conditionals'):
+                    model.set_conditionals(None)  # Activate neutral if method exists (old load for empty)
+                    logger.debug("Default neutral conds activated in model getter (text-only ready)")
+                else:
+                    logger.debug("Default conds=None set (assuming self.conds used by generate)")
+
+        return model
 
     def is_loaded(self, model_type: str) -> bool:
         return self.model is not None and self.model_type == model_type
@@ -219,6 +240,48 @@ class ModelManager:
         instance = cls.get_instance()
         instance.clear()
         return instance.load_model(model_type or ('multilingual' if get_config_value('multilingual') else 'english'))
+
+
+
+@staticmethod
+def create_dummy_conds(model, device, dtype, reason="dummy"):
+    logger.warning(f"Dummy conds for {reason} – neutral voice")
+    emb = torch.zeros((1, 256), dtype=dtype, device=device)
+
+    class MockT3:
+        def __init__(self, dtype, device):
+            self.speaker_emb = emb
+            self.emotion_adv = torch.zeros((1,), dtype=dtype, device=device)  # FIXED: Non-None dtype
+            self._bucket_graphs = {}
+            self.params = {'generate_token_backend': 'cuda'} if hasattr(model.t3, 'params') else {}
+
+    class MockConds:
+        def __init__(self, t3):
+            self.t3 = t3
+            self.cmel = torch.zeros((1, 80, 100), dtype=dtype, device=device)  # Match lengths
+            self.cmap = torch.zeros((1, 1024, 200), dtype=dtype, device=device)
+
+        # FIXED: Implement .to for conds (coordinator/set_conditionals may call)
+        def to(self, device=None, dtype=None):
+            if device is not None:
+                self.device = device
+            if dtype is not None:
+                self.dtype = dtype
+                self.cmel = self.cmel.to(dtype=dtype)
+                self.cmap = self.cmap.to(dtype=dtype)
+                self.t3.speaker_emb = self.t3.speaker_emb.to(dtype=dtype)
+                self.t3.emotion_adv = self.t3.emotion_adv.to(dtype=dtype)
+            return self
+
+    dummy_t3 = MockT3(dtype, device)
+    dummy_conds = MockConds(dummy_t3)
+
+    model.conds = dummy_conds
+    if hasattr(model, 'set_conditionals'):
+        model.set_conditionals(dummy_conds)
+
+    logger.debug(f"Dummy set: emb non-zero False, cmel {dummy_conds.cmel.shape} (with .to)")
+    return dummy_conds
 
 
 # Backward Compat: Facades to Singleton (use these if old code calls load_model() directly)

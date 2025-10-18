@@ -1,12 +1,13 @@
 """
-bridge_ui.py - Entry point for the UI with exactly 29 parameters.
+ui_interface.py - Entry point for the UI with exactly 29 parameters.
 
 This file acts as the bridge between the UI and the internal generation pipeline.
 All generation logic has been moved to the pipeline, this function is
 strictly responsible for:
-1. Creating the context object with UI-provided parameters
-2. Executing the pipeline
-3. Formatting the result for Gradio
+1. Loading model, cache_manager, config (if not available)
+2. Creating the context object with UI-provided parameters + loaded internals
+3. Executing the pipeline
+4. Formatting the result for Gradio
 """
 
 import asyncio
@@ -19,14 +20,15 @@ import gradio as gr
 import torch
 from loguru import logger
 
-from src.config import get_config, get_config_value
+from src.config import get_config
 from src.tts_model import ModelManager, GEN_ACTIVE_LOCK
-from generate.pipeline.coordinator import GenerationPipeline
-from generate.pipeline.context import AudioGenerationContext
-from .cache.cache_manager import CacheManager
+from src.generate.pipeline.context import AudioGenerationContext
+from src.generate.cache.cache_manager import CacheManager
+from src.seeding import cpp_uuid_to_seed
 
-# Cache for hot reloads
+# Cache for hot reloads (loaded model/config)
 PIPELINE_CACHE = None
+CONFIG_CACHE = None
 CACHE_MANAGER_CACHE = None
 
 def _ensure_valid_return(result: Any, error_msg: Optional[str] = None) -> list:
@@ -41,7 +43,7 @@ def _ensure_valid_return(result: Any, error_msg: Optional[str] = None) -> list:
 
     # Try fallbacks in order of reliability
     try:
-        sr = get_config().app_config.globals.sr
+        sr = get_config().app_config.globals.sr  # Fixed: Use config.globals.sr
         fallback_path = _create_raw_silence_fallback(0, sr)
         return [fallback_path, status_text]
     except:
@@ -57,8 +59,8 @@ def _create_raw_silence_fallback(uuid: int, sr: int = 24000) -> str:
     import numpy as np
     from scipy.io import wavfile
 
-    temp_dir = Path(get_config().app_config.globals.cache_dir) / "temp"
-    temp_dir.mkdir(parents=True, exist_ok=True)
+    temp_dir = Path(tempfile.gettempdir())
+    temp_dir.mkdir(parents=True, exist_ok=True)  # Use system temp as fallback
 
     # Use predictable name for reuse across requests
     silence_path = temp_dir / f"silence_{sr}.wav"
@@ -106,34 +108,33 @@ async def generate_audio_ui(
     """Entry point with exactly 29 parameters for UI compatibility."""
     result = None
     error_msg = None
+    global CONFIG_CACHE, CACHE_MANAGER_CACHE, PIPELINE_CACHE
 
     try:
-        # Initialize pipeline and cache manager (lazy load)
-        global PIPELINE_CACHE, CACHE_MANAGER_CACHE
-        if PIPELINE_CACHE is None:
-            from generate.pipeline.coordinator import GenerationPipeline
-            PIPELINE_CACHE = GenerationPipeline()
-        pipeline = PIPELINE_CACHE
+        # Load config (global)
+        config = get_config()
+        if CONFIG_CACHE is None:
+            CONFIG_CACHE = config  # Cache for reuse
 
+        # Load model (via singleton)
+        model_manager = ModelManager.get_instance()
+        model_type = 'multilingual' if config.app_config.globals.multilingual else 'english'  # Fixed: config.globals
+        if not model_manager.is_loaded(model_type):
+            model_manager.load_model(model_type)
+        model = model_manager.get_model()
+        if model is None:
+            error_msg = "No TTS model available"
+            return _ensure_valid_return(None, error_msg)
+
+        # Initialize cache_manager (lazy load)
         if CACHE_MANAGER_CACHE is None:
-            from .cache.cache_manager import CacheManager
-            config = get_config()
             CACHE_MANAGER_CACHE = CacheManager(config)
         cache_manager = CACHE_MANAGER_CACHE
 
-        # Load model if needed
-        model = ModelManager.get_instance().get_model()
-        if model is None:
-            ModelManager.get_instance().load_model('english')
-            model = ModelManager.get_instance().get_model()
-            if model is None:
-                error_msg = "No TTS model available"
-                return _ensure_valid_return(None, error_msg)
-
-        # Create generation context (single source of truth)
+        # Create generation context with params + loaded internals
         context = _create_generation_context(
             text=text,
-            audio_prompt_path=speaker_audio,
+            audio_prompt_path=speaker_audio,  # UI-provided audio
             cache_uuid=uuid_seed,
             exaggeration=quadratic_exagg or 0.5,
             temperature=linear_temp or 0.8,
@@ -142,17 +143,24 @@ async def generate_audio_ui(
             top_p=top_p_param,
             repetition_penalty=confidence_rep or 1.2,
             language_id=language,
-            seed_num=cpp_uuid_to_seed(uuid_seed),
+            seed_num=cpp_uuid_to_seed(uuid_seed) if randomize_seed_toggle else None,
             enable_memory_cache=True,
             enable_disk_cache=True,
-            model=model
+            model=model,  # FIXED: Pass the loaded model
+            config=config,  # FIXED: Pass the loaded config
+            cache_manager=cache_manager  # FIXED: Pass the cache_manager
         )
-        context.cache_manager = cache_manager
+
+        if PIPELINE_CACHE is None:
+            from .pipeline.coordinator import GenerationCoordinator
+            PIPELINE_CACHE = GenerationCoordinator()
+        pipeline = PIPELINE_CACHE
 
         # Execute the pipeline within concurrency control
         start_time = time.time()
         with GEN_ACTIVE_LOCK:
-            result = await pipeline.run(context)
+            # Run sync pipeline in threadpool (non-blocking for async UI)
+            result = await asyncio.to_thread(pipeline.run, context)
 
         # Process result
         if result and result.output_path and Path(result.output_path).exists():
@@ -173,25 +181,40 @@ async def generate_audio_ui(
         logger.exception(error_msg)
         return _ensure_valid_return(None, error_msg)
 
-def _create_generation_context(**kwargs) -> AudioGenerationContext:
-    """Creates context object with UI-provided parameters."""
-    from src.config import get_config
-
-    config = get_config()
-    globals_config = config.app_config.globals
+def _create_generation_context(
+    text: str,
+    audio_prompt_path: Optional[str],
+    cache_uuid: int,
+    exaggeration: float,
+    temperature: float,
+    cfgw: float,
+    min_p: float,
+    top_p: float,
+    repetition_penalty: float,
+    language_id: str,
+    seed_num: int,
+    enable_memory_cache: bool = True,
+    enable_disk_cache: bool = True,
+    model: Optional[Any] = None,
+    config: Optional["AppConfig"] = None,
+    cache_manager: Optional["CacheManager"] = None
+) -> AudioGenerationContext:
+    """Creates context object with UI-provided parameters + injected loaders."""
+    if config is None:
+        config = get_config()  # Fallback global load
+    if model is None:
+        model = ModelManager.get_instance().get_model()  # Fallback load via singleton
 
     # Validate and normalize audio path first (needed for voice stem)
-    audio_path = kwargs.get('audio_prompt_path', None)
-    if audio_path and not Path(audio_path).exists():
-        logger.warning(f"Provided audio path does not exist: {audio_path}")
-        kwargs['audio_prompt_path'] = None
-        audio_path = None
+    if audio_prompt_path and not Path(audio_prompt_path).exists():
+        logger.warning(f"Provided audio path does not exist: {audio_prompt_path}")
+        audio_prompt_path = None
 
     # Determine voice stem
     voice_stem = None
-    if audio_path:
+    if audio_prompt_path:
         from src.normalize_stem import normalize_stem
-        voice_stem = normalize_stem(audio_path)
+        voice_stem = normalize_stem(audio_path=audio_prompt_path)
 
     # Get voice-specific parameters
     voice_params = {}
@@ -199,23 +222,23 @@ def _create_generation_context(**kwargs) -> AudioGenerationContext:
         voice_params = config.get_merged_audio_params(voice_name=voice_stem)
 
     # Coerce seeds
-    uuid_seed = kwargs.get('cache_uuid', 0)
-    seed_num = cpp_uuid_to_seed(uuid_seed) if kwargs.get('randomize_seed_toggle', False) else kwargs.get('seed_num', 42)
+    seed = cpp_uuid_to_seed(cache_uuid) if seed_num is None else seed_num
 
-    return AudioGenerationContext(
-        text=kwargs.get('text', ""),
-        audio_prompt_path=kwargs.get('audio_prompt_path', None),
-        cache_uuid=kwargs.get('cache_uuid', 0),
-        exaggeration=kwargs.get('exaggeration', 0.5),
-        temperature=kwargs.get('temperature', voice_params.get('temperature', 0.8)),
-        cfgw=kwargs.get('cfgw', voice_params.get('cfg_weight', 0.45)),
-        min_p=kwargs.get('min_p', voice_params.get('min_p', 0.05)),
-        top_p=kwargs.get('top_p', voice_params.get('top_p', 1.0)),
-        repetition_penalty=kwargs.get('repetition_penalty', voice_params.get('repetition_penalty', 1.2)),
-        language_id=kwargs.get('language_id', 'en'),
-        seed_num=seed_num,
-        enable_memory_cache=kwargs.get('enable_memory_cache', True),
-        enable_disk_cache=kwargs.get('enable_disk_cache', True),
+    # Create and initialize context (now with full internals)
+    context = AudioGenerationContext(
+        text=text,
+        audio_prompt_path=audio_prompt_path,
+        cache_uuid=cache_uuid,
+        exaggeration=exaggeration or voice_params.get('exaggeration', 0.5),
+        temperature=temperature or voice_params.get('temperature', 0.8),
+        cfgw=cfgw or voice_params.get('cfg_weight', 0.45),
+        min_p=min_p or voice_params.get('min_p', 0.05),
+        top_p=top_p or voice_params.get('top_p', 1.0),
+        repetition_penalty=repetition_penalty or voice_params.get('repetition_penalty', 1.2),
+        language_id=language_id,
+        seed=seed,
+        enable_memory_cache=enable_memory_cache,
+        enable_disk_cache=enable_disk_cache,
         voice_stem=voice_stem or "default",
         voice_params=voice_params,
         t3_params={
@@ -223,30 +246,49 @@ def _create_generation_context(**kwargs) -> AudioGenerationContext:
             "stride_length": 4,
             "skip_when_1": True
         },
-        device=torch.device(globals_config.device),
-        dtype=globals_config.dtype,
-        model=kwargs.get('model'),
-        config=config,
-        original_text=kwargs.get('text', ""),
-        save_cache=kwargs.get('enable_memory_cache', True) or kwargs.get('enable_disk_cache', True)
+        device=torch.device(config.app_config.globals.device if config else "cuda" if torch.cuda.is_available() else "cpu"),
+        dtype=config.app_config.globals.dtype if config else torch.bfloat16,  # Fixed: config.globals.dtype
+        model=model,  # FIXED: Set loaded model
+        config=config,  # FIXED: Set loaded config
+        cache_manager=cache_manager,  # FIXED: Set cache_manager
+        sr=config.app_config.globals.sr if config else 24000,  # FIXED: Direct from config.globals.sr
+        multilingual=config.app_config.globals.multilingual if config else False  # FIXED: From config.globals
     )
 
-def cpp_uuid_to_seed(uuid_64: int) -> int:
-    """Convert a 64-bit UUID to a valid PyTorch seed (0 to 2^32 - 1)."""
-    return abs(hash(uuid_64)) % (2 ** 32)
+    # Legacy compat (set in __post_init__, but reinforce)
+    context.cfg_weight = cfgw or voice_params.get('cfg_weight', 0.45)
+    context.save_cache = enable_memory_cache or enable_disk_cache
 
-def setup_bridge_api(demo, audio_output, api_status_md):
+    logger.debug(f"Context created: voice_stem={voice_stem}, model present={model is not None}, cache_manager={cache_manager is not None}")
+
+    return context
+
+def setup_bridge_api(demo, audio_output, api_status_md, config=None):
     """
     Registers 29 hidden components + button/.click for /api/generate_audio.
-    Exact match from original working code signature/order/defaults.
-    Call inside gr.Blocks() in ui.py.
+    Args:
+        demo: Gradio demo instance
+        audio_output: Audio output component for integration
+        api_status_md: Status component for API updates
+        config: Optional config object (faster to inject than global lookup)
     """
-    from src.config import get_config_value
-    model_type = 'multilingual' if get_config_value('multilingual') else 'english'
-    from src.tts_model import ModelManager
-    ModelManager.get_instance().load_model(model_type)
+    # Get config safely (either injected or global)
+    if config is None:
+        from src.config import get_config
+        config = get_config()
 
-    # 29 hidden components (exact from original working code signature/order/defaults)
+    # Extract model type from properly structured config
+    model_type = 'multilingual' if config.app_config.globals.multilingual else 'english'
+
+    # Load model using dependency-injected config
+    from src.tts_model import ModelManager
+    model_manager = ModelManager.get_instance()
+
+    # Check if model already loaded before loading again
+    if not model_manager.is_loaded(model_type):
+        model_manager.load_model(model_type)
+
+    # 29 hidden components (exactly matching UI requirements)
     model_choice = gr.Textbox(visible=False, value=None, label="Model Choice")
     text_input_hidden = gr.Textbox(visible=False, value="", label="Text Hidden")
     language = gr.Textbox(visible=False, value="en", label="Language")
@@ -278,7 +320,7 @@ def setup_bridge_api(demo, audio_output, api_status_md):
     unconditional_keys_list = gr.Textbox(visible=False, value="", label="Unconditional Keys")
     hidden_api_btn = gr.Button(visible=False, value="Hidden API Trigger")
 
-    # .click event (exact 29 inputs from original working code)
+    # Click event with exactly 29 inputs
     hidden_api_btn.click(
         fn=generate_audio_ui,
         inputs=[
@@ -293,7 +335,12 @@ def setup_bridge_api(demo, audio_output, api_status_md):
         show_progress=True,
         concurrency_limit=4
     )
-    logger.info("Minimal hidden API registered (29 original components + .click; CONFIG 'api'/value mode; calls generate_audio)")
+
+    logger.info(
+        "Hidden API bridge connected: "
+        f"29 parameters correctly wired to generate_audio_ui | "
+        f"Model: {model_type}"
+    )
 
 # Expose for ui.py import (minimal)
 __all__ = ['generate_audio_ui', 'setup_bridge_api']
