@@ -47,84 +47,80 @@ class VoiceProcessingPhase(GenerationPhase):
             return 0.0
 
     def execute(self, context: AudioGenerationContext) -> AudioGenerationContext:
-        """If cache miss, prep conds on processed_path (reuse if HIT). FIXED: None-safe exag format; stable cond_key with hash."""
+        """Process conds safely; FIXED: Use context.processed_voice_path/conds_key if HIT; globals.device; check exists before compute/save."""
         start_time = time.perf_counter()
-        config = get_config()
-        stem = context.voice_stem or normalize_stem(context.audio_prompt_path or '')
-        processed_path = getattr(context, 'processed_ref_path', context.audio_prompt_path or '')  # Safe getattr
 
-        if not processed_path or not os.path.exists(processed_path):
-            logger.warning(f"No valid path for {stem} – dummy conds")
-            create_dummy_conds(context.model, config.device, config.dtype, "no_path")
-            context.conditionals_key = f"dummy_{stem}"
-            context.voice_ref_processed = False
-            voice_time = time.perf_counter() - start_time
-            logger.info(f"Voice time: {voice_time:.3f}s (dummy for {stem})")
+        if not context.model:
+            logger.warning("No model – dummy fallback")
             return context
 
-        # Pad text pre-prep
-        from src.audio_utils import pad_short_text
-        # FIXED: Guard voice_params (prevent None.items in handle_error fallback)
-        voice_params = getattr(context, 'voice_params', {}) or {}
-        if isinstance(voice_params, dict):
-            context.text = pad_short_text(context.text, voice_params)
-        else:
-            logger.warning("voice_params not dict; defaulting empty")
-            context.text = pad_short_text(context.text, {})
+        model = context.model
+        conds_key = context.conds_key or context.conditionals_key
+        processed_path = context.processed_voice_path
+        voice_stem = context.voice_stem
+        voice_params = getattr(context, 'voice_params', {})
 
-        # NEW: Stable cond_key using voice_content_hash (from voice_reference; fallback MD5 on path for reuse)
-        content_hash = getattr(context, 'voice_content_hash', None)
-        if content_hash is None:
-            # Fallback: Compute MD5 on path (stable across uploads if content same)
+        if not voice_stem:
+            logger.warning("No voice_stem – dummy")
+            from src.tts_model import create_dummy_conds
+            config = get_config()
+            device = config.app_config.globals.device  # FIXED: Safe globals.device
+            dtype = config.app_config.globals.dtype
+            model.conds = create_dummy_conds(model, device, dtype)
+            context.conds_key = 'dummy_no_voice'
+            return context
+
+        config = get_config()
+        device = config.app_config.globals.device  # FIXED: Standard access (fixes 'Config' error)
+        dtype = config.app_config.globals.dtype
+
+        # FIXED: Load if HIT key set (fast; no path needed if cached)
+        if conds_key and self.cache_manager and self.cache_manager.get_conditionals(conds_key, model):
+            logger.info(f"VoiceProcessing: Conds HIT for {voice_stem} from key {conds_key[:20]}...")
+            # Quick validate (move to device if loaded raw)
+            if hasattr(model.conds, 'speaker_emb'):
+                model.conds = model.conds.to(device=device, dtype=dtype)
+            context.conds_key = conds_key
+            # Success – return
+            time_taken = time.perf_counter() - start_time
+            logger.debug(f"VoiceProcessing HIT: {time_taken:.3f}s | key={conds_key[:20]}")
+            return context
+
+        # FIXED: Compute if path available (real; check exists)
+        if processed_path and os.path.exists(processed_path):
             try:
-                with open(processed_path, 'rb') as f:
-                    content_hash = hashlib.md5(f.read()).hexdigest()[:12]
-                context.voice_content_hash = content_hash  # Store for downstream
-            except Exception as hash_e:
-                logger.warning(f"Hash fallback failed: {hash_e}; using timestamp")
-                content_hash = f"hash_{int(time.time() % 1000000)}"[:12]
-        exag = voice_params.get('exaggeration', 1.0)
-        if exag is None:  # FIXED: Handle None
-            exag = 1.0
-            logger.warning("Exaggeration None; default 1.0")
-        temp = voice_params.get('temperature', 0.8)
-        topp = voice_params.get('top_p', 1.0)
-        cond_key = f"hash_{content_hash}_exag{exag:.2f}_temp{temp:.2f}_topp{topp:.2f}"  # TODO review do we need stem?
-        context.conditionals_key = cond_key
+                logger.info(f"VoiceProcessing: Compute conds for {voice_stem} from {processed_path}")
+                conds = context.model.prepare_conditionals(processed_path, exaggeration=context.exaggeration)
+                # Set key if not set (use existing or derive)
+                if not conds_key:
+                    conds_key = f"computed_{voice_stem}_{int(time.time())}"
+                context.conds_key = conds_key
+                context.conditionals_key = conds_key
 
-        # FIXED: Prep with cache integration (get_or_prep atomic; HIT skips prep)
-        prep_time = time.perf_counter()
-        conds_loaded = False
-        if self.conditionals_cache:
-            conds = self._prepare_conditionals(context, processed_path, voice_params)
-            if conds is not None:
-                conds_loaded = True
+                # FIXED: Safe save (check conds valid; no None)
+                if hasattr(model, 'conds') and model.conds is not None and self.cache_manager:
+                    if self.cache_manager.save_conditionals(conds_key, model):
+                        logger.debug(f"Conds saved for {voice_stem}: {conds_key[:20]}")
+                    else:
+                        logger.warning(f"Compute OK but save failed for {voice_stem}")
+                else:
+                    logger.warning("Computed but no conds/model – skip save")
+            except Exception as e:
+                logger.error(f"Compute error for {voice_stem}: {e} – dummy fallback")
+                processed_path = None  # To trigger dummy below
         else:
-            # No cache: Always fresh prep (use fallback)
-            conds = self._prepare_fresh(context.model, processed_path, exag, context.device, context.dtype)
-            if conds is not None:
-                conds_loaded = True
+            logger.warning(f"VoiceProcessing: No path for {voice_stem} ({processed_path or 'none'}) – dummy")
 
-        prep_time = time.perf_counter() - prep_time
-        status = "reuse" if conds_loaded else "prep"
-        if conds_loaded and self.conditionals_cache:
-            status = "cache_reuse" if hasattr(context,
-                                              'conds_from_cache') and context.conds_from_cache else "fresh_prep"
-        logger.info(
-            f"Prepared conds on {processed_path} for {stem} (key: {cond_key[:20]}...) | time {prep_time:.3f}s ({status})")
+        # FIXED: Dummy if no real conds (pre-change behavior; safe device)
+        if not hasattr(model, 'conds') or model.conds is None:
+            from src.tts_model import create_dummy_conds
+            model.conds = create_dummy_conds(model, device, dtype)
+            context.conds_key = f"dummy_{voice_stem}"
+            logger.debug(f"Dummy conds set for {voice_stem}")
 
-        if conds is None:
-            # Failed: Dummy fallback
-            logger.warning(f"Prep failed for {stem} – dummy conds")
-            create_dummy_conds(context.model, context.device, context.dtype, f"prep_fail_{stem}")
-            conds_loaded = False
-
-        # FIXED: Ensure voice_params is always dict
-        context.voice_params = voice_params or {}
-        context.voice_ref_processed = True
-        voice_time = time.perf_counter() - start_time
-        logger.info(
-            f"Voice time: {voice_time:.3f}s ({'reuse' if conds_loaded else 'prep'} for {stem})")
+        time_taken = time.perf_counter() - start_time
+        logger.debug(
+            f"VoiceProcessing MISS: {time_taken:.3f}s | key={context.conds_key[:20]} | path={processed_path or 'none'}")
         return context
 
 
@@ -312,63 +308,53 @@ class VoiceProcessingPhase(GenerationPhase):
         return success
 
     def handle_error(self, context: AudioGenerationContext, error: Exception) -> AudioGenerationContext:
-        """Handle errors with fallback (safe sr). FIXED: Guard voice_params (no None.items); safe config.device/globals; dummy conds; path safety."""
-        logger.error(f"Voice processing error: {str(error)} – falling back to simple/default")
-        context.processed_voice_path = context.audio_prompt_path or ""
+        """Fallback to simple/default on voice error. FIXED: Import guard for get_config; safe access; set conds_key/voice_stem."""
+        logger.error(f"Voice processing error: {error} – falling back to simple/default")
+
+        # FIXED: Import guard for get_config (if not at file top)
         try:
-            context.voice_stem = normalize_stem(context.processed_voice_path) or 'default'
-        except Exception as stem_e:
-            logger.warning(f"Stem fallback failed: {stem_e}")
-            context.voice_stem = 'default'
+            from src.config import get_config
+        except ImportError:
+            logger.error("get_config import failed in handle_error – ultimate fallback")
+            context.voice_params = {'exaggeration': 1.0}  # Hardcode
+            context.processed_voice_path = ""
+            context.conditionals_key = "error_default"
+            if not hasattr(context, 'conds_key'):
+                context.conds_key = "error_default"
+            return context
 
         config = get_config()
-        # FIXED: Safe config attrs (nested/flat; fallback to context/defaults – no 'device' error)
-        if hasattr(config, 'globals'):
-            device = getattr(config.globals, 'device', None) or getattr(config, 'device', None) or \
-                     (context.device if hasattr(context, 'device') else torch.device(
-                         'cuda' if torch.cuda.is_available() else 'cpu'))
-            dtype = getattr(config.globals, 'dtype', None) or getattr(config, 'dtype', None) or \
-                    (context.dtype if hasattr(context, 'dtype') else torch.bfloat16)
-            sr = getattr(config.globals, 'sr', None) or getattr(config, 'sr', None) or \
-                 (context.sr if hasattr(context, 'sr') else 24000)
-        else:
-            # Flat config or no attribs
-            device = getattr(config, 'device', context.device if hasattr(context, 'device') else torch.device(
-                'cuda' if torch.cuda.is_available() else 'cpu'))
-            dtype = getattr(config, 'dtype', context.dtype if hasattr(context, 'dtype') else torch.bfloat16)
-            sr = getattr(config, 'sr', context.sr if hasattr(context, 'sr') else 24000)
+        stem = getattr(context, 'voice_stem', 'error_default')
 
-        # FIXED: Additional guard if still None (rare)
-        if device is None:
-            device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        if dtype is None:
-            dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
-        if sr is None or not isinstance(sr, int):
-            sr = 24000
+        try:
+            # FIXED: Safe get_voice_params (no device/dtype kwargs)
+            voice_params = config.get_voice_params(stem)  # FIXED: No kwargs
+            context.voice_params = voice_params
+            context.processed_voice_path = getattr(context, 'audio_prompt_path', "") or ""
+            context.conditionals_key = f"error_{stem}"
+            if not hasattr(context,
+                           'conds_key') or context.conds_key is None:  # FIXED: Set if missing (no attr error downstream)
+                context.conds_key = context.conditionals_key
 
-        # FIXED: Guard voice_params (prevent None.items in get_voice_params or access)
-        voice_params = getattr(context, 'voice_params', {}) or {}
-        if not isinstance(voice_params, dict):
-            voice_params = {}  # Force dict
-        context.voice_params = config.get_voice_params(context.voice_stem,
-                                                       {'exaggeration': 1.0}) or voice_params  # Safe fallback
+            # FIXED: Dummy conds for model (neutral; use safe device/dtype)
+            if hasattr(context, 'model') and context.model is not None:
+                from src.tts_model import create_dummy_conds
+                device = getattr(config.app_config.globals, 'device', 'cpu') if hasattr(config,
+                                                                                        'app_config') and hasattr(
+                    config.app_config, 'globals') else torch.device('cpu')
+                dtype = getattr(config.app_config.globals, 'dtype', torch.float32) if hasattr(config,
+                                                                                              'app_config') and hasattr(
+                    config.app_config, 'globals') else torch.float32
+                create_dummy_conds(context.model, device, dtype, f"error_{stem}")
 
-        context.conditionals_key = f"fallback_{context.voice_stem}_{int(time.time() % 10000)}"
-        context.voice_ref_processed = False
+            logger.debug(f"Fallback for {stem}: dummy conds set, key={context.conditionals_key}")
+        except Exception as fallback_e:
+            logger.warning(f"Stem fallback failed: {fallback_e}; no audio_path for stem derivation")
+            context.voice_params = {'exaggeration': 1.0}  # Ultimate
+            context.processed_voice_path = ""
+            context.conditionals_key = "error_default"
+            if not hasattr(context, 'conds_key'):
+                context.conds_key = "error_default"
 
-        # FIXED: Use create_dummy_conds (from working snippet); guard model exists
-        if hasattr(context, 'model') and context.model is not None:
-            create_dummy_conds(context.model, device, dtype, f"error_{context.voice_stem}")
-
-        # FIXED: Silence fallback with get_silence (safe sr/device; CPU for persistence)
-        from src.audio_utils import get_silence
-        if not hasattr(context, 'generated_wav') or context.generated_wav is None:
-            context.generated_wav = get_silence(duration=2.0, sr=sr, dtype=torch.float32,
-                                                device=torch.device('cpu')).to(device, dtype)
-
-        # FIXED: Ensure path not None (fixes PathLike in downstream gen/output)
-        if not hasattr(context, 'audio_prompt_path') or context.audio_prompt_path is None:
-            context.audio_prompt_path = ""  # Valid str for os/Path
-
-        logger.debug("Error fallback complete; proceeding with default (dummy conds + silence)")
         return context
+

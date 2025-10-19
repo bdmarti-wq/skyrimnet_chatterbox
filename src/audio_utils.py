@@ -12,7 +12,7 @@ import torchaudio
 import soundfile as sf
 import tempfile
 from scipy.signal import sosfilt, butter, iirnotch
-from src.config import CONFIG, get_config_value  # Adjusted import (from .config if package)
+from src.config import CONFIG, get_config_value, get_config  # Adjusted import (from .config if package)
 import os
 os.environ['TORCH_LOGS'] = ""
 
@@ -177,7 +177,7 @@ def is_artifact_laden(wav_path: str, threshold_hz: float = None, ratio_threshold
         reason = "high_mean" if mean_centroid > threshold_hz else "high_ratio" if high_frames > ratio_threshold else "clean"
         comp_mean = " > " if mean_centroid > threshold_hz else " <= "
         comp_ratio = " > " if high_frames > ratio_threshold else " <= "
-        logger.debug(f"Artifact {Path(wav_path).name}: mean={mean_centroid:.0f}{comp_mean}{threshold_hz}Hz (ratio={high_frames:.2f}{comp_ratio}{ratio_threshold}, dur={dur:.2f}s) – {reason}")
+        # logger.debug(f"Artifact {Path(wav_path).name}: mean={mean_centroid:.0f}{comp_mean}{threshold_hz}Hz (ratio={high_frames:.2f}{comp_ratio}{ratio_threshold}, dur={dur:.2f}s) – {reason}")
 
         return is_bad
     except Exception as e:
@@ -471,45 +471,56 @@ def get_silence(duration: float = 2.0, sr: int = 24000, dtype: torch.dtype = tor
     Notes:
         - Saves/loads to/from cache/fallback/silence_{sr}Hz.wav (one file per SR).
         - Uses torchaudio for save/load (ensures compatibility).
+        - FIXED: Guard against fspath None (all paths str/Path; zeros fallback if fail).
     """
-    cache_dir = Path(get_config_value('app_config.globals.cache_dir')) / "fallback"
-    cache_dir.mkdir(parents=True, exist_ok=True)
+    config = get_config()
+    if hasattr(config, 'app_config') and hasattr(config.app_config, 'globals'):
+        cache_dir_path = Path(config.app_config.globals.cache_dir) / "fallback"
+    else:
+        cache_dir_path = Path("./cache") / "fallback"
+    cache_dir_path.mkdir(parents=True, exist_ok=True)
 
     filename = f"silence_{sr}Hz.wav"
-    silence_path = cache_dir / filename
+    silence_path = cache_dir_path / filename
+    silence_path_str = str(silence_path)  # FIXED: Ensure str for torchaudio (valid PathLike)
 
-    # Check if cached file exists
+    # FIXED: Check if cached file exists (guard before load)
     if silence_path.exists():
         try:
-            logger.debug(f"Loading cached silence: {silence_path}")
-            wav, loaded_sr = torchaudio.load(str(silence_path))
+            logger.debug(f"Loading cached silence: {silence_path_str}")
+            wav, loaded_sr = torchaudio.load(silence_path_str)  # FIXED: str(silence_path) – no None fspath
             if loaded_sr != sr:
-                logger.warning(f"Cached SR {loaded_sr} != requested {sr}; ignoring cache")
+                logger.warning(f"Cached SR {loaded_sr} != requested {sr}; regenerating (ignore cache)")
                 raise ValueError("SR mismatch")
-
             # Load to tensor, reshape to [1, T] if needed, move to device/dtype
             wav = wav.mean(0, keepdim=True) if wav.shape[0] > 1 else wav  # Mono if stereo
             silence = wav.to(device=device, dtype=dtype)
             logger.debug(f"Loaded silence: {silence.shape}, dur={silence.shape[1] / sr:.2f}s")
             return silence
         except Exception as load_e:
-            logger.warning(f"Failed to load cached silence {silence_path}: {load_e}; regenerating")
+            logger.warning(f"Failed to load cached silence {silence_path_str}: {load_e}; regenerating")
 
-    # Create if no cache
-    logger.info(f"Creating new silence cache: {silence_path} (dur={duration}s, sr={sr}Hz)")
+    # FIXED: Create if no cache/file
+    logger.info(f"Creating new silence cache: {silence_path_str} (dur={duration}s, sr={sr}Hz)")
     samples = int(sr * duration)
-    silence_save = torch.zeros((1, samples), dtype=torch.float32)  # Float32 for WAV save
+    silence_save = torch.zeros((1, samples), dtype=torch.float32)  # Float32 for WAV save (CPU implicit)
 
     try:
-        # Save to cache (CPU float32 for persistence)
-        torchaudio.save(str(silence_path), silence_save, sr)
-        logger.debug(f"Saved silence cache: {silence_path}, size={silence_path.stat().st_size / 1024:.1f}KB")
+        # FIXED: Save to cache (explicit str for fspath; CPU for persistence)
+        torchaudio.save(silence_path_str, silence_save, sr)
+        if silence_path.exists() and silence_path.stat().st_size > 0:
+            logger.debug(f"Saved silence cache: {silence_path_str}, size={silence_path.stat().st_size / 1024:.1f}KB")
+        else:
+            logger.warning("Save succeeded but no file/zero-size – fallback in-memory")
     except Exception as save_e:
         logger.error(f"Failed to save silence cache: {save_e}")
-        # Don't raise; proceed to return in-memory tensor
+        # FIXED: Proceed to return in-memory (no raise; zeros safe)
 
-    # Return moved to requested device/dtype
+    # FIXED: Return moved to requested (from save tensor or fresh zeros)
     silence = silence_save.to(device=device, dtype=dtype)
+    if silence.numel() == 0:
+        logger.warning("Silence tensor empty – force zeros")
+        silence = torch.zeros((1, samples), dtype=dtype, device=device)
     logger.debug(f"Returned silence: {silence.shape}, dur={duration}s")
     return silence
 

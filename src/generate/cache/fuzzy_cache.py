@@ -53,6 +53,9 @@ class FuzzyAudioCache:
         self.last_save_time = 0
         self.save_counter = 0
 
+        # FIXED: Base dir for subpath validation (e.g., "cache" root for all audio/output/resampled subpaths)
+        self.base_dir = self.cache_dir.parent  # "cache" – ensures all paths relative to root
+
         # Load existing cache
         self.load_cache()
 
@@ -88,13 +91,7 @@ class FuzzyAudioCache:
             self._save_cache(save_all=True)
 
     def index_audio(self, text: str, wav_path: str, voice_stem: str) -> None:
-        """Add audio to fuzzy cache for future matching.
-
-        Args:
-            text: The text that generated this audio
-            wav_path: Path to the audio file
-            voice_stem: Voice identifier for this audio
-        """
+        """Add audio to fuzzy cache for future matching. FIXED: Ensure absolute path when queuing (subpath safe)."""
         if not self.enable_fuzzy:
             logger.debug("Fuzzy cache disabled in config - skipping index")
             return
@@ -103,15 +100,21 @@ class FuzzyAudioCache:
             logger.debug(f"Skipping index for non-existent path: {wav_path}")
             return
 
+        # FIXED: Ensure wav_path is absolute str (resolve early; prevents relative issues in worker)
+        wav_path_abs = str(Path(wav_path).resolve().absolute())
+        if not Path(wav_path_abs).is_relative_to(self.base_dir):
+            logger.warning(f"Skipping index: Path not in subpath of {self.base_dir}: {wav_path_abs}")
+            return
+
         # Skip very short text
         if len(text.strip()) < self.min_length:
             logger.debug(f"Skipped indexing short text (<{self.min_length}): {text[:10]}")
             return
 
         # Skip artifacts
-        if self.enable_artifact_purge and is_artifact_laden(wav_path, threshold_hz=self.artifact_threshold_hz):
+        if self.enable_artifact_purge and is_artifact_laden(wav_path_abs, threshold_hz=self.artifact_threshold_hz):
             logger.warning(
-                f"Skip fuzzy index: Artifacts in {wav_path} (centroid >{self.artifact_threshold_hz}Hz) for '{text[:20]}' (stem: {voice_stem})"
+                f"Skip fuzzy index: Artifacts in {wav_path_abs} (centroid >{self.artifact_threshold_hz}Hz) for '{text[:20]}' (stem: {voice_stem})"
             )
             return
 
@@ -127,9 +130,9 @@ class FuzzyAudioCache:
                     sim_boost = self.boost_amount
                     break
 
-        # Queue for background processing
+        # Queue for background processing (use abs path)
         try:
-            self.fuzzy_queue.put((text, wav_path, voice_stem, sim_boost), block=False)
+            self.fuzzy_queue.put((text, wav_path_abs, voice_stem, sim_boost), block=False)
             logger.trace(f"Queued fuzzy index: {norm_key[:30]} for {voice_stem}")
         except Exception as e:
             logger.warning(f"Failed to queue fuzzy index: {str(e)}")
@@ -141,17 +144,7 @@ class FuzzyAudioCache:
         stem: str,
         threshold: Optional[float] = None
     ) -> Optional[str]:
-        """Check for fuzzy audio cache hit.
-
-        Args:
-            audio_path: Path to reference audio
-            text_input: Text to match against
-            stem: Voice identifier
-            threshold: Optional similarity threshold override
-
-        Returns:
-            Path to matching audio if found, None otherwise
-        """
+        """Check for fuzzy audio cache hit. FIXED: Return absolute path if valid (subpath safe)."""
         if not self.enable_fuzzy:
             logger.debug("Fuzzy cache disabled in config - skipping check")
             return None
@@ -202,11 +195,27 @@ class FuzzyAudioCache:
                 best_path = entry['wav_path']
 
         # Check if we have a hit
-        if best_sim >= threshold and best_path and os.path.exists(best_path):
+        if best_sim >= threshold and best_path:
+            # FIXED: Resolve best_path to absolute and validate subpath (safety)
+            best_path_abs = str(Path(best_path).resolve().absolute())
+            if not os.path.exists(best_path_abs):
+                logger.debug(f"Fuzzy MISS: Best candidate '{best_path_abs}' doesn't exist")
+                return None
+            if not Path(best_path_abs).is_relative_to(self.base_dir):
+                logger.warning(f"Fuzzy HIT invalid subpath for {best_path_abs} – purging entry")
+                with self.cache_lock:
+                    norm_key = self.normalize_text(best_match)
+                    if stem in self.cache_data and norm_key in self.cache_data[stem]:
+                        del self.cache_data[stem][norm_key]
+                        if not self.cache_data[stem]:
+                            del self.cache_data[stem]
+                self._save_cache(save_all=True)  # Force save after purge
+                return None
+
             # Validate for artifacts if enabled
-            if self.enable_artifact_purge and is_artifact_laden(best_path, threshold_hz=self.artifact_threshold_hz):
+            if self.enable_artifact_purge and is_artifact_laden(best_path_abs, threshold_hz=self.artifact_threshold_hz):
                 logger.warning(
-                    f"Fuzzy HIT invalid: Artifacts in {best_path} (centroid >{self.artifact_threshold_hz}Hz) – purging entry"
+                    f"Fuzzy HIT invalid: Artifacts in {best_path_abs} (centroid >{self.artifact_threshold_hz}Hz) – purging entry"
                 )
                 with self.cache_lock:
                     norm_key = self.normalize_text(best_match)
@@ -220,9 +229,9 @@ class FuzzyAudioCache:
             logger.info(
                 f"Fuzzy cache HIT: '{text_input[:30]}...' ≈ '{best_match[:30]}...' "
                 f"(sim={best_sim:.3f} >= {threshold:.2f}, boost={self.boost_amount}) "
-                f"for stem '{stem}' -> {best_path}"
+                f"for stem '{stem}' -> {best_path_abs}"
             )
-            return best_path
+            return best_path_abs  # FIXED: Return abs str for safety
         else:
             if best_path and not os.path.exists(best_path):
                 logger.debug(f"Fuzzy MISS: Best candidate '{best_path}' doesn't exist")
@@ -239,12 +248,24 @@ class FuzzyAudioCache:
         return f"{text_hash}_{cleaned}"
 
     def _start_index_worker(self) -> None:
-        """Start background thread for async index processing."""
+        """Start background thread for async index processing. FIXED: Path subpath validation in worker (skip invalid)."""
         def worker():
             while True:
                 try:
                     text, wav_path, voice_stem, sim_boost = self.fuzzy_queue.get(timeout=1)
                     orig_text = text
+
+                    # FIXED: Validate wav_path subpath early (skip if not under base_dir – fixes "not in subpath")
+                    wav_path_p = Path(wav_path).resolve()
+                    if not wav_path_p.is_relative_to(self.base_dir):
+                        logger.warning(f"Fuzzy worker skip: Path not in subpath of {self.base_dir}: {wav_path} (stem: {voice_stem})")
+                        self.fuzzy_queue.task_done()
+                        continue
+
+                    if not wav_path_p.exists():
+                        logger.debug(f"Fuzzy worker skip: Path doesn't exist: {wav_path}")
+                        self.fuzzy_queue.task_done()
+                        continue
 
                     # Skip very short text
                     min_length = self.min_length
@@ -254,7 +275,7 @@ class FuzzyAudioCache:
                         continue
 
                     # Skip artifacts (shouldn't happen after pre-filter but double checking)
-                    if self.enable_artifact_purge and is_artifact_laden(wav_path, threshold_hz=self.artifact_threshold_hz):
+                    if self.enable_artifact_purge and is_artifact_laden(str(wav_path_p), threshold_hz=self.artifact_threshold_hz):
                         logger.warning(
                             f"Skip fuzzy index: Artifacts detected during processing for '{orig_text[:20]}' (stem: {voice_stem})"
                         )
@@ -284,9 +305,9 @@ class FuzzyAudioCache:
                                 del self.cache_data[voice_stem][oldest_key]
                                 logger.debug(f"Pruned old entry in {voice_stem} - limit reached")
 
-                            # Add new entry
+                            # Add new entry (use resolved abs path)
                             self.cache_data[voice_stem][norm_key] = {
-                                'wav_path': wav_path,
+                                'wav_path': str(wav_path_p),  # FIXED: Store abs str
                                 'orig_text': orig_text,
                                 'stem': voice_stem,
                                 'sim_boost': sim_boost,
@@ -329,7 +350,7 @@ class FuzzyAudioCache:
         logger.info("Fuzzy cache background indexer started")
 
     def load_cache(self) -> None:
-        """Load fuzzy cache from disk persistence."""
+        """Load fuzzy cache from disk persistence. FIXED: Enhance subpath validation on load (skip invalid relatives)."""
         if not self.cache_file.exists():
             logger.debug("No fuzzy cache file – starting empty")
             return
@@ -351,28 +372,34 @@ class FuzzyAudioCache:
                             purged_count += 1
                             continue
 
-                        # Convert relative to absolute path
+                        # FIXED: Convert relative to absolute and validate subpath
                         rel_path = entry['wav_path']
                         full_path = Path(rel_path)
                         if not full_path.is_absolute():
-                            full_path = self.cache_dir.parent / "audio" / rel_path
+                            full_path = self.base_dir / rel_path  # FIXED: Resolve from base_dir ("cache")
 
-                        # Skip invalid paths
-                        if not full_path.exists():
-                            logger.trace(f"Skipped invalid path: {stem}:{norm_key} ({full_path})")
+                        full_path_res = full_path.resolve()
+                        if not full_path_res.exists():
+                            logger.trace(f"Skipped invalid path: {stem}:{norm_key} ({full_path_res})")
+                            purged_count += 1
+                            continue
+
+                        # FIXED: Subpath check on resolved path
+                        if not full_path_res.is_relative_to(self.base_dir):
+                            logger.warning(f"Load skip: Path not in subpath of {self.base_dir}: {full_path_res} ({stem}:{norm_key})")
                             purged_count += 1
                             continue
 
                         # Skip artifact-laden files
-                        if self.enable_artifact_purge and is_artifact_laden(str(full_path), self.artifact_threshold_hz):
+                        if self.enable_artifact_purge and is_artifact_laden(str(full_path_res), self.artifact_threshold_hz):
                             logger.warning(
-                                f"Load-time purge: Artifacts in {full_path} for {stem}:{norm_key} – skipping"
+                                f"Load-time purge: Artifacts in {full_path_res} for {stem}:{norm_key} – skipping"
                             )
                             purged_count += 1
                             continue
 
                         # Store valid entry
-                        entry['wav_path'] = str(full_path)
+                        entry['wav_path'] = str(full_path_res)  # FIXED: Abs str
                         self.cache_data[stem][norm_key] = entry
                         total_entries += 1
 
@@ -396,7 +423,7 @@ class FuzzyAudioCache:
             self.cache_data = {}
 
     def _save_cache(self, save_all: bool = False) -> None:
-        """Save fuzzy cache to disk with throttling."""
+        """Save fuzzy cache to disk with throttling. FIXED: Ensure valid relatives on save (subpath safe)."""
         now = time.time()
         if not save_all and (now - self.last_save_time) < self.save_interval:
             return
@@ -422,6 +449,14 @@ class FuzzyAudioCache:
                             purged_count += 1
                             continue
 
+                        # FIXED: Subpath validation on save (purge if invalid)
+                        wav_path_p = Path(wav_path).resolve()
+                        if not wav_path_p.is_relative_to(self.base_dir):
+                            logger.warning(f"Save-time purge: Path not in subpath of {self.base_dir}: {wav_path} – deleting entry")
+                            del self.cache_data[stem][norm_key]
+                            purged_count += 1
+                            continue
+
                         # Remove entries with artifacts
                         if is_artifact_laden(wav_path, threshold_hz=self.artifact_threshold_hz):
                             del self.cache_data[stem][norm_key]
@@ -439,9 +474,12 @@ class FuzzyAudioCache:
 
                 save_data[stem] = {}
                 for norm_key, entry in stem_entries.items():
-                    # Convert absolute path to relative path
-                    abs_path = Path(entry['wav_path'])
-                    rel_path = abs_path.relative_to(self.cache_dir.parent)
+                    # FIXED: Ensure abs wav_path; compute relative safely
+                    abs_path = Path(entry['wav_path']).resolve()
+                    if not abs_path.is_relative_to(self.base_dir):
+                        logger.warning(f"Save skip: Invalid subpath for {abs_path} – purging")
+                        continue  # Skip bad entry
+                    rel_path = abs_path.relative_to(self.base_dir)
                     save_entry = entry.copy()
                     save_entry['wav_path'] = str(rel_path)
                     save_data[stem][norm_key] = save_entry

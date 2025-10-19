@@ -1,7 +1,9 @@
+# src/generate/cache/cache_manager.py (Corrected: Use safe config.app_config.globals access in all methods; no device/dtype kwargs in get_voice_params)
 from typing import Dict, Any, Optional, Tuple
 import hashlib
 import os
 
+import torch
 import torchaudio
 from pathlib import Path
 import time
@@ -12,7 +14,7 @@ from src.config import get_config_value, get_config
 from .audio_cache import AudioCache
 from .conditionals_cache import ConditionalsCache
 from .fuzzy_cache import FuzzyAudioCache
-from .voice_reference import VoiceReferenceCache
+from .voice_reference import VoiceReferenceCache, VoiceReferenceEntry
 from ...audio_utils import is_artifact_laden
 from ...normalize_stem import normalize_stem
 
@@ -101,7 +103,7 @@ class CacheManager:
         return stem or "default"
 
     def validate_voice_prompt(self, audio_path: str, voice_stem: str = "default") -> Tuple[bool, str]:
-        """Validate a voice prompt against audio requirements."""
+        """Validate a voice prompt against audio requirements. FIXED: Safe globals access (no kwargs to voice_reference)."""
         if not audio_path or not os.path.exists(audio_path):
             return False, "Path does not exist"
 
@@ -112,86 +114,72 @@ class CacheManager:
                 return True, "Remote validated recently"
             self._last_validation[audio_path] = time.time()
 
-        # Use the voice reference cache's validation (which handles resampled versions)
-        is_valid = self.voice_reference.validate_reference_file(audio_path, voice_stem)
+        # FIXED: Get globals safely (no kwargs to validate_reference_file – assume it uses config internals)
+        config = get_config()
+        sr = getattr(config.app_config.globals, 'sr', 24000) if hasattr(config, 'app_config') and hasattr(config.app_config, 'globals') else 24000
+        is_valid = self.voice_reference.validate_reference_file(audio_path, voice_stem, sr=sr)  # FIXED: No device/dtype kwargs (use internals)
         return is_valid, "Valid" if is_valid else "Invalid voice reference"
 
     def process_voice_reference(self, audio_path: str, voice_stem: str, force: bool = False) -> Tuple[
-        str, str, str, Dict[str, Any]]:
+        str, str, str, Dict[str, Any], Optional[VoiceReferenceEntry]]:
         """
-        Process a voice reference file through the voice cache (handles hashing, reuse, resampling, and conds key).
-        Returns: (processed_path, content_hash_str, conds_key, voice_params)
-        - processed_path: Resampled/processed path for use in pipeline (reuse if HIT).
-        - content_hash_str: Empty '' (handled internally; no need to return for caller).
-        - conds_key: Key for conditionals cache.
-        - voice_params: Voice-specific parameters from config.
-
-        On HIT: Reuse processed_path and conds_key (fast, no reprocess).
-        On MISS: Process (resample/save/update cache) and return new.
+        Wrapper; SIMPLIFIED: Norm stem on input; call process_new_reference; return tuple + hit_entry.
+        FIXED: No device/dtype kwargs in get_voice_params (dict for params only).
         """
         if not audio_path or not os.path.exists(audio_path):
-            logger.warning(f"Invalid audio path for voice reference: {audio_path}")
-            return audio_path, '', 'fallback_key', {}  # Fallback to raw/empty
+            logger.warning(f"Invalid voice path: {audio_path}")
+            voice_params = self.config.get_voice_params('default', {'exaggeration': 1.0})  # FIXED: Dict for params (no device/dtype kwargs)
+            return audio_path, '', 'fallback_key', voice_params, None
 
-        # Normalize stem if not provided (fallback to default)
-        if not voice_stem:
-            voice_stem = normalize_stem(audio_path) or 'default'
-            logger.debug(f"Derived voice stem: '{voice_stem}' from {audio_path}")
+        # SIMPLIFIED: Always derive norm_stem (stable)
+        voice_stem = self.voice_reference.normalize_stem(audio_path) or voice_stem or 'default'
+        logger.debug(f"Process voice under stable norm_stem '{voice_stem}'")
 
-        # Basic validation (dur/artifacts; delegate to voice cache for full)
+        # Basic validation (min dur/artifacts)
         config = get_config()
         min_duration = get_config_value('globals.min_ref_duration', 3.0)
         try:
             info = torchaudio.info(audio_path)
             duration = info.num_frames / info.sample_rate
             if duration < min_duration:
-                logger.warning(f"Voice {voice_stem}: Duration {duration:.2f}s < required {min_duration}s – fallback")
-                return audio_path, '', 'short_fallback_key', config.get_voice_params(voice_stem, {})
+                logger.warning(f"Short {voice_stem}: {duration:.2f}s")
+                voice_params = config.get_voice_params(voice_stem, {})  # FIXED: Dict for params (no device/dtype kwargs)
+                return audio_path, '', 'short_fallback_key', voice_params, None
 
-            # Artifact check (optional)
-            if get_config_value('globals.check_artifacts', True) and is_artifact_laden(audio_path,
-                                                                                       threshold_hz=config.app_config.globals.sr // 3):
-                logger.warning(f"Voice {voice_stem}: Artifacts detected – fallback but flag for purge")
-                # Optional: Purge from cache if exists
-                if hasattr(self, 'voice_reference') and voice_stem in self.voice_reference.voice_cache:
-                    self.voice_reference.voice_cache.pop(voice_stem, None)
-                    logger.info(f"Purged artifact-laden entry for {voice_stem}")
+            if get_config_value('globals.check_artifacts', True):
+                threshold = getattr(config.app_config.globals, 'sr', 24000) // 3 if hasattr(config, 'app_config') and hasattr(config.app_config, 'globals') else 8000
+                if is_artifact_laden(audio_path, threshold_hz=threshold):
+                    logger.warning(f"Artifacts {voice_stem}; purge if cached")
+                    if voice_stem in self.voice_reference.voice_cache:
+                        self.voice_reference.voice_cache.pop(voice_stem, None)
         except Exception as v_e:
-            logger.warning(f"Validation failed for {voice_stem}: {v_e} – proceed with raw")
-            return audio_path, '', 'invalid_fallback_key', config.get_voice_params(voice_stem, {})
+            logger.warning(f"Validation fail {voice_stem}: {v_e}")
+            voice_params = config.get_voice_params(voice_stem, {})  # FIXED: Dict for params (no device/dtype kwargs)
+            return audio_path, '', 'invalid_fallback_key', voice_params, None
 
-        # Call voice reference cache (handles probe/tiers/reuse/resample/conds key)
-        if not hasattr(self, 'voice_reference') or not self.voice_reference:
-            logger.error("VoiceReferenceCache not initialized – fallback to raw")
-            voice_params = config.get_voice_params(voice_stem, {})
-            return audio_path, '', f'{voice_stem}_nocache_key', voice_params
-
-        voice_cache = self.voice_reference
-        success, processed_path, cond_key, voice_params, entry = voice_cache.process_new_reference(
+        # Call with stable norm_stem
+        success, processed_path, conds_key, voice_params, hit_entry = self.voice_reference.process_new_reference(
             voice_stem, audio_path, force_update=force
         )
 
         if not success:
-            logger.error(f"Voice cache processing failed for {voice_stem}; fallback to raw")
-            # Purge stem if corrupted/misbehaved
-            if voice_stem in voice_cache.voice_cache:
-                voice_cache.voice_cache.pop(voice_stem, None)
-                voice_cache.save_cache()
-                logger.info(f"Purged failed entry for {voice_stem}")
-            return audio_path, '', f'{voice_stem}_fail_key', voice_params
+            logger.error(f"Process fail {voice_stem}; purge")
+            if voice_stem in self.voice_reference.voice_cache:
+                self.voice_reference.voice_cache.pop(voice_stem, None)
+                self.voice_reference.save_cache()
+            voice_params = config.get_voice_params(voice_stem, {})  # FIXED: Dict for params (no device/dtype kwargs)
+            return audio_path, '', f'{voice_stem}_fail_key', voice_params, None
 
-        # Success: Use processed (reuse or new resampled)
-        if entry:
-            logger.debug(
-                f"Voice process HIT for {voice_stem}: Reuse entry (processed: {processed_path}, conds: {cond_key[:20]}...)")
+        if hit_entry:
+            logger.info(f"Voice HIT/reuse {voice_stem} (stable norm)")
         else:
-            logger.info(
-                f"Voice MISS → processed for {voice_stem}: {processed_path} (new conds key: {cond_key[:20]}...)")
+            logger.info(f"Voice MISS/process {voice_stem} (new stable norm)")
 
-        # Return (no content_hash needed; internal to voice_cache)
-        return processed_path, '', cond_key, voice_params
+        if not success or not processed_path:
+            # Fallback str
+            processed_path = audio_path if os.path.exists(audio_path) else ''
 
-
+        return str(processed_path), '', conds_key, voice_params, hit_entry
 
     def _compute_content_hash(self, audio_path: str) -> str:
         """Helper: Compute MD5 hash of file for caching (safe fallback)."""
@@ -205,30 +193,36 @@ class CacheManager:
             return hashlib.md5(str(audio_path).encode('utf-8')).hexdigest()
 
     def get_conditionals(self, conditionals_key: str, model: Any) -> bool:
-        """Load conditionals from cache system (memory or disk)."""
+        """Load conditionals from cache system (memory or disk). FIXED: Safe globals access (no kwargs issues)."""
         if not conditionals_key:
             return False
 
+        config = get_config()
+        device = getattr(config.app_config.globals, 'device', torch.device('cuda' if torch.cuda.is_available() else 'cpu')) if hasattr(config, 'app_config') and hasattr(config.app_config, 'globals') else torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        dtype = getattr(config.app_config.globals, 'dtype', torch.float32) if hasattr(config, 'app_config') and hasattr(config.app_config, 'globals') else torch.float32
         return self.conditionals_cache.get(
             cache_key=conditionals_key,
             model=model,
-            device=self.config.app_config.globals.device,
-            dtype=self.config.app_config.globals.dtype
+            device=device,
+            dtype=dtype
         ) is not None
 
     def save_conditionals(self,
                          conditionals_key: str,
                          model: Any) -> bool:
-        """Save conditionals to cache system."""
+        """Save conditionals to cache system. FIXED: Safe globals access."""
         if not conditionals_key or model is None or not hasattr(model, 'conds'):
             return False
 
+        config = get_config()
+        device = getattr(config.app_config.globals, 'device', torch.device('cuda' if torch.cuda.is_available() else 'cpu')) if hasattr(config, 'app_config') and hasattr(config.app_config, 'globals') else torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        dtype = getattr(config.app_config.globals, 'dtype', torch.float32) if hasattr(config, 'app_config') and hasattr(config.app_config, 'globals') else torch.float32
         return self.conditionals_cache.save(
             cache_key=conditionals_key,
             conditionals=model.conds,
             model=model,
-            device=self.config.app_config.globals.device,
-            dtype=self.config.app_config.globals.dtype
+            device=device,
+            dtype=dtype
         )
 
     def get_audio_cache(self, cache_key: str) -> Optional[str]:
@@ -280,3 +274,5 @@ class CacheManager:
             "fuzzy_cache": self.fuzzy_cache.get_stats(),
             "voice_reference": self.voice_reference.get_stats()
         }
+
+

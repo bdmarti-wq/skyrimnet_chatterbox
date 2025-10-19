@@ -287,7 +287,7 @@ def prepare_generation_params(text: str, audio_prompt_path: Optional[str], exagg
      seed_num = int(seed_num or 42)
 
      voice_stem = get_voice_stem(audio_prompt_path)  # Use existing helper
-     voice_params = config.get_merged_audio_params(voice_name=voice_stem)
+     voice_params = config.get_voice_params(voice_name=voice_stem)
      text = pad_short_text(text, voice_params)
 
      t3_params = {
