@@ -194,11 +194,6 @@ class GenerationPhase(BaseGenerationPhase):
             # FIXED: Scalar bool guard (e.g., valid_audio check)
             # Example: if torch.all(wav > -1e-6): → if torch.all(wav > -1e-6).item()
 
-            # Purge model.conds to force fresh load next time   TODO review this
-            context.model.conds = None
-            torch.cuda.empty_cache()  # Clear GPU memory (safe, minor perf hit)
-            logger.debug(f"Post-gen state cleared for {context.voice_stem}")
-
             context.generated_wav = wav
             context.audio_duration = len(wav.squeeze(0)) / context.sr
             logger.info(f"Generation success: {context.audio_duration:.2f}s WAV @ {context.sr}Hz")

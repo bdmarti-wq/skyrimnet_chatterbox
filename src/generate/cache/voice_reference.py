@@ -564,7 +564,7 @@ class VoiceReferenceCache:
             # FIXED: Stable filename with norm_stem
             norm_stem = self.normalize_stem(raw_path)
             resampled_path = self.resampled_dir / f"{norm_stem}_{MODEL_SR}Hz.wav"
-            waveform = waveform.to(device=device, dtype=dtype)
+            waveform = waveform.to(device=device, dtype=torch.float32)
             torchaudio.save(resampled_path, waveform, MODEL_SR)
 
             if resampled_path.exists() and resampled_path.stat().st_size > 0:
