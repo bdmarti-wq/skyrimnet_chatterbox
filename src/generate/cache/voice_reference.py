@@ -549,33 +549,63 @@ class VoiceReferenceCache:
         else:
             return True, current_hash, full_new, None
 
-    def _resample_and_save_persistent(self, stem: str, raw_path: str, device=torch.device('cpu'), dtype=torch.float32, sr=24000) -> Optional[str]:
-        """Resample/save. FIXED: Safe device/dtype/sr params."""
+    def _resample_and_save_persistent(self, stem: str, raw_path: str, device=torch.device('cpu'), dtype=torch.float32,
+                                      sr=24000) -> Optional[str]:
+        """Resample/save. FIXED: Full CPU tensor enforcement for torchaudio.save (no GPU tensors); shape handling for mono; robust validation."""
         try:
+            # Load waveform (may be on GPU from prior load; force CPU early for all ops)
             waveform, sr_orig = torchaudio.load(raw_path)
+
+            # FIXED: Always to CPU post-load (numpy/ torchaudio.save compatibility)
+            if isinstance(waveform, torch.Tensor) and waveform.device.type == 'cuda':
+                waveform = waveform.cpu()
+
+            # FIXED: Ensure mono (mean channels if stereo) and float32 dtype for resample
             if waveform.dim() > 1:
-                waveform = waveform.mean(0, keepdim=True)
+                waveform = waveform.mean(0, keepdim=True)  # Mono: [1, frames]
+            else:
+                waveform = waveform.unsqueeze(0)  # Ensure [1, frames]
+            waveform = waveform.float()  # Resample expects float32; not dtype param
 
+            # Resample only if needed (use model SR constant)
             if sr_orig != MODEL_SR:
-                resampler = torchaudio.transforms.Resample(sr_orig, MODEL_SR)
-                waveform = resampler(waveform.cpu())
-                logger.debug(f"Resampled {stem} {sr_orig}→{MODEL_SR}Hz")
+                resampler = torchaudio.transforms.Resample(orig_freq=sr_orig, new_freq=MODEL_SR)
+                waveform = resampler(waveform)  # Already CPU; stays CPU
+                logger.debug(f"Resampled {stem} {sr_orig}→{MODEL_SR}Hz (dur post: {waveform.shape[1] / MODEL_SR:.2f}s)")
 
-            # FIXED: Stable filename with norm_stem
+            # FIXED: Stable filename with norm_stem (your code)
             norm_stem = self.normalize_stem(raw_path)
             resampled_path = self.resampled_dir / f"{norm_stem}_{MODEL_SR}Hz.wav"
-            waveform = waveform.to(device=device, dtype=torch.float32)
+
+            # FIXED: Save on CPU only (torchaudio.save requires CPU tensors; no .to(device) here!)
+            # If device needed later (e.g., for conds prep), handle in prepare_conditionals
             torchaudio.save(resampled_path, waveform, MODEL_SR)
 
-            if resampled_path.exists() and resampled_path.stat().st_size > 0:
-                logger.info(f"Resampled: {resampled_path}")
-                return str(resampled_path)
+            # Validate saved file (non-empty, correct SR)
+            if resampled_path.exists():
+                file_size = resampled_path.stat().st_size
+                if file_size > 0:
+                    # Quick SR check
+                    verify_info = torchaudio.info(resampled_path)
+                    if verify_info.sample_rate == MODEL_SR:
+                        logger.debug(f"Resampled success: {stem} → {resampled_path} ({file_size / 1024:.1f}KB)")
+                        return str(resampled_path)
+                    else:
+                        resampled_path.unlink()
+                        logger.warning(f"SR validation failed for {stem}; deleted invalid")
+                else:
+                    resampled_path.unlink()
+                    logger.warning(f"Empty resample for {stem}; deleted")
+            else:
+                logger.warning(f"Resample save path missing for {stem}")
 
-            logger.warning(f"Resample empty for {stem}")
-            return None
+            return None  # Error: Caller falls back to raw_path
+
         except Exception as re:
-            logger.error(f"Resample error {stem}: {re}")
-            return None
+            logger.error(f"Resample error {stem}: {re} – fallback to original")
+            return None  # Caller (process_new_reference) uses raw_path
+
+
 
     def _generate_conditionals_key(self, voice_stem: str, audio_path: str, voice_config: Dict[str, Any]) -> str:
         """Generate conds key."""
