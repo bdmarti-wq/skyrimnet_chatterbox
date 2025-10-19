@@ -54,15 +54,9 @@ class VoiceProcessingPhase(GenerationPhase):
             logger.warning("No model – dummy fallback")
             return context
 
-        # FIXED: Clear state at start (prevent bleed from prior gen)
-        if hasattr(context.model, 'conds'):
-            context.model.conds = None
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()  # Minimal perf hit
-        logger.debug(f"Cleared state for {context.voice_stem}")
+        # No unconditional clear here – allow preserved conds from prior phases if applicable (anti-bleed handled by cache uniqueness)
 
         model = context.model
-
 
         conds_key = context.conds_key or context.conditionals_key
         processed_path = context.processed_voice_path
@@ -87,8 +81,9 @@ class VoiceProcessingPhase(GenerationPhase):
         if conds_key and self.cache_manager and self.cache_manager.get_conditionals(conds_key, model):
             logger.info(f"VoiceProcessing: Conds HIT for {voice_stem} from key {conds_key[:20]}...")
             # Quick validate (move to device if loaded raw)
-            if hasattr(model.conds, 'speaker_emb'):
-                model.conds = model.conds.to(device=device, dtype=dtype)
+            if hasattr(model.conds, 't3') and hasattr(model.conds.t3, 'speaker_emb'):
+                model.conds = model.conds.t3.to(device=device)
+
             context.conds_key = conds_key
             # Success – return
             time_taken = time.perf_counter() - start_time

@@ -130,6 +130,7 @@ class ConditionalsCache:
         self.stats["misses"] += 1
         return None
 
+
     def _is_empty_conditionals(self, conditionals: Any) -> bool:
         """Helper: Check if conditionals are empty/invalid."""
         if conditionals is None:
@@ -186,12 +187,13 @@ class ConditionalsCache:
             return False
 
     def _get_or_prepare(self, model, audio_path: str, exag: float, device: str, dtype: torch.dtype, cache_key: str) -> \
-    Optional[Any]:
-        """NEW: Get from cache or prepare inline (for integration: tries load, preps if miss, saves)."""
-        conds = self.get(cache_key, model, device, dtype)
-        if conds is not None:
-            logger.debug(f"Conds HIT from cache for key {cache_key[:20]}...")
-            return conds
+            Optional[Any]:
+        """NEW: Atomic prepare with cache (_get_or_prepare); returns conds if success (loaded or fresh). FIXED: Eager/sync; set conds_loaded flag."""
+        with self.cache_lock:
+            conds = self.get(cache_key, model, device, dtype)
+            if conds is not None:
+                logger.debug(f"Conds HIT from cache for key {cache_key[:20]}...")
+                return conds
 
         # Miss: Prepare + cache (caller must have valid path)
         try:
