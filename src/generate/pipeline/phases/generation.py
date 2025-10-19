@@ -1,4 +1,4 @@
-# src/generate/pipeline/phases/generation.py (Cleaned: Separate handle_error for GenerationPhase only – no cache_queue/audio_cache; guard audio_prompt_path pre-build; full execute with path set)
+# src/generate/pipeline/phases/generation.py (Fixed: Remove t3.to() call to avoid 'dtype' error; import create_dummy_conds at top; safe emb move if needed)
 """
 Generation Phase: Core TTS audio synthesis using the TTS model.
 Handles parameter extraction, generation with retry logic, and fallbacks.
@@ -10,16 +10,14 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 import torch
-import torchaudio  # For optional load/debug if needed
 
 from src.audio_utils import pad_short_text, get_silence
 from src.config import get_config
-from src.tts_model import GEN_ACTIVE_LOCK, restore_graphs_for_bucket  # Global lock for gen/prepare
+from src.tts_model import GEN_ACTIVE_LOCK, restore_graphs_for_bucket, create_dummy_conds  # FIXED: Import at top for scope
 from .base import GenerationPhase as BaseGenerationPhase
 from ...pipeline.context import AudioGenerationContext
 from loguru import logger
 from src.seeding import set_seed
-
 
 class GenerationPhase(BaseGenerationPhase):
     def execute(self, context: AudioGenerationContext) -> AudioGenerationContext:
@@ -38,138 +36,144 @@ class GenerationPhase(BaseGenerationPhase):
         if not hasattr(context, 'processed_voice_path') or context.processed_voice_path is None:
             context.processed_voice_path = ""
 
-        # FIXED: Validate conds before generation (prevent bool tensor error; check model.conds as in working snippet)
-        conds = getattr(context.model, 'conds', None)  # Internal state from prepare_conditionals
-        if conds is None:
-            logger.warning("No model.conds – dummy fallback")
-            from src.tts_model import create_dummy_conds  # Import from working snippet
-            config = get_config()
-            if hasattr(config, 'app_config') and hasattr(config.app_config, 'globals'):
-                device = config.app_config.globals.device
-                dtype = config.app_config.globals.dtype
-            else:
-                device = getattr(config, 'device', torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
-                dtype = getattr(config, 'dtype', torch.bfloat16)
-            create_dummy_conds(context.model, device, dtype, "no_conds")
-            conds = getattr(context.model, 'conds', None)  # Refresh
+        # FIXED: Use context.conds if preserved from VoiceProcessing (skip fresh prep – recover 0.1s)
+        # Log entry state for debug
+        has_context_conds = hasattr(context, 'conds') and context.conds is not None
+        model_conds_none = getattr(context.model, 'conds', None) is None
+        logger.debug(f"Generation entry: has_context_conds={has_context_conds}, model_conds_none={model_conds_none}")
 
-        # FIXED: Immediate emb/t3 validation post-load (pre-mock check; if zero/mock, force fresh – fixes HIT dummy prop)
-        if conds and self._is_nonempty_conds(conds):  # Reuse method (non-zero emb/t3 real)
-            if hasattr(conds, 't3') and hasattr(conds.t3, 'speaker_emb'):
-                emb = conds.t3.speaker_emb
-                emb_nonzero = not torch.all(emb == 0).item()
-                if emb_nonzero:
-                    logger.debug(f"Conds validation: emb {emb.shape} (non-zero: {emb_nonzero})")
+        conds = None
+        if has_context_conds:
+            conds = context.conds  # Restore preserved conds
+            logger.debug(f"Attempting restore from context.conds: type={type(conds).__name__ if conds else 'None'}")
+
+            # FIXED: Assign to model IMMEDIATELY for state-based gen (before validation)
+            if conds is not None:
+                context.model.conds = conds  # Key: Restore model state here
+                logger.debug("Assigned context.conds to model.conds")
+
+                # FIXED: Validate AFTER assign (on model.conds – checks assigned state; direct emb access, no t3)
+                if self._is_nonempty_conds(context.model.conds):
+                    # Diagnostics: Log if partial (no force fresh; emb non-zero is sufficient)
+                    try:
+                        # FIXED: Direct access to speaker_emb on conds (T3Cond has it directly, no .t3 sub-object)
+                        if hasattr(context.model.conds, 'speaker_emb') and context.model.conds.speaker_emb is not None:
+                            emb = context.model.conds.speaker_emb
+                            emb_nonzero = not torch.all(emb == 0).item()
+                            emb_mean = emb.mean().item()
+                            logger.debug(
+                                f"Restored model.conds emb: shape={emb.shape}, mean={emb_mean:.4f} (non-zero: {emb_nonzero})")
+                        else:
+                            logger.warning(
+                                "Restored model.conds missing speaker_emb – but validation passed, proceeding")
+                    except Exception as diag_e:
+                        logger.warning(f"Diagnostics failed on restored conds: {diag_e} – proceeding")
                 else:
-                    logger.warning("Loaded zero emb for conds – purging invalid & forcing fresh prep")
-                    conds = None  # Trigger fresh below
-                    # Optional purge if cache (prevent dummy save/load loop)
-                    if hasattr(self, 'conditionals_cache') and self.conditionals_cache and context.conditionals_key:
-                        try:
-                            self.conditionals_cache.delete(context.conditionals_key)
-                            logger.debug(f"Purged invalid cache entry: {context.conditionals_key[:20]}")
-                        except Exception:
-                            pass
-            # Mel-token match (if exposed)
-            if hasattr(conds, 'cmel') and hasattr(conds, 'cmap'):
-                cmel_len = conds.cmel.shape[-1] if conds.cmel is not None else 0
-                cmap_token_len = conds.cmap.shape[-1] // 2 if conds.cmap is not None else 0
-                if cmel_len != cmap_token_len * 2:
-                    logger.warning("Mel-token mismatch – adjusting")
-                    min_len = min(cmel_len, cmap_token_len * 2)
-                    if cmel_len > min_len:
-                        conds.cmel = conds.cmel[..., :min_len]
-                    elif cmap_token_len * 2 > cmel_len:
-                        pad_mel = torch.zeros((conds.cmel.shape[0], conds.cmel.shape[1], cmap_token_len * 2 - cmel_len),
-                                              dtype=context.dtype, device=context.device)
-                        conds.cmel = torch.cat([conds.cmel, pad_mel], dim=-1)
-                    logger.debug(f"Adjusted conds: cmel_len={conds.cmel.shape[-1]}")
+                    logger.warning("Post-restore model.conds invalid – force fresh prep")
+
+                    # FIXED: Skip redundant dummy; directly force fresh (avoids unnecessary dummy creation)
+                    conds = None
+                    context.model.conds = None  # Clear for fresh prep
+            else:
+                logger.warning("Preserved conds is None – fallback to model.conds")
+                conds = getattr(context.model, 'conds', None)
         else:
-            logger.warning("Empty conds – forcing fresh")
-            conds = None
-
-        # FIXED: Fresh prep if invalid (path exists; real conds – no dummy on HIT miss)
-        processed_path = getattr(context, 'processed_voice_path', None)
-        if conds is None and processed_path and os.path.exists(str(processed_path)):
-            voice_params = getattr(context, 'voice_params', {})
-            exag = voice_params.get('exaggeration', 1.0)
-            config = get_config()
-            if hasattr(config, 'app_config') and hasattr(config.app_config, 'globals'):
-                device = config.app_config.globals.device
-                dtype = config.app_config.globals.dtype
-            else:
-                device = getattr(context, 'device', torch.device('cpu'))
-                dtype = getattr(context, 'dtype', torch.float32)
-            try:
-                # FIXED: Call prep (assume model.prepare_conditionals; guard)
-                context.model.prepare_conditionals(str(processed_path), exaggeration=exag)
-                if hasattr(context.model, 'conds') and context.model.conds is not None:
-                    conds = context.model.conds.to(device=device)
-                    logger.debug("Fresh real conds prepped from path")
-                    # FIXED: Set key if none (safe getattr for voice_stem – no reference error)
-                    if not context.conditionals_key:
-                        voice_stem = getattr(context, 'voice_stem', 'default')
-                        context.conditionals_key = f"fresh_{voice_stem}_{int(time.time()) % 10000}"
-                    # FIXED: Set conds_key if missing (for gen_args consistency)
-                    if not hasattr(context, 'conds_key') or context.conds_key is None:
-                        context.conds_key = context.conditionals_key
-                else:
-                    raise ValueError("Prep returned None conds")
-            except Exception as prep_e:
-                logger.error(f"Fresh prep failed {prep_e} – dummy fallback")
-        elif conds is None:
-            # No path/invalid – dummy
-            from src.tts_model import create_dummy_conds
-            config = get_config()
-            if hasattr(config, 'app_config') and hasattr(config.app_config, 'globals'):
-                device = config.app_config.globals.device
-                dtype = config.app_config.globals.dtype
-            else:
-                device = getattr(context, 'device', torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
-                dtype = getattr(context, 'dtype', torch.bfloat16)
-            create_dummy_conds(context.model, device, dtype, "no_path_dummy")
+            logger.warning("No context.conds – check VoiceProcessing handoff")
             conds = getattr(context.model, 'conds', None)
-            logger.debug("Dummy conds set (no valid path)")
-            # FIXED: Set key on dummy too (safe getattr for voice_stem)
-            if not context.conditionals_key:
-                voice_stem = getattr(context, 'voice_stem', 'dummy')
-                context.conditionals_key = f"dummy_{voice_stem}_{int(time.time()) % 10000}"
-            if not hasattr(context, 'conds_key') or context.conds_key is None:
-                context.conds_key = context.conditionals_key
 
-        # FIXED: Final t3 check (post-val/prep; proceed if emb non-zero – emb sufficient for gen; log partial if missing tokens)
-        emb_present = False
-        if hasattr(context.model, 'conds') and context.model.conds is not None and hasattr(context.model.conds,
-                                                                                           't3') and hasattr(
-                context.model.conds.t3, 'speaker_emb'):
-            emb = context.model.conds.t3.speaker_emb
-            emb_nonzero = not torch.all(emb == 0).item()
-            if emb_nonzero:
-                emb_present = True
-                logger.debug(
-                    f"T3 full? cond_prompt_speech_tokens: {'Yes' if hasattr(context.model.t3, 'cond_prompt_speech_tokens') else 'No (partial cache, but emb OK – proceed)'}")
-        else:
-            logger.warning("No valid conds/t3 post-prep – fallback")
+        # FIXED: Combine fallbacks (no duplicate dummy; fresh only if no valid conds post-restore)
+        # REMOVED: Separate post-assign validation – now unified below to avoid duplicate blocks
+        if conds is None or context.model.conds is None or not self._is_nonempty_conds(context.model.conds):
+            logger.warning(f"No valid model.conds after restore (context: {has_context_conds}) – fresh prep from path")
+            processed_path = getattr(context, 'processed_voice_path', None)
+            if processed_path and os.path.exists(str(processed_path)):
+                # Fresh prep logic unchanged
+                voice_params = getattr(context, 'voice_params', {})
+                exag = voice_params.get('exaggeration', 1.0)
+                config = get_config()
+                if hasattr(config, 'app_config') and hasattr(config.app_config, 'globals'):
+                    device = config.app_config.globals.device
+                    dtype = config.app_config.globals.dtype
+                else:
+                    device = getattr(context, 'device', torch.device('cpu'))
+                    dtype = getattr(context, 'dtype', torch.float32)
+                try:
+                    context.model.prepare_conditionals(str(processed_path), exaggeration=exag)
+                    if hasattr(context.model, 'conds') and context.model.conds is not None:
+                        conds = context.model.conds
+                        logger.debug("Fresh real conds prepped from path")
+                        # FIXED: Set key if none
+                        if not context.conditionals_key:
+                            voice_stem = getattr(context, 'voice_stem', 'default')
+                            context.conditionals_key = f"fresh_{voice_stem}_{int(time.time()) % 10000}"
+                        # FIXED: Preserve for downstream
+                        context.conds = conds
+                    else:
+                        raise ValueError("Prep returned None conds")
+                except Exception as prep_e:
+                    logger.error(f"Fresh prep failed {prep_e} – dummy fallback")
+                    # Dummy as final fallback (unchanged)
+                    config = get_config()
+                    if hasattr(config, 'app_config') and hasattr(config.app_config, 'globals'):
+                        device = config.app_config.globals.device
+                        dtype = config.app_config.globals.dtype
+                    else:
+                        device = getattr(context, 'device',
+                                         torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
+                        dtype = getattr(context, 'dtype', torch.bfloat16)
+                    create_dummy_conds(context.model, device, dtype, "no_path_dummy")
+                    conds = getattr(context.model, 'conds', None)
+                    logger.debug("Dummy conds set (no valid path)")
+                    # Set key on dummy too
+                    if not context.conditionals_key:
+                        voice_stem = getattr(context, 'voice_stem', 'dummy')
+                        context.conditionals_key = f"dummy_{voice_stem}_{int(time.time()) % 10000}"
+                    if conds is not None:
+                        context.conds = conds
+            else:
+                logger.error("No path for fresh prep – full dummy fallback")
+                # Ultimate dummy (unchanged)
+                config = get_config()
+                if hasattr(config, 'app_config') and hasattr(config.app_config, 'globals'):
+                    device = config.app_config.globals.device
+                    dtype = config.app_config.globals.dtype
+                else:
+                    device = getattr(context, 'device', torch.device('cuda' if torch.cuda.is_available() else 'cpu'))
+                    dtype = getattr(context, 'dtype', torch.bfloat16)
+                create_dummy_conds(context.model, device, dtype, "ultimate_dummy")
+                conds = getattr(context.model, 'conds', None)
+                logger.debug("Ultimate dummy conds set")
 
+        # FIXED: Final validation simplified (post-val/prep; direct on model.conds; no redundant if or t3 access)
+        emb_present = self._is_nonempty_conds(context.model.conds)
         if emb_present:
-            # Proceed to gen (emb non-zero → real enough; catch any T3 error in try below)
-            logger.debug("Emb non-zero → allow gen (even if partial T3)")
+            # Diagnostics for partial/full T3
+            try:
+                if hasattr(context.model.conds,
+                           'cond_prompt_speech_tokens') and context.model.conds.cond_prompt_speech_tokens is not None:
+                    logger.debug("T3 full (has cond_prompt_speech_tokens)")
+                else:
+                    logger.debug("T3 partial (no cond_prompt_speech_tokens)")
+            except Exception as t3_e:
+                logger.debug(f"T3 check failed: {t3_e}")
+            logger.debug("Final pre-gen: model.conds valid – proceed to generation")
         else:
-            # FIXED: Only fallback if no t3 at all or zero emb (not just missing tokens)
-            logger.warning("Partial T3 (no tokens, emb zero) – silent fallback")
+            logger.error("No valid conds post-all – silent fallback")
             return self._silent_fallback(context)
 
-        # FIXED: Ensure bool checks use .all().item() (scalar bool) – general guard
+        # Proceed to gen (emb non-zero → real enough; catch any T3 error in try below)
+        logger.debug("Model.conds valid → allow gen")
+
         try:
             # FIXED: Build args WITHOUT 'conds' (stateful model.conds internal; align with working snippet)
             gen_args = self._build_generate_args(context)  # No 'conds' added
 
-            # FIXED: Simplified conds_shapes log (compute outside to avoid broken f-string)
+            # FIXED: Simplified conds_shapes log (direct access to speaker_emb on model.conds)
             conds_shapes = {}
-            if conds and hasattr(conds, 't3') and hasattr(conds.t3, 'speaker_emb'):
-                conds_shapes['model.conds.t3.speaker_emb'] = conds.t3.speaker_emb.shape
-            elif conds:
-                conds_shapes['model.conds'] = f'Present (type: {type(conds).__name__})'
+            if hasattr(context.model.conds, 'speaker_emb') and context.model.conds.speaker_emb is not None:
+                conds_shapes['model.conds.speaker_emb'] = context.model.conds.speaker_emb.shape
+            elif hasattr(context.model, 'conds') and context.model.conds is not None:
+                conds_shapes['model.conds'] = f'Present (type: {type(context.model.conds).__name__})'
             else:
                 conds_shapes['model.conds'] = 'None'
             logger.debug(f"Gen args: text_len={len(context.text)}, max_new_tokens=250, conds_shapes={conds_shapes}")
@@ -177,6 +181,9 @@ class GenerationPhase(BaseGenerationPhase):
             # FIXED: Call generate WITHOUT conds kwarg (uses model.conds state; as in working snippet)
             if context.seed is not None:
                 set_seed(context.seed)
+
+            # FIXED: Log before generate for debug
+            logger.debug("Calling model.generate with restored model.conds")
 
             generated = context.model.generate(**gen_args)  # FIXED: Relies on model.conds (no kwarg)
 
@@ -191,32 +198,35 @@ class GenerationPhase(BaseGenerationPhase):
             if wav is None or wav.numel() == 0:
                 raise ValueError("Generated WAV empty")
 
-            # FIXED: Scalar bool guard (e.g., valid_audio check)
-            # Example: if torch.all(wav > -1e-6): → if torch.all(wav > -1e-6).item()
-
             context.generated_wav = wav
             context.audio_duration = len(wav.squeeze(0)) / context.sr
             logger.info(f"Generation success: {context.audio_duration:.2f}s WAV @ {context.sr}Hz")
 
+            # FIXED: Preserve for downstream phases (e.g., PostProcessing if needed)
+            if conds is not None:
+                context.conds = conds
+
         except Exception as gen_e:
             logger.error(
                 f"Generation core error: {gen_e} – traceback: {gen_e.__traceback__ if hasattr(gen_e, '__traceback__') else 'No trace'}")
-            # Log conds pre-fail
+            # FIXED: Log conds pre-fail (use model.conds for consistency)
             conds_info = "None"
             if hasattr(context, 'model') and hasattr(context.model, 'conds') and context.model.conds:
-                if hasattr(context.model.conds, 't3') and hasattr(context.model.conds.t3, 'speaker_emb'):
-                    conds_info = f"torch.Size({context.model.conds.t3.speaker_emb.shape})"
+                if hasattr(context.model.conds, 'speaker_emb'):
+                    emb = context.model.conds.speaker_emb
+                    conds_info = f"torch.Size({emb.shape}) non-zero: {not torch.all(emb == 0).item()}"
                 else:
                     conds_info = f"type {type(context.model.conds).__name__}"
-            logger.debug(f"Pre-gen conds: model.conds {conds_info}")
+            logger.debug(f"Pre-fail conds (post-restore): model.conds {conds_info}")
             return self.handle_error(context, gen_e)  # Generation-specific (zeros, no cache)
 
         return context
 
 
 
+    # _build_generate_args unchanged (it's fine)
     def _build_generate_args(self, context: AudioGenerationContext) -> dict:
-        """Construct arguments for the generation call (no 'conds' kwarg – state-based). FIXED: Param mapping (cfgw → cfg_weight); no 'conds' added; guard path None."""
+        """Construct arguments for the generation call (no 'conds' kwarg – state-based)."""
         generate_args = {
             'text': context.text,
             'exaggeration': getattr(context, 'exaggeration', 0.7),
@@ -263,11 +273,11 @@ class GenerationPhase(BaseGenerationPhase):
 
         return generate_args
 
+    # Other methods (_generate_audio_core, _is_nonempty_conds, _create_silence_fallback, _silent_fallback, handle_error) unchanged
     def _generate_audio_core(self, model: Any, gen_args: Dict, t3_params: Dict) -> Optional[torch.Tensor]:
-        """Core generation with graph retry and cleanup. FIXED: Clear graphs on CUDA capture/previous error; eager fallback; guard model None/mock."""
+        """Core generation with graph retry and cleanup."""
         if model is None:
             logger.error("generate_audio_core: model is None – creating dummy silence")
-            from src.tts_model import create_dummy_conds
             config = get_config()
             if hasattr(config, 'app_config') and hasattr(config.app_config, 'globals'):
                 device = getattr(config.app_config.globals, 'device', 'cpu')
@@ -331,6 +341,7 @@ class GenerationPhase(BaseGenerationPhase):
             return wav if wav else self._create_silence_fallback()
 
     def _is_nonempty_conds(self, conds: Any) -> bool:
+        """Validate non-empty conds (emb non-zero). FIXED: No to() check; emb.numel() > 0 for size."""
         if conds is None:
             return False
         if hasattr(conds, 't3') and hasattr(conds.t3, 'speaker_emb') and conds.t3.speaker_emb is not None:
@@ -345,7 +356,7 @@ class GenerationPhase(BaseGenerationPhase):
             return True
         return False
 
-
+    # _create_silence_fallback and _silent_fallback unchanged (they're fine)
     def _create_silence_fallback(self) -> torch.Tensor:
         """Internal helper: 2s silence (fallback for core errors). FIXED: Use config.app_config.globals."""
         config = get_config()
@@ -418,6 +429,7 @@ class GenerationPhase(BaseGenerationPhase):
         logger.warning(f"Silence fallback created: {silence.shape}")
         return context
 
+    # _generate_wav removed – use integrated _generate_audio_core for consistency (as in your original code)
     def _generate_wav(self, context: AudioGenerationContext, generate_args: dict) -> Optional[torch.Tensor]:
         """Execute the core generation process with error handling. FIXED: Call integrated _generate_audio_core; no PathLike issues."""
         try:

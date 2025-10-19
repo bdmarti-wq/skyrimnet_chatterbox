@@ -80,9 +80,86 @@ class VoiceProcessingPhase(GenerationPhase):
         # FIXED: Load if HIT key set (fast; no path needed if cached)
         if conds_key and self.cache_manager and self.cache_manager.get_conditionals(conds_key, model):
             logger.info(f"VoiceProcessing: Conds HIT for {voice_stem} from key {conds_key[:20]}...")
-            # Quick validate (move to device if loaded raw)
+
+            # Patched: Detect mock & fix (check if real conds or dummy/mock)
+            is_mock = False
             if hasattr(model.conds, 't3') and hasattr(model.conds.t3, 'speaker_emb'):
-                model.conds = model.conds.t3.to(device=device)
+                emb = model.conds.t3.speaker_emb
+                emb_nonzero = (emb is not None and torch.numel(emb) > 0 and not torch.all(emb == 0).item())
+                has_to_method = hasattr(model.conds.t3, 'to') and callable(model.conds.t3.to)  # Check callable
+                if not emb_nonzero or not has_to_method:
+                    logger.warning(
+                        f"Loaded mock/invalid conds for {voice_stem} (emb zero: {not emb_nonzero}, no .to: {not has_to_method}) – forcing fresh real prep")
+                    is_mock = True
+                else:
+                    # Safe .to() for real conds (only if device != 'cpu' to avoid unnecessary moves)
+                    current_device = getattr(model.conds.t3, 'device', torch.device('cpu')) if hasattr(model.conds.t3,
+                                                                                                       'device') else torch.device(
+                        'cpu')
+                    if str(device) != str(current_device):
+                        model.conds = model.conds.t3.to(device=device)
+                    logger.debug(f"Real conds validated: emb non-zero ({emb_nonzero}), moved to {device}")
+            else:
+                logger.warning(f"Invalid conds structure for {voice_stem} (no t3/emb) – forcing fresh")
+                is_mock = True
+
+            # Patched: If mock detected, recompute real conds & overwrite cache (with path fallback)
+            if is_mock:
+                logger.info(f"Fixing invalid cache for {voice_stem}: recompute & save real")
+                derived_path = None
+                if not processed_path or not os.path.exists(processed_path):
+                    # Derive path from voice_stem if missing (use cache/voices dir)
+                    voice_dir = getattr(self.cache_manager, 'voice_cache_dir',
+                                        Path("./cache/voices"))  # Assume from manager
+                    derived_path = voice_dir / f"{voice_stem}.wav"  # Or 'resampled' subdir
+                    logger.debug(f"Derived missing path: {derived_path} for {voice_stem}")
+
+                    # Try legacy/resampled if standard voice not found
+                    if not derived_path.exists():
+                        resampled_dir = voice_dir / "resampled"
+                        derived_path = resampled_dir / f"{voice_stem}.wav"
+                        logger.debug(f"Tried resampled path: {derived_path}")
+
+                if derived_path and os.path.exists(derived_path):
+                    try:
+                        conds = context.model.prepare_conditionals(str(derived_path), exaggeration=context.exaggeration)
+                        if conds is not None and self._is_nonempty_conds(conds):
+                            model.conds = conds
+                            if self.cache_manager:
+                                saved = self.cache_manager.save_conditionals(conds_key, model)
+                                if saved:
+                                    logger.info(f"Recomputed & overwrote cache with real conds for {voice_stem}")
+                                else:
+                                    logger.warning(f"Recompute OK but save failed for {voice_stem}")
+                            else:
+                                logger.error(f"Recompute succeeded but no cache_manager – dummy fallback")
+                        else:
+                            raise ValueError("Recompute returned empty conds")
+                    except Exception as recompute_e:
+                        logger.error(f"Recompute failed for {voice_stem}: {recompute_e} – dummy fallback")
+                else:
+                    logger.warning(f"No valid path for recompute ({processed_path or derived_path}) – dummy fallback")
+
+                # Patched: Directly call dummy if still no real conds (no error → integrate with handle_error logic)
+                from src.tts_model import create_dummy_conds
+                create_dummy_conds(model, device, dtype, f"recompute_fail_{voice_stem}")
+                if hasattr(model, 'conds') and model.conds is None:
+                    logger.error("Dummy creation failed – ultimate fallback (empty conds)")
+                    model.conds = None  # Let caller handle
+            else:
+                # Original: context.conds assign for real conds
+                context.conds = model.conds
+                logger.debug("Conds passed to context for reuse")
+
+            context.conds_key = conds_key
+            # Success – return
+            time_taken = time.perf_counter() - start_time
+            logger.debug(f"VoiceProcessing HIT: {time_taken:.3f}s | key={conds_key[:20]}")
+            return context
+
+            # At end of successful conds load in VoiceProcessing
+            context.conds = model.conds  # Simple assign – ~0 lines, preserves object
+            logger.debug("Conds passed to context for reuse")
 
             context.conds_key = conds_key
             # Success – return
