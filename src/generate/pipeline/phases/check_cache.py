@@ -1,4 +1,3 @@
-# src/generate/pipeline/phases/cache_check.py (Corrected: Safe device/dtype/sr in validation; consistent config access)
 import os
 import time
 from pathlib import Path
@@ -6,125 +5,129 @@ from pathlib import Path
 import torch
 import torchaudio
 
-from src.config import get_config
-from src.normalize_stem import normalize_stem
 from .base import GenerationPhase
 from ...pipeline.context import AudioGenerationContext
 from loguru import logger
 
-class CacheCheckPhase(GenerationPhase):
-    """Voice cache check; SIMPLIFIED: Call manager.wrapper (norm stem stable); set attrs for conds."""
 
+class CacheCheckPhase(GenerationPhase):
     def __init__(self, cache_manager=None):
         self.cache_manager = cache_manager
-        if not self.cache_manager:
-            logger.warning("No cache_manager; voice MISS")
         super().__init__()
 
-    def execute(self, context: AudioGenerationContext) -> AudioGenerationContext:
-        """Voice process/check. FIXED: Ensure processed_voice_path is always set/valid (derive from voice_stem if None/missing for conds prep in reuse)."""
-        start_time = time.perf_counter()
+    def _execute_core(self, context: AudioGenerationContext) -> AudioGenerationContext:
+        """FIXED: Robust unpack/result parsing from process_voice_reference (5-tuple: success/bool, path, key, params_dict, hit_entry). Defaults if misalign."""
+        context.ensure_attrs()  # Now guards voice_params to dict
 
         if not self.cache_manager:
             context.is_cached = False
             context.cache_hit_type = 'no_cache'
-            context.cache_uuid = int(time.time() * 1000) % (2 ** 32)
-            context.cache_key = f"nocache_{hash(context.text)}_{context.audio_prompt_path}"
             return context
 
-        audio_prompt_path = getattr(context, 'audio_prompt_path', None)
-        voice_stem = getattr(context, 'voice_stem',
-                             normalize_stem(audio_prompt_path) if audio_prompt_path else 'default')
+        audio_prompt = context.audio_prompt_path or ""
+        voice_stem = context.voice_stem
         text = context.text
-        exag = getattr(context, 'exaggeration', 0.5)
 
-        if not voice_stem or not text:
-            logger.warning("Missing voice/text")
-            context.cache_type = 'invalid'
-            context.cache_uuid = int(time.time() * 1000) % (2 ** 32)
+        if not voice_stem or not text.strip():
+            context.cache_hit_type = 'invalid_input'
             return context
 
-        # SIMPLIFIED: Call wrapper (handles norm; returns stable)
-        processed_path, _, conds_key, voice_params, hit_entry = self.cache_manager.process_voice_reference(
-            audio_path=audio_prompt_path, voice_stem=voice_stem
-        )
+        # FIXED: Get result, parse safely (aligns with voice_reference 5-tuple)
+        result = self.cache_manager.process_voice_reference(audio_path=audio_prompt, voice_stem=voice_stem)
 
-        # FIXED: Ensure processed_voice_path is valid (set from return; derive if None/invalid for conds prep)
-        context.voice_stem = voice_stem  # Norm from wrapper
-        initial_path = processed_path
-        if processed_path and os.path.exists(str(processed_path)):
-            context.processed_voice_path = processed_path
-            logger.debug(f"Set processed_voice_path from cache: {context.processed_voice_path}")
+        # Parse: Assume [success?, path, key, params, hit_entry] – index safely
+        processed_path = None
+        conds_key = None
+        voice_params = {}
+        hit_entry = None
+
+        if isinstance(result, (list, tuple)):
+            if len(result) >= 1:
+                processed_path = result[
+                    1 if len(result) > 1 and isinstance(result[0], bool) else 0]  # Skip bool if present
+            if len(result) >= 2:
+                conds_key = result[2 if len(result) > 2 and isinstance(result[0], bool) else 1] if isinstance(
+                    result[2 if len(result) > 2 else 1], str) else None
+            if len(result) >= 3:
+                param_idx = 3 if len(result) > 3 and isinstance(result[0], bool) else 2
+                raw_params = result[param_idx]
+                voice_params = raw_params if isinstance(raw_params, dict) else {}  # Ensure dict
+            if len(result) >= 4:
+                hit_idx = 4 if len(result) > 4 and isinstance(result[0], bool) else 3
+                hit_entry = result[hit_idx]
+
+        if conds_key and isinstance(conds_key, str):
+            logger.debug(f"Parsed: path={processed_path}, key={conds_key[:20]}..., params type={type(voice_params)}")
         else:
-            # Derive valid path from voice_stem (for HIT reuse; assume cache/voices or resampled)
-            voice_cache_dir = getattr(self.cache_manager, 'voice_cache_dir', None)
-            if voice_cache_dir is None:
-                from src.config import get_config
-                config = get_config()
-                voice_cache_dir = Path(getattr(config, 'cache_dir', './cache')) / "voices"  # Fallback to config
-            derived_path = voice_cache_dir / f"{voice_stem}.wav"
-            if not derived_path.exists():
-                # Try resampled subdir (common for processed)
-                resampled_dir = voice_cache_dir / "resampled"
-                derived_path = resampled_dir / f"{voice_stem}.wav"
-                logger.debug(f"Tried resampled derived path for {voice_stem}: {derived_path}")
+            logger.warning("Invalid parse from process_voice_reference – MISS")
 
-            if derived_path.exists():
-                context.processed_voice_path = derived_path
-                logger.info(
-                    f"Derived valid processed_voice_path for reuse: {context.processed_voice_path} (original: {initial_path})")
+        # Derive/validate path (same as before)
+        if not processed_path or not os.path.exists(processed_path):
+            globals_dict = context.get_globals()
+            cache_root = globals_dict.get('cache_dir', Path('./cache'))
+            voice_dir = cache_root / "voices"
+            voice_dir.mkdir(parents=True, exist_ok=True)
+            derived = voice_dir / f"{voice_stem}.wav"
+            if derived.exists() and self.validate_path(str(derived)):
+                processed_path = derived
+                logger.debug(f"Derived path: {derived}")
             else:
-                # Ultimate fallback: Set to original audio_prompt_path if available, or warn
-                context.processed_voice_path = audio_prompt_path or Path("")
-                if not context.processed_voice_path or not os.path.exists(str(context.processed_voice_path)):
-                    logger.warning(
-                        f"Could not derive valid processed_voice_path for {voice_stem}; set to empty – conds may fail")
-                    context.processed_voice_path = Path("")
-                else:
-                    logger.info(f"Fallback to original audio_prompt_path: {context.processed_voice_path}")
+                resampled_dir = voice_dir / "resampled"
+                resampled_dir.mkdir(parents=True, exist_ok=True)
+                resampled = resampled_dir / f"{voice_stem}_24000Hz.wav"
+                if resampled.exists() and self.validate_path(str(resampled)):
+                    processed_path = resampled
+                    logger.debug(f"Derived resampled: {resampled}")
 
-        context.processed_ref_path = context.processed_voice_path  # Mirror for compatibility
-        context.conditionals_key = conds_key
-        context.conds_key = conds_key
-        context.voice_params = voice_params
-        # Note: content_hash if needed in Gen/context; stub here if essential
-        context.cache_uuid = context.cache_uuid or int(time.time() * 1000) % (2 ** 32)
+        if processed_path:
+            is_valid, msg = self.validate_voice_ref(processed_path, voice_stem)
+            if not is_valid:
+                logger.warning(f"Path invalid {voice_stem}: {msg} – MISS")
+                processed_path = None
 
-        logger.info(
-            f"Voice processed {voice_stem} (conds {conds_key[:20]}... | path exists: {os.path.exists(str(context.processed_voice_path))})")
+        context.processed_voice_path = str(processed_path) if processed_path else ""
+        context.processed_ref_path = context.processed_voice_path
+        context.conditionals_key = conds_key or f"stub_{voice_stem}_{int(time.time() % 10000)}"
+        context.conds_key = context.conditionals_key
+        context.voice_params = voice_params  # Already dict from parse
 
-        # Set type
+        # HIT/MISS
         if hit_entry:
-            context.cache_hit = True
-            context.cache_type = 'voice_reuse'
             context.is_cached = True
             context.cache_hit_type = 'voice_reuse'
             logger.info(f"VOICE HIT: {voice_stem} (stable)")
         else:
-            context.cache_hit = False
-            context.cache_type = 'voice_miss'
             context.is_cached = False
             context.cache_hit_type = 'voice_miss'
             logger.info(f"VOICE MISS: {voice_stem} (new stable)")
 
-        # Simple key stub (norm + hash text/exag; voice stable base)
-        text_hash = hash(text)
-        context.cache_key = f"{voice_stem}_{text_hash}_{exag:.2f}_{context.cache_uuid}"
+        context.cache_key = context.generate_cache_key(voice_stem, text, context.exaggeration)
+        logger.debug(f"CacheCheck: {context.cache_hit_type} | path exists: {bool(processed_path)}")
+        return context
 
-        time_taken = time.perf_counter() - start_time
-        logger.debug(
-            f"Voice CacheCheck: {time_taken:.3f}s | {context.cache_type} | path={context.processed_voice_path}")
+    @classmethod
+    def validate_voice_ref(cls, audio_path: str, stem: str) -> tuple[bool, str]:
+        """FIXED: Align with voice_reference.validate_voice_prompt (dur>=3s, SR check, non-empty; artifacts skipped for refs)."""
+        if not audio_path or not os.path.exists(audio_path):
+            return False, f"Missing: {audio_path}"
 
-        return context  # To Gen
-
+        try:
+            info = torchaudio.info(audio_path)
+            duration = info.num_frames / info.sample_rate
+            if duration < 3.0:  # min_ref_duration
+                return False, f"Short {stem}: {duration:.2f}s < 3s"
+            if info.sample_rate != 24000:
+                logger.warning(f"SR mismatch {stem}: {info.sample_rate}Hz != 24000Hz")
+            waveform, _ = torchaudio.load(audio_path)
+            if waveform.numel() == 0 or torch.max(torch.abs(waveform)) <= 1e-6:
+                return False, f"Empty/silent {stem}"
+            # Artifacts skipped for voices (as in original)
+            logger.trace(f"Valid ref {stem}: {duration:.2f}s @ {info.sample_rate}Hz")
+            return True, f"Valid ({duration:.2f}s)"
+        except Exception as e:
+            return False, f"Validation error {stem}: {e}"
 
     def handle_error(self, context: AudioGenerationContext, error: Exception) -> AudioGenerationContext:
-        """Fallback."""
-        logger.warning(f"Voice check error: {error}; MISS")
         context.is_cached = False
-        context.cache_type = 'error_miss'
         context.cache_hit_type = 'error_miss'
-        context.cache_uuid = int(time.time() * 1000) % (2**32)
-        context.cache_key = f"error_{hash(context.text)}_{context.audio_prompt_path or 'none'}"
-        context.cache_hit = False
-        return context
+        return super().handle_error(context, error)

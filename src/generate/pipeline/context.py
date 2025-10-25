@@ -1,9 +1,12 @@
+import time
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Optional, Dict, Any
 import torch
 import hashlib
 from src.config.models import AppConfig
+from src.tts_model import get_model  # For fallback if needed
+from src.normalize_stem import normalize_stem  # For derive_stem
 import logging
 
 logger = logging.getLogger(__name__)
@@ -82,17 +85,23 @@ class AudioGenerationContext:
     # Private field for audio_duration (with getter/setter)
     _audio_duration: float = field(default=0.0, init=False, repr=False)
 
+    # Cached globals (lazy, DRY)
+    _globals_cache: Dict[str, Any] = field(default_factory=dict, init=False, repr=False)
+
     # Timing metrics (runtime; always dicts)
     timing: Dict[str, float] = field(default_factory=dict, init=True, repr=False)
     step_times: Dict[str, float] = field(default_factory=dict, init=True, repr=False)
 
     def __post_init__(self):
-        """Initialize derived fields safely; ensure timing/step_times are always dicts."""
-        # Ensure timing and step_times are initialized as dicts (guard against missing or None)
+        """Initialize derived fields safely; ensure timing/step_times are always dicts. REFACTORED: Call ensure_attrs() for defaults; compute save_cache."""
+        # Ensure timing and step_times are initialized as dicts
         if self.timing is None:
             object.__setattr__(self, 'timing', {})
         if self.step_times is None:
             object.__setattr__(self, 'step_times', {})
+
+        # REFACTORED: Ensure common attrs (paths, seeds, etc.) – DRY across phases
+        self.ensure_attrs()
 
         # Compute save_cache
         object.__setattr__(self, 'save_cache', self.enable_memory_cache or self.enable_disk_cache)
@@ -103,36 +112,102 @@ class AudioGenerationContext:
         if self.cfgw != 0.45 and self.cfg_weight == 0.45:
             object.__setattr__(self, 'cfg_weight', self.cfgw)
 
-        # FIXED: Override defaults with config values if config is provided (no crash on None)
-        if self.config is not None and hasattr(self.config, 'globals'):
-            try:
-                # Only override if not already explicitly passed (avoids clobbering)
-                if hasattr(self.config.globals, 'device') and self.device.type == 'cpu':  # Preserve if set
-                    object.__setattr__(self, 'device', torch.device(self.config.globals.device))
-                if hasattr(self.config.globals, 'dtype') and self.dtype == torch.bfloat16:  # Default check
-                    object.__setattr__(self, 'dtype', self.config.globals.dtype)
-                if hasattr(self.config.globals, 'multilingual'):
-                    object.__setattr__(self, 'multilingual', self.config.globals.multilingual)
-                if hasattr(self.config.globals, 'sr'):
-                    object.__setattr__(self, 'sr', self.config.globals.sr)
-                logger.debug(f"Context derived from config: device={self.device}, dtype={self.dtype}, sr={self.sr}, multilingual={self.multilingual}")
-            except (AttributeError, ValueError, KeyError) as e:
-                logger.warning(f"Failed to derive fields from config: {e}; keeping passed defaults")
+        # REFACTORED: Override defaults with config if provided (lazy; use get_globals below)
+        if self.config is not None:
+            globals_dict = self.get_globals()
+            if globals_dict:
+                self.sr = globals_dict.get('sr', 24000)
+                self.device = torch.device(globals_dict.get('device', 'cpu'))
+                self.dtype = globals_dict.get('dtype', torch.bfloat16)
+                self.multilingual = globals_dict.get('multilingual', False)
+                logger.debug(f"Context derived from config: sr={self.sr}, device={self.device}, dtype={self.dtype}")
 
-        # Reset _audio_duration to 0.0 (start fresh)
+        # Reset _audio_duration
         object.__setattr__(self, '_audio_duration', 0.0)
+        logger.debug(f"Context post-init: save_cache={self.save_cache}")
 
-        logger.debug(f"AudioGenerationContext post-init: save_cache={self.save_cache}, timing keys={list(self.timing.keys())}")
+    def ensure_attrs(self):
+        """FIXED: Ensure voice_params is dict (prevents str from unpack misalign)."""
+        # Paths
+        if self.audio_prompt_path is None:
+            object.__setattr__(self, 'audio_prompt_path', "")
+        if self.processed_voice_path is None:
+            object.__setattr__(self, 'processed_voice_path', "")
+        if self.processed_ref_path is None:
+            object.__setattr__(self, 'processed_ref_path', self.processed_voice_path or "")
+        if self.output_path is None:
+            object.__setattr__(self, 'output_path', "")
+
+        # Voice stem
+        if not self.voice_stem or self.voice_stem == "default":
+            if self.audio_prompt_path:
+                try:
+                    from src.normalize_stem import normalize_stem
+                    object.__setattr__(self, 'voice_stem', normalize_stem(self.audio_prompt_path) or "default")
+                except ImportError:
+                    from pathlib import Path
+                    object.__setattr__(self, 'voice_stem', Path(self.audio_prompt_path).stem or "default")
+            else:
+                object.__setattr__(self, 'voice_stem', "default")
+
+        # FIXED: Ensure voice_params is dict (handles str from mis-set key/params)
+        if self.voice_params is None or not isinstance(self.voice_params, dict):
+            object.__setattr__(self, 'voice_params', {})
+
+        # Seeds
+        if self.seed is None:
+            object.__setattr__(self, 'seed', self.seed_num or 42)
+
+        # Cache keys
+        if not self.cache_key:
+            object.__setattr__(self, 'cache_key', self.generate_cache_key())
+        if not self.conditionals_key:
+            object.__setattr__(self, 'conditionals_key', f"stub_{self.voice_stem}_{int(time.time() % 10000)}")
+
+        # Flags
+        if self.is_cached is None:
+            object.__setattr__(self, 'is_cached', False)
+        if self.voice_ref_processed is None:
+            object.__setattr__(self, 'voice_ref_processed', False)
+
+    def get_globals(self) -> Dict[str, Any]:
+        """REFACTORED: Shared lazy access to config globals (sr, device, dtype, etc.). Cache result; fallback defaults. DRY across all files."""
+        if self._globals_cache:
+            return self._globals_cache
+
+        globals_dict = {}
+        if self.config is not None and hasattr(self.config, 'app_config') and hasattr(self.config.app_config, 'globals'):
+            g = self.config.app_config.globals
+            globals_dict = {
+                'sr': getattr(g, 'sr', 24000),
+                'device': getattr(g, 'device', 'cuda' if torch.cuda.is_available() else 'cpu'),
+                'dtype': getattr(g, 'dtype', torch.bfloat16),
+                'multilingual': getattr(g, 'multilingual', False),
+                'cache_dir': getattr(g, 'cache_dir', Path('./cache'))
+            }
+        else:
+            # Fallback defaults
+            globals_dict = {
+                'sr': 24000,
+                'device': 'cuda' if torch.cuda.is_available() else 'cpu',
+                'dtype': torch.bfloat16,
+                'multilingual': False,
+                'cache_dir': Path('./cache')
+            }
+            logger.warning("Using fallback globals (no valid config)")
+
+        self._globals_cache = globals_dict
+        return globals_dict
 
     @property
     def audio_duration(self) -> float:
         """Get cached or compute audio duration; caches result in _audio_duration."""
         if self._audio_duration > 0:
             return self._audio_duration
-        if self.processed_wav is not None and self.processed_wav.numel() > 0:
+        if self.processed_wav is not None and hasattr(self.processed_wav, 'numel') and self.processed_wav.numel() > 0:
             self._audio_duration = len(self.processed_wav.squeeze(0)) / self.sr
             return self._audio_duration
-        if self.generated_wav is not None and self.generated_wav.numel() > 0:
+        if self.generated_wav is not None and hasattr(self.generated_wav, 'numel') and self.generated_wav.numel() > 0:
             self._audio_duration = len(self.generated_wav.squeeze(0)) / self.sr
             return self._audio_duration
         return 0.0
@@ -156,6 +231,6 @@ class AudioGenerationContext:
             except Exception as e:
                 logger.warning(f"Cache manager key gen failed: {e}; using fallback")
 
-        # Fallback hash-based key
+        # Fallback hash-based key (REFACTORED: Use existing text/voice_stem if not passed)
         hash_str = f"{voice_stem or self.voice_stem}_{hash(text or self.text)}_{exaggeration or self.exaggeration}_{cache_uuid or self.cache_uuid}"
         return hashlib.md5(hash_str.encode()).hexdigest()[:16]

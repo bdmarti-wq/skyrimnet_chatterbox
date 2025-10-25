@@ -1,114 +1,111 @@
-import time
-import os
-from typing import Optional, Dict, Any
 import torch
-import torchaudio  # Optional: For any SR checks (unused now)
-
-from src.audio_utils import create_silence_tensor, apply_post_processing  # From prior patches; fallback if missing
-from src.config import get_config, get_config_value
+import torchaudio
+from typing import Dict, Any  # Add for voice_params
 from .base import GenerationPhase
 from ...pipeline.context import AudioGenerationContext
 from loguru import logger
 
-
 class PostProcessingPhase(GenerationPhase):
-    """Applies audio post-processing to enhance quality of generated audio."""
-
-    process_after_cache = True  # Should run even if we have cache hits (for quality control)
-
-    def execute(self, context: AudioGenerationContext) -> AudioGenerationContext:
-        if context.generated_wav is None or len(context.generated_wav) == 0:
-            logger.warning("No WAV for post-processing – skip")
+    def _execute_core(self, context: AudioGenerationContext) -> AudioGenerationContext:
+        """FIXED: Local guard for voice_params dict (if str from mis-set); same Tensor fixes."""
+        if not hasattr(context, 'generated_wav') or context.generated_wav is None or context.generated_wav.numel() == 0:
+            logger.warning("No/empty WAV for post-processing – skip")
             return context
 
+        # FIXED: Ensure voice_params dict (defensive)
+        voice_params = getattr(context, 'voice_params', {})
+        if not isinstance(voice_params, dict):
+            logger.warning(f"voice_params not dict ({type(voice_params)}), defaulting to empty")
+            voice_params = {}
+
         try:
-            sr = context.sr  # FIXED: Use context.sr (int) instead of context.config.sr
-            logger.debug(f"Post-processing: WAV {context.generated_wav.shape}, sr={sr}Hz")
+            sr = context.sr
+            wav = context.generated_wav
 
-            # FIXED: Norm/gain calc (prevent iterable error on config)
-            wav = context.generated_wav.squeeze(0)  # [T] or [C,T]
-            if wav.dim() == 1:
-                peak = torch.max(torch.abs(wav))  # Scalar
-            else:
-                peak = torch.max(torch.abs(wav))  # Still scalar
+            if wav.numel() == 0:
+                raise ValueError("Empty WAV tensor")
 
+            if wav.dim() == 2 and wav.size(0) == 1:
+                wav = wav.squeeze(0)
+
+            peak = torch.max(torch.abs(wav))
             if peak > 0:
-                gain = 0.95 / (peak + 1e-8)  # Avoid div0
+                gain = 0.95 / (peak + 1e-8)
                 wav = wav * gain
-                logger.debug(f"Applied norm + gain: peak={peak:.3f}, gain={20 * torch.log10(gain):+.1f}dB")
-            else:
-                logger.debug("WAV is zero – no norm needed")
+                logger.debug(f"Norm: peak={peak:.3f}")
 
-            # FIXED: Resample if needed (use context.sr, not config)
-            if context.sr != 24000:  # Target SR
+            # FIXED: Use guarded dict
+            post_gain = voice_params.get('post_gain', 0.0)
+            if post_gain != 0:
+                wav = wav * (1 + post_gain)
+                if torch.max(torch.abs(wav)) > 1.0:
+                    wav = wav / torch.max(torch.abs(wav))
+
+            target_sr = 24000
+            if sr != target_sr:
                 from torchaudio.transforms import Resample
-                resampler = Resample(context.sr, 24000)
-                target_sr = 24000
-                context.sr = target_sr  # Update
-                context.processed_wav = resampler(wav.unsqueeze(0)).squeeze(0)  # [1, T] → [T]
-            else:
-                context.processed_wav = wav.unsqueeze(0) if wav.dim() == 1 else wav  # Ensure [1,T]
+                resampler = Resample(sr, target_sr)
+                context.sr = target_sr
+                input_wav = wav.unsqueeze(0) if wav.dim() == 1 else wav
+                resampled = resampler(input_wav)
+                wav = resampled.squeeze(0)
 
-            context.audio_duration = len(context.processed_wav.squeeze(0)) / context.sr
-            logger.info(f"Post-processing success: {context.audio_duration:.2f}s @ {context.sr}Hz")
-
+            context.processed_wav = wav.unsqueeze(0) if wav.dim() == 1 else wav
+            context.audio_duration = context.audio_duration
+            logger.info(f"Post-processing: {context.audio_duration:.2f}s @ {context.sr}Hz")
         except Exception as e:
-            logger.error(f"Post-processing error: {e} – raw pass-through")
-            context.processed_wav = context.generated_wav  # Fallback
-            # FIXED: In handle_error, use context.sr too
-            # e.g., sr = int(context.sr) if hasattr(context, 'sr') else 24000
+            logger.error(f"Post-processing error: {e} – raw fallback")
+            raw_wav = context.generated_wav
+            # FIXED: Guard again in fallback (though attrs/ensure should prevent)
+            fallback_params = getattr(context, 'voice_params', {})
+            if not isinstance(fallback_params, dict):
+                fallback_params = {}
+            if raw_wav is not None and raw_wav.numel() > 0:
+                context.processed_wav = self._inline_simple_norm(raw_wav, fallback_params)
+            else:
+                context.processed_wav = self.create_silence(context.sr, 2.0)
 
         return context
-
-
 
     def _inline_simple_norm(self, wav: torch.Tensor, voice_params: Dict[str, Any]) -> torch.Tensor:
-        """Simple torch-based peak normalization + voice gain (fallback; no deps)."""
-        # Peak norm (safe clamp)
-        max_abs = wav.abs().max()
-        if max_abs > 0:
-            post_wav = wav / max_abs  # Normalize to [-1,1]
-        else:
-            post_wav = wav  # Already zero/silent
+        """FIXED: Guard voice_params (input param); same Tensor."""
+        # FIXED: Ensure dict (caller should, but defensive)
+        if not isinstance(voice_params, dict):
+            logger.warning(f"Inline voice_params not dict, defaulting")
+            voice_params = {}
 
-        # Voice-specific: Post-gain from params (e.g., boost for quiet clones)
+        if wav is None or wav.numel() == 0:
+            return self.create_silence(24000, 1.0)
+
+        if wav.dim() == 2 and wav.size(0) == 1:
+            wav = wav.squeeze(0)
+
+        max_abs = torch.max(torch.abs(wav))
+        if max_abs > 0:
+            wav = wav / max_abs
+
         post_gain = voice_params.get('post_gain', 0.0)
         if post_gain != 0:
-            post_wav = post_wav * (1 + post_gain)
-            # Re-clamp if exploded
-            if post_wav.abs().max() > 1.0:
-                post_wav = post_wav / post_wav.abs().max()
+            wav = wav * (1 + post_gain)
+            if torch.max(torch.abs(wav)) > 1.0:
+                wav = wav / torch.max(torch.abs(wav))
 
-        # Optional: Min duration pad (if short artifact)
-        min_post_duration = voice_params.get('min_post_duration', 1.0)
-        sr = get_config_value('sr', 24000)
-        current_dur = post_wav.shape[-1] / sr
-        if current_dur < min_post_duration:
-            pad_samples = int((min_post_duration - current_dur) * sr)
-            post_wav = torch.nn.functional.pad(post_wav, (0, pad_samples), mode='constant', value=0)
+        min_dur = voice_params.get('min_post_duration', 1.0)
+        current_dur = wav.numel() / 24000
+        if current_dur < min_dur:
+            pad_samples = int((min_dur - current_dur) * 24000)
+            wav = torch.nn.functional.pad(wav, (0, pad_samples), mode='constant', value=0)
 
-        logger.debug("Applied inline simple norm + gain (peak=1.0, gain={:+.2f}dB)".format(
-            20 * torch.log10(torch.tensor(1 + post_gain)) if post_gain > 0 else 0))
-        return post_wav
-
-    # Advanced methods (commented: Optional expansions; enable via config + deps)
-    # def _apply_voice_eq(self, audio_data: np.ndarray, sr: int, gain_db: float, cutoff_hz: float) -> np.ndarray:
-    #     """High-shelf EQ (requires scipy)."""
-    #     if np.isclose(gain_db, 0.0):
-    #         return audio_data
-    #     # ... (your existing; convert wav to np first if used)
-    #     return audio_data
-
-    # Future: Integrate cleaning toggle
-    # if get_config_value('voice.enable_cleanup', False):
-    #     from src.audio_utils import process_voice_cleanup
-    #     post_wav, _ = process_voice_cleanup(post_wav, sr, voice_params)
+        logger.debug(f"Inline norm: peak=1.0, gain={post_gain:+.2f}")
+        return wav.unsqueeze(0) if wav.dim() == 1 else wav
 
     def handle_error(self, context: AudioGenerationContext, error: Exception) -> AudioGenerationContext:
-        """Handle post-processing errors by falling back to raw audio."""
-        logger.error(f"Post-processing phase failed: {str(error)} – falling back to raw generation")
-        if hasattr(context, 'generated_wav') and context.generated_wav is not None:
-            # Inline simple norm as last resort
-            voice_params = getattr(context, 'voice_params', {})
-            context.generated_wav = self._inline_simple_norm(context.generated_wav, voice_params)
-        return context
+        """FIXED: Guard voice_params in fallback."""
+        logger.error(f"Post-processing failed: {error} – raw with inline norm")
+        raw_wav = getattr(context, 'generated_wav', None)
+        fallback_params = getattr(context, 'voice_params', {})
+        if not isinstance(fallback_params, dict):
+            fallback_params = {}
+        if raw_wav is not None and raw_wav.numel() > 0:
+            context.processed_wav = self._inline_simple_norm(raw_wav, fallback_params)
+        return super().handle_error(context, error)
