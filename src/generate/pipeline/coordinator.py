@@ -20,10 +20,10 @@ from src.generate.pipeline.context import AudioGenerationContext
 
 
 class GenerationCoordinator:
-    """Manages the full generation pipeline with phases and caching. REFACTORED: Simplified init (no force load); run uses base timing/validate."""
+    """Manages the full generation pipeline with phases and caching. FIXED: Bypass on audio HIT."""
 
     def __init__(self, config=None):
-        """REFACTORED: Assume valid config (raise if None); inject cache_manager once."""
+        """Assume valid config (raise if None); inject cache_manager once."""
         self.config = config or get_config()
         if self.config is None or not hasattr(self.config, 'app_config'):
             raise ValueError("Invalid config – cannot initialize coordinator")
@@ -43,18 +43,29 @@ class GenerationCoordinator:
         logger.info("Coordinator initialized")
 
     def run(self, context: AudioGenerationContext) -> AudioGenerationContext:
-        """REFACTORED: Inject once; use base execute (with shared timing/validate). Remove per-run warmup."""
+        """Inject once; check skip_pipeline after CacheCheck (bypass Voice/Gen/Post on audio HIT)."""
         start_total = time.perf_counter()
         context.model = self.model
         context.cache_manager = self.cache_manager
-        context.config = self.config  # Ensure
+        context.config = self.config
 
-        # REFACTORED: Base phases handle timing/validate internally
         phase_times = {}
-        for phase in self.phases:
+
+        for i, phase in enumerate(self.phases):
             phase_name = phase.__class__.__name__
             phase_start = time.perf_counter()
-            context = phase.execute(context)  # Uses base: validate + time + core
+
+            # Bypass on audio HIT (after CacheCheck; skip Voice/Gen/Post)
+            if (hasattr(context, 'skip_pipeline') and context.skip_pipeline and
+                i >= 2):  # From VoiceProcessingPhase (idx 2) onward
+                logger.info(f"Skipping {phase_name} on full audio cache HIT (use cached_path)")
+                phase_times[phase_name] = 0.0
+                # Pre-set output for final Output if jumped
+                if phase_name == 'OutputPhase' and hasattr(context, 'cached_path'):
+                    context.output_path = context.cached_path
+                continue
+
+            context = phase.execute(context)
             phase_times[phase_name] = time.perf_counter() - phase_start
 
         total_time = time.perf_counter() - start_total
@@ -63,12 +74,14 @@ class GenerationCoordinator:
         return context
 
     def _fallback_context(self, context: AudioGenerationContext, error: Exception) -> AudioGenerationContext:
-        """REFACTORED: Use shared base _fallback_silence. Remove dupes."""
+        """Use shared base _fallback_silence. Remove dupes."""
         logger.warning(f"Coordinator fallback due to {error}")
-        return self.base_phase._fallback_silence(context, str(error))  # Assuming base imported or ref
+        # Fallback to first phase's handle_error or implement shared
+        from src.generate.pipeline.phases.base import GenerationPhase
+        return GenerationPhase()._fallback_silence(context, str(error))  # Static call
 
     def _log_pipeline_results(self, total_time: float, phase_times: Dict[str, float], context: AudioGenerationContext):
-        """REFACTORED: Use context globals/sr/audio_duration (DRY). Simplify conds stats."""
+        """Use context globals/sr/audio_duration (DRY). Simplify conds stats."""
         globals_dict = context.get_globals()
         sr = globals_dict['sr']
         audio_dur = context.audio_duration
@@ -83,7 +96,7 @@ class GenerationCoordinator:
         if cache_type != 'miss':
             log_msg += f" | cache: {cache_type}"
 
-        # Conds stats (simplified if cache_manager)
+        # Conds stats (if cache_manager)
         if context.cache_manager and hasattr(context.cache_manager.conditionals_cache, 'get_stats'):
             stats = context.cache_manager.conditionals_cache.get_stats().get('stats', {})
             hits = stats.get('disk_hits', 0) + stats.get('memory_hits', 0)

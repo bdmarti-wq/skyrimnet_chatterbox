@@ -1,4 +1,3 @@
-# src/generate/cache/cache_manager.py (Corrected: Use safe config.app_config.globals access in all methods; no device/dtype kwargs in get_voice_params)
 from typing import Dict, Any, Optional, Tuple
 import hashlib
 import os
@@ -20,9 +19,9 @@ from ...normalize_stem import normalize_stem
 
 
 class CacheManager:
-    """Centralized cache management for audio generation pipeline."""
+    """Centralized cache management for audio generation pipeline. FIXED: _validate_path_for_cache uses absolute resolves."""
 
-    def __init__(self, config: "AppConfig"):
+    def __init__(self, config):
         self.config = config
         self.cache_config = config.app_config.globals
 
@@ -69,8 +68,6 @@ class CacheManager:
             return voice_stem
 
         return f"{voice_stem}_{text_hash}_{exaggeration:.2f}_{uuid_hex}"
-
-    # In cache_manager.py, replace the existing get_voice_stem method:
 
     def get_voice_stem(self, audio_path: Optional[str]) -> str:
         """Get normalized voice stem from path or fallback. Uses centralized utility for consistency."""
@@ -176,7 +173,6 @@ class CacheManager:
             logger.info(f"Voice MISS/process {voice_stem} (new stable norm)")
 
         if not success or not processed_path:
-            # Fallback str
             processed_path = audio_path if os.path.exists(audio_path) else ''
 
         return str(processed_path), '', conds_key, voice_params, hit_entry
@@ -226,31 +222,62 @@ class CacheManager:
         )
 
     def get_audio_cache(self, cache_key: str) -> Optional[str]:
-        """Check exact audio cache for hit."""
-        return self.audio_cache.get(cache_key)
+        """FIXED: Get with validation (exists? subpath? artifacts?) + purge if invalid."""
+        path = self.audio_cache.get(cache_key)
+        if path and os.path.exists(path):
+            p = Path(path).resolve()
+            base_dir = (self.cache_config.cache_dir / "audio" / "output").resolve()
+            if p.is_relative_to(base_dir) and not is_artifact_laden(path, 7000):
+                return str(p.absolute())
+            else:
+                # Purge invalid
+                self.audio_cache.set(cache_key, None)
+                logger.warning(f"Purged invalid audio_cache entry: {path}")
+        return None
 
     def set_audio_cache(self, cache_key: str, audio_path: str) -> None:
-        """Cache an audio result with proper validation."""
-        self.audio_cache.set(cache_key, audio_path)
+        """FIXED: Set only if valid (exists, subpath, no artifacts). Ignore energy arg; use stem fallback 'default'."""
+        if audio_path and os.path.exists(audio_path):
+            # FIXED: Pass 'default' for stem (no energy_threshold_hz needed)
+            if self._validate_path_for_cache(audio_path, 'default'):
+                self.audio_cache.set(cache_key, str(Path(audio_path).absolute()))
+                logger.info(f"Set audio_cache: {cache_key[:12]} → {Path(audio_path).name}")
+            else:
+                logger.warning(f"Skipped invalid set for audio_cache: {audio_path}")
+        else:
+            logger.debug(f"Skipped set (missing): {audio_path}")
+
 
     def get_fuzzy_audio_cache(self,
-                            audio_path: str,
-                            text: str,
-                            stem: str) -> Optional[str]:
-        """Check for fuzzy audio cache hit."""
-        return self.fuzzy_cache.try_fuzzy_audio_cache(
-            audio_path=audio_path,
-            text_input=text,
-            stem=stem
-        )
+                            audio_path: str = '',
+                            text: str = '',
+                            stem: str = '',
+                            threshold: float = 0.70) -> Optional[str]:
+        """FIXED: Pass threshold; return abs validated path."""
+        path = self.fuzzy_cache.try_fuzzy_audio_cache(audio_path, text, stem, threshold=threshold)
+        return path if path and os.path.exists(path) else None  # Abs from fuzzy
 
     def index_audio_for_fuzzy(self, text: str, audio_path: str, voice_stem: str) -> None:
-        """Add audio to fuzzy cache for future matching."""
-        self.fuzzy_cache.index_audio(
-            text=text,
-            wav_path=audio_path,
-            voice_stem=voice_stem
-        )
+        """FIXED: Index only if valid (uses absolute _validate_path_for_cache)."""
+        if self._validate_path_for_cache(audio_path, voice_stem):
+            self.fuzzy_cache.index_audio(text, audio_path, voice_stem)
+            logger.debug(f"Indexed fuzzy: '{text[:20]}...' → {Path(audio_path).name} (stem={voice_stem})")
+        else:
+            logger.warning(f"Skipped fuzzy index (invalid path): {audio_path}")
+
+    def _validate_path_for_cache(self, path: str, stem: str = 'default') -> bool:
+        """Shared validation for caches (exists, subpath output, no artifacts). FIXED: Both absolute resolves."""
+        if not path or not os.path.exists(path):
+            return False
+        p = Path(path).resolve()
+        base_dir = (self.cache_config.cache_dir / "audio" / "output").resolve()  # FIXED: Resolve to absolute
+        if not p.is_relative_to(base_dir):
+            logger.warning(f"Path not in output subdir {base_dir}: {path}")
+            return False
+        if is_artifact_laden(path, 7000):
+            logger.warning(f"Artifact-laden path skipped: {path}")
+            return False
+        return True
 
     def clear_caches(self, voice: Optional[str] = None, full: bool = False) -> None:
         """Clear all cache systems with optional voice-specific purge."""
@@ -269,10 +296,8 @@ class CacheManager:
     def cache_stats(self) -> Dict[str, Any]:
         """Aggregate stats from all cache systems."""
         return {
-            "audio_cache": self.audio_cache.get_stats(),
+            "audio_cache": self.audio_cache.get_stats() if hasattr(self.audio_cache, 'get_stats') else {'entries': 0},
             "conditionals_cache": self.conditionals_cache.get_stats(),
             "fuzzy_cache": self.fuzzy_cache.get_stats(),
             "voice_reference": self.voice_reference.get_stats()
         }
-
-

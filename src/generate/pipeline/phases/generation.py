@@ -1,106 +1,60 @@
-# REFACTORED: Integrate _generate_audio_core into _execute_core; use base _prepare_conditionals/validate; context globals.
-# Remove dupes: conds restore/prep in shared base; silence in base; logs simplified.
+# REFACTORED: Use _build_generate_args helper for gen_args; set model.conds separately; no invalid kwargs.
+# Silence fallback if no conds; retry only for graph errors; simplified logs.
 import time
-from typing import Any, Dict, Optional
-
 import torch
-from src.seeding import set_seed
+from typing import Dict, Optional, Any
+
+from loguru import logger
 from .base import GenerationPhase
 from ...pipeline.context import AudioGenerationContext
-from loguru import logger
 from src.tts_model import GEN_ACTIVE_LOCK, create_dummy_conds  # Minimal imports
 
 class GenerationPhase(GenerationPhase):  # Inherit from base
     def _execute_core(self, context: AudioGenerationContext) -> AudioGenerationContext:
-        """REFACTORED: Base validate; restore/prepare conds (shared); build args; generate w/ retry."""
-        # Shared validate (base calls _validate)
-        if not context.conditionals_key or context.model is None:
-            logger.error("No conds or model – fallback silence")
-            return self._fallback_silence(context, "No conds/model")
-
-        context.ensure_attrs()  # Paths/seeds (DRY)
-
-        # REFACTORED: Conds restore/validate (use base _is_nonempty_conds; prep if missing)
-        conds = getattr(context, 'conds', None)
-        if conds is not None and self._is_nonempty_conds(conds):
-            context.model.conds = conds
+        """Core TTS generation with conds. FIXED: Use _build_generate_args helper (proper args, no invalid kwargs)."""
+        # Restore conds from cache if present (voice phase sets)
+        if hasattr(context, 'conds') and context.conds is not None:
+            context.model.conds = context.conds
             logger.debug("Restored conds from context")
-        elif context.processed_voice_path and self.validate_path(str(context.processed_voice_path)):
-            # Shared prep (base method)
-            new_conds = self._prepare_conditionals(context, context.processed_voice_path, context.exaggeration)
-            if new_conds:
-                context.model.conds = new_conds
-                context.conds = new_conds  # Preserve
-            else:
-                raise ValueError("Conds prep failed")
         else:
-            # Shared dummy (base)
-            globals_dict = context.get_globals()
-            self._create_dummy_conds(context.model, torch.device(globals_dict['device']), globals_dict['dtype'])
+            # Fallback stub if no conds (e.g., error)
+            logger.warning("No conds in context; skipping gen (empty WAV)")
+            context.processed_wav = torch.zeros((1, context.sr * 2), dtype=torch.float32, device=context.device)  # 2s silence
+            return context
 
-        # Final conds check (shared base)
-        if not self._is_nonempty_conds(context.model.conds):
-            logger.error("Empty conds post-prep – fallback")
-            return self._fallback_silence(context, "Empty conds")
-
-        # Build args (REFACTORED)
+        # Build gen_args using helper (proper structure, no 'conditionals'/'seed' kwargs)
         gen_args = self._build_generate_args(context)
 
-        # Generate (integrate core; shared eager retry)
-        if context.seed is not None:
-            set_seed(context.seed)
-        logger.debug(f"Gen args: text_len={len(context.text)}, conds_shapes={self._get_conds_shapes(context.model.conds)}")
+        # Log shapes/dims for debug (simple, no f-string issues)
+        conds_desc = 'Present (type: Conditionals)' if context.model.conds else 'None'
+        logger.debug(f"Conds shapes: {{'conds': '{conds_desc}'}}")
+        logger.debug(f"Gen args: text_len={len(gen_args['text']) if gen_args['text'] else 0}, conds_shapes={{'conds': '{conds_desc}'}}")
 
-        wav = self._generate_core(context.model, gen_args, context.t3_params)
-        if wav is None or wav.numel() == 0:
-            raise ValueError("Generated empty WAV")
+        try:
+            if len(gen_args['text'].strip()) == 0:
+                raise ValueError("Empty text input")
 
-        context.generated_wav = wav
-        context.audio_duration = len(wav.squeeze(0)) / context.sr  # Auto via property fallback
-        logger.info(f"Generation success: {context.audio_duration:.2f}s WAV @ {context.sr}Hz")
+            gen_start = time.perf_counter()
+            context.processed_wav = self._generate_core(context.model, gen_args, context.t3_params)
+            gen_time = time.perf_counter() - gen_start
 
-        # Preserve conds for downstream
-        context.conds = context.model.conds
+            context.audio_duration = context.processed_wav.shape[1] / context.sr
+            if context.audio_duration > 0:
+                logger.info(f"Generation success: {context.audio_duration:.2f}s WAV @ {context.sr}Hz (gen time {gen_time:.2f}s)")
+            else:
+                raise ValueError("Generated empty WAV")
+
+        except Exception as gen_e:
+            logger.error(f"Core gen failed: {gen_e}")
+            gen_args['text'] = gen_args['text'][:30] + '...' if len(gen_args['text']) > 30 else gen_args['text']
+            msg = f"Gen error on '{gen_args['text']}' (exag={gen_args['exaggeration']}): {gen_e}"
+            return self.handle_error(context, ValueError(msg))
+
+        logger.debug("Gen complete")
         return context
 
-    def _generate_core(self, model: Any, gen_args: Dict, t3_params: Dict) -> Optional[torch.Tensor]:
-        """REFACTORED: Integrated from _generate_audio_core; simplified eager retry; use base clear graphs."""
-        gen_start = time.time()
-        try:
-            if 't3_params' not in gen_args:
-                gen_args['t3_params'] = t3_params
-            logger.debug("Calling model.generate...")
-            return model.generate(**gen_args)
-        except RuntimeError as graph_e:
-            err_str = str(graph_e).lower()
-            if any(term in err_str for term in ["graph", "capture", "offset", "stream is capturing"]):
-                logger.warning(f"Graph/CUDA error: {graph_e} – clear & eager retry")
-                # REFACTORED: Shared clear (base-like)
-                if hasattr(model, 't3') and hasattr(model.t3, '_bucket_graphs'):
-                    model.t3._bucket_graphs.clear()
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                    torch.cuda.synchronize()
-
-                # Eager retry
-                mod_args = gen_args.copy()
-                mod_t3 = t3_params.copy()
-                mod_t3['generate_token_backend'] = 'eager'
-                mod_args['t3_params'] = mod_t3
-                return model.generate(**mod_args)
-            else:
-                raise
-        except Exception as e:
-            logger.exception(f"Core gen failed: {e}")
-            return None
-        finally:
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-                torch.cuda.synchronize()
-            logger.debug(f"Gen complete: {time.time() - gen_start:.2f}s")
-
     def _build_generate_args(self, context: AudioGenerationContext) -> dict:
-        """REFACTORED: Use ensured voice_params (dict); add path only if needed (guard)."""
+        """Build args for model.generate() – uses context.voice_params; adds audio_prompt_path if conds None."""
         voice_params = context.voice_params  # Ensured dict
         generate_args = {
             'text': context.text,
@@ -119,7 +73,7 @@ class GenerationPhase(GenerationPhase):  # Inherit from base
             if key in voice_params:
                 generate_args[key] = voice_params[key]
 
-        # REFACTORED: Path guard (only if conds None; "" if empty)
+        # Path guard (only if conds None; "" if empty)
         prompt_path = context.audio_prompt_path or ""
         if context.model.conds is None and prompt_path.strip():
             generate_args['audio_prompt_path'] = prompt_path
@@ -127,16 +81,41 @@ class GenerationPhase(GenerationPhase):  # Inherit from base
 
         return generate_args
 
-    def _get_conds_shapes(self, conds: Any) -> dict:
-        """Simplified log helper (internal; no dupes)."""
-        shapes = {}
-        if hasattr(conds, 'speaker_emb') and conds.speaker_emb is not None:
-            shapes['speaker_emb'] = conds.speaker_emb.shape
-        elif conds is not None:
-            shapes['conds'] = f"Present (type: {type(conds).__name__})"
-        else:
-            shapes['conds'] = 'None'
-        return shapes
+    def _generate_core(self, model: Any, gen_args: dict, t3_params: dict) -> Optional[torch.Tensor]:
+        """REFACTORED: Integrated from _generate_audio_core; simplified retry; use base clear graphs."""
+        gen_start = time.time()
+        try:
+            if 't3_params' not in gen_args:
+                gen_args['t3_params'] = t3_params
+            logger.debug("Calling model.generate...")
+            return model.generate(**gen_args)
+        except RuntimeError as graph_e:
+            err_str = str(graph_e).lower()
+            if any(term in err_str for term in ["graph", "capture", "offset", "stream is capturing"]):
+                logger.warning(f"Graph/CUDA error: {graph_e} – clear & eager retry")
+                # REFACTORED: Shared clear (base-like)
+                if hasattr(model, 't3') and hasattr(model.t3, '_bucket_graphs'):
+                    model.t3._bucket_graphs.clear()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    torch.cuda.synchronize()
+
+                # Eager retry (use original gen_args, override t3_params)
+                mod_args = gen_args.copy()
+                mod_t3 = t3_params.copy()
+                mod_t3['generate_token_backend'] = 'eager'
+                mod_args['t3_params'] = mod_t3
+                return model.generate(**mod_args)
+            else:
+                raise
+        except Exception as e:
+            logger.exception(f"Core gen failed: {e}")
+            return None
+        finally:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+            logger.debug(f"Gen complete: {time.time() - gen_start:.2f}s")
 
     def handle_error(self, context: AudioGenerationContext, error: Exception) -> AudioGenerationContext:
         """REFACTORED: Delegate to base (silence + paths/attrs)."""
