@@ -8,7 +8,8 @@ from src.normalize_stem import normalize_stem
 from src.config import get_config  # For defaults from config
 
 class InputsValidationPhase(GenerationPhase):
-    """REFACTORED: Master validator – shared helpers for text, stem, seed, and audio params (exagg, temp, etc.). Validates early to prevent None errors."""
+    """REFACTORED: Master validator – shared helpers for text, stem, seed, and audio params (exagg, temp, etc.). Validates early to prevent None errors.
+    OPTIMIZED: Single call to get_voice_params, then use the full dict for all params (avoids repetition)."""
 
     def _execute_core(self, context: AudioGenerationContext) -> AudioGenerationContext:
         """REFACTORED: Core validation using shared helpers; ensure all audio params have sane defaults."""
@@ -21,7 +22,7 @@ class InputsValidationPhase(GenerationPhase):
         # Seed
         self.default_seed(context)
 
-        # FIXED: Validate/default all audio params (exaggeration, temperature, etc.) using getattr with config/defaults
+        # FIXED: Validate/default all audio params with single voice_params fetch
         self.validate_audio_params(context)
 
         # Delegate to base for conds/paths (already in _validate)
@@ -55,31 +56,32 @@ class InputsValidationPhase(GenerationPhase):
 
     @staticmethod
     def validate_audio_params(context: AudioGenerationContext):
-        """FIXED: Ensure all audio params have sane non-None defaults (from config or hardcoded)."""
+        """OPTIMIZED: Ensure all audio params have sane non-None defaults (single get_voice_params call).
+        Fetches voice_params once, then uses the dict for all params (no repetition). Adds t3_params validation."""
         config = get_config() if context.config is None else context.config
 
-        # Helper to get sane default (config if available, else hardcoded)
-        def sane_default(key: str, default: float) -> float:
-            if hasattr(config, 'get_voice_params') and context.voice_stem != "default":
-                voice_params = config.get_voice_params(context.voice_stem) or {}
-                return voice_params.get(key, default)
-            return default
+        # FIXED: Fetch voice_params once if voice_stem is set (for the entire pipeline)
+        voice_params = {}
+        if hasattr(config, 'get_voice_params') and context.voice_stem != "default":
+            voice_params = config.get_voice_params(context.voice_stem) or {}  # Single call!
 
-        # FIXED: Set each param if None or invalid
-        defaults = {
-            'exaggeration': sane_default('exaggeration', 0.5),
-            'temperature': sane_default('temperature', 0.7),
-            'cfg_weight': sane_default('cfg_weight', 0.45),
-            'min_p': sane_default('min_p', 0.05),
-            'top_p': sane_default('top_p', 1.0),
-            'repetition_penalty': sane_default('repetition_penalty', 1.2),
-        }
+        # Helper: Get from voice_params, fall back to context, then hardcoded
+        def sane_default(key: str, fallback_default: float) -> float:
+            context_val = getattr(context, key, None)
+            if context_val is not None and isinstance(context_val, (int, float)) and 0 <= context_val <= 2.0:
+                return context_val  # Use context if sane
+            voice_val = voice_params.get(key, None)
+            if voice_val is not None and isinstance(voice_val, (int, float)) and 0 <= voice_val <= 2.0:
+                return voice_val  # Use voice override
+            return fallback_default  # Hardcoded fallback
 
-        for param, default_val in defaults.items():
-            val = getattr(context, param, None)
-            if val is None or not isinstance(val, (int, float)) or not 0 <= val <= 2.0:  # Loose range check
-                setattr(context, param, default_val)
-                logger.debug(f"Set default {param}={default_val} (was invalid/None)")
+        # Set each param with sane_default
+        context.exaggeration = sane_default('exaggeration', 0.5)
+        context.temperature = sane_default('temperature', 0.7)
+        context.cfg_weight = sane_default('cfg_weight', 0.45)
+        context.min_p = sane_default('min_p', 0.05)
+        context.top_p = sane_default('top_p', 1.0)
+        context.repetition_penalty = sane_default('repetition_penalty', 1.2)
 
         # Also ensure t3_params is present (fallback dict if None)
         if context.t3_params is None:
@@ -90,7 +92,7 @@ class InputsValidationPhase(GenerationPhase):
             }
             logger.debug("Set default t3_params (was None)")
 
-        logger.debug(f"Audio params validated: exagg={context.exaggeration}, temp={context.temperature}, cfg={context.cfg_weight}")
+        logger.trace(f"Audio params validated: exagg={context.exaggeration}, temp={context.temperature}, cfg={context.cfg_weight} (from single voice_params fetch)")
 
     def handle_error(self, context: AudioGenerationContext, error: Exception) -> AudioGenerationContext:
         """REFACTORED: Delegate to base (silence)."""

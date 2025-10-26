@@ -14,6 +14,7 @@ from .audio_cache import AudioCache
 from .conditionals_cache import ConditionalsCache
 from .fuzzy_cache import FuzzyAudioCache
 from .voice_reference import VoiceReferenceCache, VoiceReferenceEntry
+from ..pipeline import AudioGenerationContext
 from ...audio_utils import is_artifact_laden
 from ...normalize_stem import normalize_stem
 
@@ -33,7 +34,7 @@ def get_cache_manager(config=None):
     return _cache_manager_instance
 
 class CacheManager:
-    """Centralized cache management for audio generation pipeline. FIXED: _validate_path_for_cache uses absolute resolves."""
+    """Centralized cache management for audio generation pipeline. SIMPLIFIED: process_voice_reference takes only context (extracts path/stem internally)."""
 
     def __init__(self, config):
         self.config = config
@@ -132,46 +133,56 @@ class CacheManager:
         is_valid = self.voice_reference.validate_reference_file(audio_path, voice_stem, sr=sr)  # FIXED: No device/dtype kwargs (use internals)
         return is_valid, "Valid" if is_valid else "Invalid voice reference"
 
-    def process_voice_reference(self, audio_path: str, voice_stem: str, force: bool = False) -> Tuple[
+    def process_voice_reference(self, context: AudioGenerationContext, force: bool = False) -> Tuple[
         str, str, str, Dict[str, Any], Optional[VoiceReferenceEntry]]:
         """
-        Wrapper; SIMPLIFIED: Norm stem on input; call process_new_reference; return tuple + hit_entry.
-        FIXED: No device/dtype kwargs in get_voice_params (dict for params only).
+        SIMPLIFIED: Takes only context (extracts audio_path/voice_stem internally); call process_new_reference; return tuple + hit_entry.
+        FIXED: Extract audio_path = context.audio_prompt_path, voice_stem = context.voice_stem; pass to VoiceReferenceCache.
         """
+        if context is None:
+            logger.warning("process_voice_reference called without context; fallback to defaults")
+            voice_params = self.config.get_voice_params('default', {'exaggeration': 1.0})
+            return "", '', 'fallback_key', voice_params, None
+
+        audio_path = getattr(context, 'audio_prompt_path', None)
+        voice_stem = getattr(context, 'voice_stem', 'default')
+
         if not audio_path or not os.path.exists(audio_path):
-            logger.warning(f"Invalid voice path: {audio_path}")
-            voice_params = self.config.get_voice_params('default', {'exaggeration': 1.0})  # FIXED: Dict for params (no device/dtype kwargs)
-            return audio_path, '', 'fallback_key', voice_params, None
+            logger.warning(f"Invalid voice path from context: {audio_path}")
+            voice_params = self.config.get_voice_params(voice_stem, {'exaggeration': 1.0})
+            context.audio_prompt_path = ""  # Reset in context
+            return "", '', 'fallback_key', voice_params, None
 
-        # SIMPLIFIED: Always derive norm_stem (stable)
-        voice_stem = self.voice_reference.normalize_stem(audio_path) or voice_stem or 'default'
-        logger.debug(f"Process voice under stable norm_stem '{voice_stem}'")
+        # Always derive norm_stem (stable)
+        norm_stem = self.get_voice_stem(audio_path)
+        voice_stem = norm_stem or voice_stem or 'default'
+        logger.debug(f"Process voice under stable norm_stem '{voice_stem}' from context")
 
-        # Basic validation (min dur/artifacts)
-        config = get_config()
+        # Basic validation (min dur/artifacts) using context.sr if available
         min_duration = get_config_value('globals.min_ref_duration', 3.0)
+        sr = getattr(context, 'sr', 24000)  # Use context.sr or fallback
         try:
             info = torchaudio.info(audio_path)
             duration = info.num_frames / info.sample_rate
             if duration < min_duration:
                 logger.warning(f"Short {voice_stem}: {duration:.2f}s")
-                voice_params = config.get_voice_params(voice_stem, {})  # FIXED: Dict for params (no device/dtype kwargs)
-                return audio_path, '', 'short_fallback_key', voice_params, None
+                voice_params = self.config.get_voice_params(voice_stem, {})
+                return "", '', 'short_fallback_key', voice_params, None
 
             if get_config_value('globals.check_artifacts', True):
-                threshold = getattr(config.app_config.globals, 'sr', 24000) // 3 if hasattr(config, 'app_config') and hasattr(config.app_config, 'globals') else 8000
+                threshold = sr // 3  # Dynamic from context/config SR
                 if is_artifact_laden(audio_path, threshold_hz=threshold):
-                    logger.warning(f"Artifacts {voice_stem}; purge if cached")
+                    logger.warning(f"Artifacts in {voice_stem}; purge if cached")
                     if voice_stem in self.voice_reference.voice_cache:
                         self.voice_reference.voice_cache.pop(voice_stem, None)
         except Exception as v_e:
-            logger.warning(f"Validation fail {voice_stem}: {v_e}")
-            voice_params = config.get_voice_params(voice_stem, {})  # FIXED: Dict for params (no device/dtype kwargs)
-            return audio_path, '', 'invalid_fallback_key', voice_params, None
+            logger.warning(f"Validation fail for {voice_stem}: {v_e}")
+            voice_params = self.config.get_voice_params(voice_stem, {})
+            return "", '', 'invalid_fallback_key', voice_params, None
 
-        # Call with stable norm_stem
+        # FIXED: Pass context to process_new_reference
         success, processed_path, conds_key, voice_params, hit_entry = self.voice_reference.process_new_reference(
-            voice_stem, audio_path, force_update=force
+            voice_stem, audio_path, force_update=force, context=context
         )
 
         if not success:
@@ -179,8 +190,8 @@ class CacheManager:
             if voice_stem in self.voice_reference.voice_cache:
                 self.voice_reference.voice_cache.pop(voice_stem, None)
                 self.voice_reference.save_cache()
-            voice_params = config.get_voice_params(voice_stem, {})  # FIXED: Dict for params (no device/dtype kwargs)
-            return audio_path, '', f'{voice_stem}_fail_key', voice_params, None
+            voice_params = self.config.get_voice_params(voice_stem, {})
+            return "", '', f'{voice_stem}_fail_key', voice_params, None
 
         if hit_entry:
             logger.info(f"Voice HIT/reuse {voice_stem} (stable norm)")
@@ -204,7 +215,7 @@ class CacheManager:
             return hashlib.md5(str(audio_path).encode('utf-8')).hexdigest()
 
     def get_conditionals(self, conditionals_key: str, model: Any) -> bool:
-        """Load conditionals from cache system (memory or disk). FIXED: Safe globals access (no kwargs issues)."""
+        """Load conditionals from cache system (memory or disk). FIXED: Safe globals access."""
         if not conditionals_key:
             return False
 
@@ -262,7 +273,6 @@ class CacheManager:
         else:
             logger.debug(f"Skipped set (missing): {audio_path}")
 
-
     def get_fuzzy_audio_cache(self,
                             audio_path: str = '',
                             text: str = '',
@@ -299,7 +309,6 @@ class CacheManager:
             return False
         logger.debug(f"Validated path: {p} in {base_dir}")
         return True
-
 
     def clear_caches(self, voice: Optional[str] = None, full: bool = False) -> None:
         """Clear all cache systems with optional voice-specific purge."""
