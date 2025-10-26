@@ -26,12 +26,11 @@ class OutputPhase(GenerationPhase):
         super().__init__()
 
     def _execute_core(self, context: AudioGenerationContext) -> AudioGenerationContext:
-        """If cached_path set (from audio/fuzzy HIT), verify/use it (no save/post). Else, normal save + exact cache set."""
-        # Early HIT path (bypass save/gen)
+        """If cached_path set (from audio/fuzzy HIT), verify/use it (no save/post). Else, normal save + exact cache set + fuzzy index."""
+        # Early HIT path (bypass save/gen/set/index)
         if hasattr(context, 'cached_path') and context.cached_path and os.path.exists(context.cached_path):
             cached_p = Path(context.cached_path)
             if cached_p.stat().st_size > 100:  # Min size
-                # FIXED: Attr access for base_dir (no .get)
                 try:
                     cache_root = context.config.app_config.globals.cache_dir if hasattr(context.config.app_config,
                                                                                         'globals') and hasattr(
@@ -41,10 +40,11 @@ class OutputPhase(GenerationPhase):
                 base_dir = (cache_root / "audio" / "output").resolve()
                 if cached_p.is_relative_to(base_dir):
                     context.output_path = str(cached_p.absolute())
-                    logger.info(f"Used cached path on HIT: {context.output_path} (no save)")
+                    logger.info(f"Used cached path on HIT: {context.output_path} (no save/set/index)")
                     return context
                 else:
-                    logger.warning(f"Cached path not in output dir {base_dir}: {context.cached_path} – regenerate")
+                    logger.warning(
+                        f"Cached path not in output dir {base_dir}: {context.cached_path} – forcing full pipeline")
 
         # No HIT or invalid → normal save
         if context.processed_wav is None or context.processed_wav.numel() == 0:
@@ -61,50 +61,75 @@ class OutputPhase(GenerationPhase):
 
         context.ensure_attrs()
         sr_int = context.sr
-        voice_stem = context.voice_stem
-        text_hash = abs(hash(context.text or '')) % 1000000
+        voice_stem = context.voice_stem or "default"  # Ensure voice_stem
+        text_hash = abs(hash(context.text or '')) % 1000000  # Fallback if text missing
         timestamp = int(time.time() * 1000) % 10000
         base_name = f"{voice_stem}_{text_hash}_{timestamp}_{sr_int}kHz.wav"
         output_path = output_dir / base_name
+
+        # FIXED: Normalize path (strip trailing /, ensure absolute)
+        output_path = output_path.absolute().resolve()
+        if output_path.suffix != '.wav':
+            output_path = output_path.with_suffix('.wav')
 
         wav_cpu = context.processed_wav.cpu().float()
         torchaudio.save(str(output_path), wav_cpu, sr_int)
 
         if output_path.exists() and output_path.stat().st_size > 100:
-            context.output_path = str(output_path.absolute())
+            context.output_path = str(output_path)
             size_kb = output_path.stat().st_size / 1024
             logger.info(f"Saved WAV: {context.output_path}, size={size_kb:.1f}KB")
 
-            # FIXED: Direct exact cache set (sync, on MISS) – pass voice_stem
-            is_miss = not getattr(context, 'is_cached', True)
-            if is_miss and self.cache_manager:
-                cache_key = getattr(context, 'cache_key', f"postgen_{text_hash}")
-                self.cache_manager.set_audio_cache(cache_key, str(output_path.absolute()))
+            # FIXED: Always attempt exact cache set (post-save, sync) – generate full key using CacheManager
+            is_hit = getattr(context, 'is_cached', False)  # From earlier pipeline stages
+            if self.cache_manager:  # Ensure available
+                # Generate full key (voice_stem, text, exaggeration, cache_uuid)
+                exagg = getattr(context, 'exaggeration', 0.5)  # Default fallback
+                uuid_val = getattr(context, 'cache_uuid', 0)  # Default 0 if missing
+                cache_key = self.cache_manager.generate_audio_cache_key(
+                    voice_stem=voice_stem,
+                    text=context.text or "",
+                    exaggeration=exagg,
+                    cache_uuid=uuid_val
+                )
+                logger.debug(f"Generated cache_key for set: {cache_key}")
+                self.cache_manager.set_audio_cache(cache_key, str(output_path))
+                logger.info(f"Set exact audio cache: {cache_key[:20]}... → {output_path.name}")
 
-            # Queue fuzzy index (async, on MISS)
-            if is_miss and self.cache_manager:
-                try:
-                    self.cache_manager.index_audio_for_fuzzy(context.text, context.output_path, voice_stem)
-                    logger.debug(f"Queued fuzzy index for {base_name}")
-                except Exception as queue_e:
-                    logger.warning(f"Fuzzy index failed: {queue_e}")
-
-            # Legacy async postgen queue (if needed, but direct above preferred)
-            if (is_miss and self.audio_cache and hasattr(self.audio_cache, 'async_cache_postgen')):
-                try:
-                    self.audio_cache.async_cache_postgen(
-                        cache_key=cache_key,
-                        audio_path=context.output_path,
-                        text=context.text or '',
-                        voice_stem=voice_stem
-                    )
-                    logger.debug(f"Queued legacy postgen for {base_name} (direct set already done)")
-                except Exception as queue_e:
-                    logger.warning(f"Legacy queue failed: {queue_e}")
+                # FIXED: Always index for fuzzy (post-save, after exact set) – moved here from UI
+                if hasattr(self.cache_manager, 'index_audio_for_fuzzy'):
+                    try:
+                        self.cache_manager.index_audio_for_fuzzy(
+                            text=context.text or "",
+                            audio_path=str(output_path),
+                            voice_stem=voice_stem
+                        )
+                        logger.debug(
+                            f"Indexed audio for fuzzy: '{context.text[:30]}...' → {output_path.name} (stem={voice_stem})")
+                    except Exception as fuzzy_e:
+                        logger.warning(f"Failed to index for fuzzy: {fuzzy_e}")
+                    # Legacy async postgen queue (if needed, but direct set/index preferred)
+                    if hasattr(self.audio_cache, 'async_cache_postgen'):
+                        try:
+                            self.audio_cache.async_cache_postgen(
+                                cache_key=cache_key,  # Use full key
+                                audio_path=str(output_path),
+                                text=context.text or '',
+                                voice_stem=voice_stem
+                            )
+                            logger.debug(f"Queued legacy postgen for {output_path.name}")
+                        except Exception as queue_e:
+                            logger.warning(f"Legacy queue failed: {queue_e}")
+            else:
+                logger.warning("No CacheManager – skipped exact cache set and fuzzy index")
         else:
-            raise OSError("Save failed (zero-size)")
+            error_msg = "Save failed (zero-size or invalid path)"
+            logger.error(error_msg)
+            # Fallback handling (as in original code)
+            context.output_path = self._create_temp_fallback()  # Or call _save_fallback_direct
 
         return context
+
 
     def _save_fallback_direct(self, voice_stem: str, sr: int) -> str:
         """Save fallback WAV directly (no cache queue)."""

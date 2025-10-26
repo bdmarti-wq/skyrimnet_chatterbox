@@ -67,6 +67,7 @@ class CacheManager:
         if stem_only:
             return voice_stem
 
+        logger.debug(f"The cache_generated_cache_key is: {voice_stem}_{text_hash}_{exaggeration:.2f}_{uuid_hex}")
         return f"{voice_stem}_{text_hash}_{exaggeration:.2f}_{uuid_hex}"
 
     def get_voice_stem(self, audio_path: Optional[str]) -> str:

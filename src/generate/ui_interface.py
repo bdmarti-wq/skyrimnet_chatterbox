@@ -151,6 +151,8 @@ async def generate_audio_ui(
             cache_manager=cache_manager  # FIXED: Pass the cache_manager
         )
 
+
+
         if PIPELINE_CACHE is None:
             from .pipeline.coordinator import GenerationCoordinator
             PIPELINE_CACHE = GenerationCoordinator()
@@ -164,13 +166,6 @@ async def generate_audio_ui(
 
         # Process result
         if result and result.output_path and Path(result.output_path).exists():
-            # Index for future fuzzy matching if applicable
-            if result.processed_voice_path and result.voice_stem != "default":
-                cache_manager.index_audio_for_fuzzy(
-                    text=text,
-                    audio_path=result.output_path,
-                    voice_stem=result.voice_stem
-                )
             return _ensure_valid_return(result.output_path)
 
         error_msg = "No valid output path generated"
