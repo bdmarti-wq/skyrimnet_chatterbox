@@ -17,7 +17,7 @@ from src.ui import create_ui
 backend = set_torchaudio_backend()
 
 # New pipeline and cache system imports
-from src.generate.cache.cache_manager import CacheManager
+from src.generate.cache.cache_manager import CacheManager, get_cache_manager
 from src.generate.pipeline.coordinator import GenerationCoordinator
 
 
@@ -50,7 +50,7 @@ def initialize_cache_system():
     config = get_config()
 
     # Create cache manager (already handles directory structure)
-    cache_manager = CacheManager(config)
+    cache_manager = get_cache_manager(config)
 
     logger.info("Cache system initialized successfully with the following stats:")
     stats = cache_manager.cache_stats

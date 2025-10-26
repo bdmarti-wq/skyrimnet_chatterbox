@@ -8,6 +8,7 @@ from loguru import logger
 from typing import Dict, Any, Optional
 
 from src.config import get_config
+from src.generate.cache.cache_manager import get_cache_manager
 from src.tts_model import get_model  # Warmup global in tts_model
 from src.generate.cache import CacheManager
 from src.generate.pipeline.phases.inputs_validation import InputsValidationPhase
@@ -28,7 +29,7 @@ class GenerationCoordinator:
         if self.config is None or not hasattr(self.config, 'app_config'):
             raise ValueError("Invalid config – cannot initialize coordinator")
 
-        self.cache_manager = CacheManager(self.config)
+        self.cache_manager = get_cache_manager(self.config)
 
         # Phases (inject cache_manager where needed)
         self.phases = [

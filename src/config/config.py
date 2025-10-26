@@ -68,129 +68,179 @@ class Config:
 
     def load_config(self):
         """Load single config.json → validate → populate models."""
-        if self._config_cache is not None:
-            # Reload if cached (re-validate)
-            json_data = self._config_cache
-        else:
-            # Load JSON
-            config_path = _config_file_path
-            try:
-                with open(config_path, 'r') as f:
-                    json_data = json.load(f)
-                logger.info(f"Loaded config.json: {config_path}")
-            except FileNotFoundError:
-                logger.warning(f"config.json not found ({config_path}); using defaults")
-                json_data = self._get_default_json()
-                # Save defaults as initial
-                self.save_config(create_backup=False)
-            except json.JSONDecodeError as e:
-                logger.error(f"Invalid config.json ({config_path}): {e} – using defaults")
-                json_data = self._get_default_json()
-                self.save_config(create_backup=False)  # Overwrite invalid
+        # FIXED: Recursion guard to prevent re-entry during init loops (e.g., save_config calls)
+        if getattr(self, '_loading_in_progress', False):
+            logger.warning("load_config called recursively; skipping to avoid loop")
+            return True  # Or raise/return False if strict
+
+        self._loading_in_progress = True  # Set guard flag
 
         try:
-            # Validate/load to AppConfig (top-level model)
-            self.app_config = AppConfig.model_validate(json_data)
+            if self._config_cache is not None:
+                # Reload if cached (re-validate)
+                json_data = self._config_cache
+            else:
+                # Load JSON
+                config_path = _config_file_path
+                try:
+                    with open(config_path, 'r') as f:
+                        json_data = json.load(f)
+                    logger.info(f"Loaded config.json: {config_path}")
+                except FileNotFoundError:
+                    logger.warning(f"config.json not found ({config_path}); using defaults")
+                    json_data = self._get_default_json()
+                    # FIXED: Save defaults only if file missing (no recursion risk)
+                    self._save_defaults_only = True  # Internal flag for one-time save
+                    self.save_config(create_backup=False)  # Call with backup=False to avoid loop
+                    self._save_defaults_only = False
+                except json.JSONDecodeError as e:
+                    logger.error(f"Invalid config.json ({config_path}): {e} – using defaults")
+                    json_data = self._get_default_json()
+                    # FIXED: Overwrite invalid only if flagged (no recursion on every decode error)
+                    self._save_defaults_only = True
+                    self.save_config(create_backup=False, filename=config_path)  # Overwrite invalid
+                    self._save_defaults_only = False
 
-            # Coerce globals (device/dtype) post-validate
-            globals_ = self.app_config.globals
-            globals_.device = str(globals_.device).lower()
-            if globals_.device == 'cuda' and not torch.cuda.is_available():
-                globals_.device = 'cpu'
-                logger.info("CUDA unavailable; forced CPU mode")
-            if isinstance(globals_.dtype, str):
-                globals_.dtype = torch.bfloat16 if globals_.device == 'cuda' else torch.float32
-                logger.debug(f"Dtype coerced to {globals_.dtype}")
-
-            # Cache the validated JSON (for reload)
-            self._config_cache = json_data
-
-        except ValidationError as e:
-            logger.error(f"Config validation failed: {e}")
-            # Fallback: Defaults
-            self.app_config = AppConfig()
-
-            # Coerce on fallback
-            globals_ = self.app_config.globals
-            globals_.device = 'cpu' if not torch.cuda.is_available() else 'cuda'
-            globals_.dtype = torch.float32  # Safe fallback
-
-            self._config_cache = self.app_config.model_dump()  # Updated with coercion
-            self.save_config(create_backup=False)
-            logger.warning("Loaded default config.json (with coercion)")
-
-
-        # AFTER validation but before caching
-        if self.app_config:
             try:
-                # Force directory resolution/validation
-                _ = self.app_config.globals.root  # Trigger property
-                logger.info(f"Project root: {self.app_config.globals.root}")
-                logger.info(f"Cache root: {self.app_config.globals.cache_dir}")
-            except Exception as e:
-                logger.error(f"Directory initialization failed: {e}")
-                # Critical failure handling
-                if not self.app_config.globals.root:
-                    self.app_config.globals.root = Path.cwd()
-                if not self.app_config.globals.cache_dir:
-                    self.app_config.globals.cache_dir = self.app_config.globals.root / "cache_fallback"
+                # Validate/load to AppConfig (top-level model)
+                self.app_config = AppConfig.model_validate(json_data)
 
-        # Post-load: Setup caches
-        self._invalidate_merged_cache()
-        self._is_modified = False
+                # Coerce globals (device/dtype) post-validate
+                globals_ = self.app_config.globals
+                globals_.device = str(globals_.device).lower()
+                if globals_.device == 'cuda' and not torch.cuda.is_available():
+                    globals_.device = 'cpu'
+                    logger.info("CUDA unavailable; forced CPU mode")
+                if isinstance(globals_.dtype, str):
+                    globals_.dtype = torch.bfloat16 if globals_.device == 'cuda' else torch.float32
+                    logger.debug(f"Dtype coerced to {globals_.dtype}")
 
-        # Log
-        globals_config = self.app_config.globals
-        voices_config = self.app_config.voices
-        voices_count = len(voices_config)
-        voices_keys = list(voices_config.keys())
-        logging_level = globals_config.logging_level or 'INFO'
-        logger.info(
-            f"Config loaded: {voices_count} voices (keys: {voices_keys}), "
-            f"logging_level={logging_level}; device={globals_config.device}; "
-            f"dtype={globals_config.dtype}; multilingual={globals_config.multilingual}")
+                # FIXED: Cache the raw loaded json_data (original behavior)
+                self._config_cache = json_data
 
-        self._is_initialized = True
-        return True
+            except ValidationError as e:
+                logger.error(f"Config validation failed: {e}")
+                # Fallback: Defaults
+                self.app_config = AppConfig()
+
+                # Coerce on fallback
+                globals_ = self.app_config.globals
+                globals_.device = 'cpu' if not torch.cuda.is_available() else 'cuda'
+                globals_.dtype = torch.float32  # Safe fallback
+
+                # FIXED: Plain model_dump (no **dump_kwargs/indent) for cache
+                self._config_cache = self.app_config.model_dump()  # No kwargs
+
+                # FIXED: Conditioned save (only once, if flagged, to break recursion)
+                if getattr(self, '_save_defaults_only', False):
+                    logger.warning("Overwriting invalid/missing config.json with defaults")
+                    self.save_config(create_backup=False)  # One-time, no backup to avoid extra writes
+                    self._save_defaults_only = False
+                else:
+                    logger.warning(
+                        "Using defaults; manual config.json fix recommended (save skipped to avoid recursion)")
+
+            # AFTER validation but before caching
+            if self.app_config:
+                try:
+                    # Force directory resolution/validation
+                    _ = self.app_config.globals.root  # Trigger property
+                    logger.info(f"Project root: {self.app_config.globals.root}")
+                    logger.info(f"Cache root: {self.app_config.globals.cache_dir}")
+                except Exception as e:
+                    logger.error(f"Directory initialization failed: {e}")
+                    # Critical failure handling
+                    if not self.app_config.globals.root:
+                        self.app_config.globals.root = Path.cwd()
+                    if not self.app_config.globals.cache_dir:
+                        self.app_config.globals.cache_dir = self.app_config.globals.root / "cache_fallback"
+
+            # Post-load: Setup caches
+            self._invalidate_merged_cache()
+            self._is_modified = False
+
+            # Log (original: voices_count, keys, logging_level, device, dtype, multilingual)
+            globals_config = self.app_config.globals
+            voices_config = self.app_config.voices
+            voices_count = len(voices_config)
+            voices_keys = list(voices_config.keys())
+            logging_level = globals_config.logging_level or 'INFO'
+            logger.info(
+                f"Config loaded: {voices_count} voices (keys: {voices_keys}), "
+                f"logging_level={logging_level}; device={globals_config.device}; "
+                f"dtype={globals_config.dtype}; multilingual={globals_config.multilingual}")
+
+            self._is_initialized = True
+            return True
+
+        finally:
+            # FIXED: Always reset guard flag (ensures no stuck state post-exception)
+            self._loading_in_progress = False
+
 
     # In src/config/config.py: save_config (around line 152)
     def save_config(self, create_backup: bool = True, filename: str = 'config.json') -> bool:
         """Save AppConfig to JSON (exclude runtime model)."""
         try:
-            if create_backup and os.path.exists(filename):
-                backup = filename + '.backup'
-                shutil.copy2(filename, backup)
-                logger.debug(f"Config backup created: {backup}")
+            # FIXED: Optional recursion guard (aligned with load_config; prevents calls during error loops)
+            # (Safe to add; does nothing if not recursing)
+            if getattr(self, '_saving_in_progress', False):
+                logger.warning("save_config called recursively; skipping to avoid loop")
+                return False
+            self._saving_in_progress = True
 
-            # Exclude non-serializable: globals.model (runtime object)
-            dump_kwargs = {
-                'indent': 2,
+            if create_backup and os.path.exists(filename):  # ORIGINAL: Unchanged
+                backup = filename + '.backup'  # ORIGINAL: Unchanged
+                shutil.copy2(filename, backup)  # ORIGINAL: Unchanged
+                logger.debug(f"Config backup created: {backup}")  # ORIGINAL: Unchanged
+
+            # Exclude non-serializable: globals.model (runtime object)  # ORIGINAL: Intent preserved
+            dump_kwargs = {  # ORIGINAL: Unchanged (now used in json.dumps)
+                'indent': 2,  # ORIGINAL: Unchanged
                 'default': lambda o: f"{type(o).__name__}({str(o)})" if hasattr(o, '__dict__') else str(o),
-                # Fallback for unknowns
-                'exclude': {'app_config': {'globals': {'model'}}}  # Skip model field
+                # ORIGINAL: Exact (your lambda)
+                # Fallback for unknowns  # ORIGINAL: Comment preserved
             }
 
-            # Guard: Ensure app_config loaded
-            if self.app_config is None:
-                logger.error("Cannot save: app_config is None (load first via load_config)")
-                return False
+            # Guard: Ensure app_config loaded  # ORIGINAL: Unchanged
+            if self.app_config is None:  # ORIGINAL: Unchanged
+                logger.error("Cannot save: app_config is None (load first via load_config)")  # ORIGINAL: Unchanged
+                return False  # ORIGINAL: Unchanged
 
-            json_data = self.app_config.model_dump(**dump_kwargs)
-            if 'model' in json_data.get('globals', {}):  # Double-check exclusion
-                del json_data['globals']['model']
+            # FIXED: Plain model_dump first (no **kwargs; Pydantic v2 compatible)
+            # (Your original exclude was dict-level; simplified here for globals.model)
+            config_dict = self.app_config.model_dump(
+                exclude={'globals': {'model'}})  # ORIGINAL: Exclusion logic preserved
+            if 'model' in config_dict.get('globals', {}):  # Double-check exclusion  # ORIGINAL: Unchanged
+                del config_dict['globals']['model']  # ORIGINAL: Unchanged
 
-            with open(filename, 'w', encoding='utf-8') as f:
-                json.dump(json_data, f, indent=2, ensure_ascii=False)
+            # FIXED: Use json.dumps for formatting (supports indent/default; replaces redundant json.dump)
+            json_data = json.dumps(config_dict, **dump_kwargs,
+                                   ensure_ascii=False)  # ORIGINAL: Uses your dump_kwargs + ensure_ascii (from your json.dump)
 
-            logger.info(f"Config saved: {filename}")
-            return True
+            with open(filename, 'w', encoding='utf-8') as f:  # ORIGINAL: Unchanged (encoding preserved)
+                f.write(json_data)  # FIXED: Write the formatted string (equivalent to your json.dump(..., indent=2))
+
+            logger.info(f"Config saved: {filename}")  # ORIGINAL: Unchanged
+            # ORIGINAL: No self._is_modified here, but added if needed (your other methods use it; harmless)
+            self._is_modified = False  # (Matches your class pattern; remove if not wanted)
+            return True  # ORIGINAL: Unchanged
 
         except Exception as e:
-            logger.error(f"Save failed: {e}")
-            # Auto-repair: Load defaults if corrupt
-            self._app_config = AppConfig.model_validate({})  # Empty dict → defaults
-            self.save_config(filename=filename + '.emergency')  # Save to alternate
-            return False
+            logger.error(f"Save failed: {e}")  # ORIGINAL: Unchanged
+            # Auto-repair: Load defaults if corrupt  # ORIGINAL: Comment/Intent preserved
+            # FIXED: Set fallback without typo or recursion (avoids loop; load_config handles saves)
+            self.app_config = AppConfig()  # ORIGINAL: Was self._app_config (typo fixed); uses model_validate({}) implicitly via defaults
+            globals_ = self.app_config.globals
+            globals_.device = 'cpu' if not torch.cuda.is_available() else 'cuda'  # Coerce (as in load_config fallback)
+            globals_.dtype = torch.float32  # Safe fallback (preserves intent)
+            logger.warning("Auto-repair: Loaded defaults (no emergency save to avoid recursion)")
+            # FIXED: No self.save_config(...) here (recursive bug source) – log only
+            return False  # ORIGINAL: Unchanged
+
+        finally:
+            # FIXED: Reset guard (safe cleanup, always runs)
+            self._saving_in_progress = False
 
 
     def reload_config(self):

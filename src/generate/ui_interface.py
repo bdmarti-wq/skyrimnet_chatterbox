@@ -23,7 +23,7 @@ from loguru import logger
 from src.config import get_config
 from src.tts_model import ModelManager, GEN_ACTIVE_LOCK
 from src.generate.pipeline.context import AudioGenerationContext
-from src.generate.cache.cache_manager import CacheManager
+from src.generate.cache.cache_manager import CacheManager, get_cache_manager
 from src.seeding import cpp_uuid_to_seed
 
 # Cache for hot reloads (loaded model/config)
@@ -128,7 +128,7 @@ async def generate_audio_ui(
 
         # Initialize cache_manager (lazy load)
         if CACHE_MANAGER_CACHE is None:
-            CACHE_MANAGER_CACHE = CacheManager(config)
+            CACHE_MANAGER_CACHE = get_cache_manager(config)
         cache_manager = CACHE_MANAGER_CACHE
 
         # Create generation context with params + loaded internals

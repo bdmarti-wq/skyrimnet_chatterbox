@@ -18,6 +18,20 @@ from ...audio_utils import is_artifact_laden
 from ...normalize_stem import normalize_stem
 
 
+
+_cache_manager_instance = None
+
+def get_cache_manager(config=None):
+    """Global singleton for CacheManager."""
+    global _cache_manager_instance
+    if _cache_manager_instance is None:
+        config = config or get_config()
+        _cache_manager_instance = CacheManager(config)
+        logger.info(f"Global CacheManager singleton #1 created (ID={id(_cache_manager_instance):x})")
+    else:
+        logger.debug(f"Global CacheManager singleton reuse (ID={id(_cache_manager_instance):x}, entries={_cache_manager_instance.fuzzy_cache.get_stats()['entries']})")
+    return _cache_manager_instance
+
 class CacheManager:
     """Centralized cache management for audio generation pipeline. FIXED: _validate_path_for_cache uses absolute resolves."""
 
@@ -267,18 +281,25 @@ class CacheManager:
             logger.warning(f"Skipped fuzzy index (invalid path): {audio_path}")
 
     def _validate_path_for_cache(self, path: str, stem: str = 'default') -> bool:
-        """Shared validation for caches (exists, subpath output, no artifacts). FIXED: Both absolute resolves."""
         if not path or not os.path.exists(path):
+            logger.warning(f"Path not exist: {path}")
             return False
+        logger.debug(f": app_config.globals.fuzzy.fuzzy_artifact_threshold_hz is {get_config_value(
+            'app_config.globals.fuzzy.fuzzy_artifact_threshold_hz')}")
+        logger.debug(f": app_config.globals.fuzzy is {get_config_value(
+            'app_config.globals.fuzzy')}")
         p = Path(path).resolve()
-        base_dir = (self.cache_config.cache_dir / "audio" / "output").resolve()  # FIXED: Resolve to absolute
-        if not p.is_relative_to(base_dir):
+        base_dir = (self.cache_config.cache_dir / "audio" / "output").resolve()
+        # FIXED: More lenient – startswith for absolute paths, ignore case
+        if not str(p).lower().startswith(str(base_dir).lower()):
             logger.warning(f"Path not in output subdir {base_dir}: {path}")
             return False
-        if is_artifact_laden(path, 7000):
+        if is_artifact_laden(path, get_config_value('app_config.globals.fuzzy.fuzzy_artifact_threshold_hz', 12000)):
             logger.warning(f"Artifact-laden path skipped: {path}")
             return False
+        logger.debug(f"Validated path: {p} in {base_dir}")
         return True
+
 
     def clear_caches(self, voice: Optional[str] = None, full: bool = False) -> None:
         """Clear all cache systems with optional voice-specific purge."""

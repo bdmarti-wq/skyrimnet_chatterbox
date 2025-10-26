@@ -60,8 +60,8 @@
         "ooh",
         "gasp"
       ],
-      "fuzzy_index_size": 1000,
-      "fuzzy_artifact_threshold_hz": 7000.0
+      "fuzzy_index_size": 5000,
+      "fuzzy_artifact_threshold_hz": 12000.0
     },
     "dtype": "bfloat16",
     "logging_level": "INFO",

@@ -18,15 +18,28 @@ from src.normalize_stem import normalize_stem
 
 class FuzzyAudioCache:
     """Class-based implementation of fuzzy audio cache with proper encapsulation."""
+    _instance = None  # Singleton instance
+    _lock = threading.Lock()  # Thread-safe init
+
+    def __new__(cls, *args, **kwargs):
+        if cls._instance is None:
+            with cls._lock:
+                if cls._instance is None:  # Double-check
+                    cls._instance = super(FuzzyAudioCache, cls).__new__(cls)
+                    cls._instance._initialized = False  # Flag: init only once
+                    logger.info(f"FuzzyAudioCache singleton #1 created (ID={id(cls._instance):x})")
+        else:
+            logger.debug(f"FuzzyAudioCache singleton reuse (ID={id(cls._instance):x})")
+        return cls._instance
+
 
     def __init__(self, cache_dir: Path, threshold: float = 0.75):
-        """Initialize fuzzy cache with configurable threshold.
+        """Initialize fuzzy cache with configurable threshold."""
+        # Singleton check—skip if already init'd
+        if hasattr(self, '_initialized') and self._initialized:
+            return  # Reuse existing
 
-        Args:
-            cache_dir: Directory for cache persistence
-            threshold: Minimum similarity threshold for cache hits
-        """
-        # Configuration values (from config system)
+        # Configuration values...
         self.config = get_config()
 
         self.cache_dir = cache_dir
@@ -34,18 +47,18 @@ class FuzzyAudioCache:
         self.cache_file = self.cache_dir / "fuzzy_audio_cache.json"
 
         self.threshold = threshold
-        self.min_length = get_config_value('fuzzy_min_length', default=3)
-        self.max_index_size = get_config_value('fuzzy.fuzzy_index_size', default=1000)
-        self.enable_fuzzy = get_config_value('fuzzy.enable_fuzzy_cache', default=True)
-        self.enable_artifact_purge = get_config_value('fuzzy.fuzzy_artifact_purge_enable', default=True)
-        self.artifact_threshold_hz = get_config_value('fuzzy.fuzzy_artifact_threshold_hz', default=8000.0)
+        self.min_length = get_config_value('app_config.globals.fuzzy.fuzzy_min_length', default=3)
+        self.max_index_size = get_config_value('app_config.globals.fuzzy.fuzzy_index_size', default=1000)
+        self.enable_fuzzy = get_config_value('app_config.globals.fuzzy.enable_fuzzy_cache', default=True)
+        self.enable_artifact_purge = get_config_value('app_config.globals.fuzzy.fuzzy_artifact_purge_enable', default=True)
+        self.artifact_threshold_hz = get_config_value('app_config.globals.fuzzy.fuzzy_artifact_threshold_hz', default=12000.0)
         self.boost_words = get_config_value(
-            'fuzzy.fuzzy_boost_words',
-            default=['ahh', 'mmm', 'ooh', 'throbb', 'moan', 'gasp', 'oh', 'fuck', 'yes', 'aah', 'gods']
+            'app_config.globals.fuzzy.fuzzy_boost_words',
+            default=['ahh', 'mmm', 'ooh', 'gasp', 'oh', 'fuck', 'yes', 'aah', 'gods']
         )
-        self.boost_amount = get_config_value('fuzzy.fuzzy_boost_amount', default=0.15)
+        self.boost_amount = get_config_value('app_config.globals.fuzzy.fuzzy_boost_amount', default=0.15)
 
-        # In-memory cache structure: {stem: {normalized_key: entry}}
+        # In-memory cache structure...
         self.cache_data: Dict[str, Dict[str, Dict]] = {}
         self.cache_lock = threading.RLock()
         self.save_interval = 5.0
@@ -53,31 +66,36 @@ class FuzzyAudioCache:
         self.last_save_time = 0
         self.save_counter = 0
 
-        # FIXED: Base dir for subpath validation (e.g., "cache" root for all audio/output/resampled subpaths)
+        # FIXED: Base dir...
         self.base_dir = self.cache_dir.parent  # "cache" – ensures all paths relative to root
 
-        # Load existing cache
+        # Load existing cache (only once)
         self.load_cache()
 
-        # Start background indexer
+        # Start background indexer (only once)
         self._start_index_worker()
 
-        logger.info(f"Fuzzy cache initialized at {self.cache_file} with threshold={self.threshold:.2f}")
+        # Singleton flag (set after full init)
+        self._initialized = True
+
+        logger.info(f"Fuzzy cache singleton initialized at {self.cache_file} with threshold={self.threshold:.2f}, max_index_size={self.max_index_size}")
+
 
     def get_stats(self) -> Dict[str, Any]:
-        """Get detailed statistics about the fuzzy cache."""
         with self.cache_lock:
             total_entries = sum(len(entries) for entries in self.cache_data.values())
-            return {
-                "entries": total_entries,
-                "stems": len(self.cache_data),
-                "memory_entries": total_entries,
-                "threshold": self.threshold,
-                "enabled": self.enable_fuzzy,
-                "artifact_purge": self.enable_artifact_purge,
-                "artifact_threshold_hz": self.artifact_threshold_hz,
-                "index_size_limit": self.max_index_size
-            }
+        return {
+            "entries": total_entries,
+            "stems": len(self.cache_data),
+            "memory_entries": total_entries,
+            "threshold": self.threshold,
+            "enabled": self.enable_fuzzy,
+            "artifact_purge": self.enable_artifact_purge,
+            "artifact_threshold_hz": self.artifact_threshold_hz,
+            "index_size_limit": self.max_index_size,
+            "instance_id": hex(id(self))  # Hex ID to track singleton
+        }
+
 
     def clear(self, voice_stem: Optional[str] = None) -> None:
         """Clear fuzzy cache, optionally for a specific voice stem."""
@@ -298,11 +316,16 @@ class FuzzyAudioCache:
                             # Enforce per-stem limit
                             if len(self.cache_data[voice_stem]) >= self.max_index_size:
                                 # Evict oldest entry (by time_indexed)
+                                old_len = len(self.cache_data[voice_stem])
                                 oldest_key = min(
                                     self.cache_data[voice_stem].items(),
                                     key=lambda x: x[1].get('time_indexed', 0)
                                 )[0]
                                 del self.cache_data[voice_stem][oldest_key]
+                                new_len = len(self.cache_data[voice_stem])
+                                evicted_count = old_len - new_len  # Usually 1, but confirm
+                                logger.info(
+                                    f"Per-stem eviction in '{voice_stem}': {evicted_count} deleted (limit={self.max_index_size}), now {new_len} entries")
                                 logger.debug(f"Pruned old entry in {voice_stem} - limit reached")
 
                             # Add new entry (use resolved abs path)
@@ -490,6 +513,7 @@ class FuzzyAudioCache:
                 for stem in list(save_data.keys()):
                     while len(save_data[stem]) > self.max_index_size:
                         oldest_key = min(save_data[stem].keys(), key=lambda k: save_data[stem][k].get('time_indexed', 0))
+                        logger.info(f"evicting oldest_key: {oldest_key}")
                         del save_data[stem][oldest_key]
 
             # Save to disk

@@ -51,7 +51,7 @@ CAPS = {
     'N_FFT_DENOISE_MIN': 512, 'N_FFT_DENOISE_MAX': 2048,
     'FADE_MS_TRAIL_MIN': 20, 'FADE_MS_TRAIL_MAX': 200,
     'TRAILING_SILENCE_DB_MIN': -60, 'TRAILING_SILENCE_DB_MAX': -30,
-    'FUZZY_ARTIFACT_THRESHOLD_HZ_MIN': 5000, 'FUZZY_ARTIFACT_THRESHOLD_HZ_MAX': 10000,
+    'FUZZY_ARTIFACT_THRESHOLD_HZ_MIN': 5000, 'FUZZY_ARTIFACT_THRESHOLD_HZ_MAX': 15000,
     'DENOISE_HIGHPASS_HZ_MIN': 50, 'DENOISE_HIGHPASS_HZ_MAX': 200,
     'DENOISE_MEDIAN_KSIZE_MIN': 1, 'DENOISE_MEDIAN_KSIZE_MAX': 5,
     'DENOISE_TARGET_BAND_LOW_MIN': 3000, 'DENOISE_TARGET_BAND_LOW_MAX': 8000,
@@ -238,7 +238,6 @@ class FuzzyConfig(BaseModel):
         return _get_field_bounds(field_name)
 
 
-# Globals: Nested categories (tts, audio, fuzzy, etc.)
 # Globals: Nested categories (tts, audio, fuzzy, etc.)
 class Globals(BaseModel):
     """

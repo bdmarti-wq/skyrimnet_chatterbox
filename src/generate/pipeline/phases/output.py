@@ -10,6 +10,7 @@ from src.config import get_config
 from src.generate.cache import CacheManager  # For fuzzy/exact
 from src.audio_utils import get_silence  # For silence fallback
 from .base import GenerationPhase
+from ...cache.cache_manager import get_cache_manager
 from ...pipeline.context import AudioGenerationContext
 
 
@@ -19,7 +20,7 @@ class OutputPhase(GenerationPhase):
     process_after_cache = True  # Always run (verify even on HIT)
 
     def __init__(self, cache_manager=None):
-        self.cache_manager = cache_manager or CacheManager(get_config())  # Fallback
+        self.cache_manager = cache_manager or get_cache_manager(get_config())  # Fallback
         self.audio_cache = getattr(self.cache_manager, 'audio_cache', None)
         if self.audio_cache is None:
             logger.warning("No audio_cache; saves only")
