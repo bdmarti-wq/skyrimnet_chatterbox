@@ -52,7 +52,7 @@ class CacheManager:
         self.conditionals_cache = ConditionalsCache(self.cache_config.conditionals_cache_dir)
         self.fuzzy_cache = FuzzyAudioCache(
             cache_dir=self.cache_config.audio_cache_dir,
-            threshold=self.cache_config.fuzzy.fuzzy_threshold
+            config=self.config
         )
         self.voice_reference = VoiceReferenceCache(
             cache_dir=self.cache_config.voices_cache_dir,

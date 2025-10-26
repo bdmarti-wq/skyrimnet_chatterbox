@@ -6,8 +6,8 @@ from pathlib import Path
 from typing import Dict, Any, Optional
 from loguru import logger
 
-# Imports for safe config access (assumes these are available in your app)
-from src.config import get_config_value  # For fallback values; add get_config if needed for other uses
+# Import for fallback values (only used if no passed config or attr missing)
+from src.config import get_config_value
 
 class AudioCache:
     _instance = None  # Singleton instance
@@ -25,6 +25,22 @@ class AudioCache:
             logger.debug(f"AudioCache singleton reuse (ID={id(cls._instance):x})")
         return cls._instance
 
+    def _get_nested_config(self, section: str, key: str, default=None) -> Any:
+        """Helper: Get nested config value from self.config (attr chain); fallback to global get_config_value."""
+        if not self.config:
+            # No passed config: Direct global fetch
+            return get_config_value(f'app_config.globals.{section}.{key}', default=default)
+
+        # Chained attr access on self.config (handles Pydantic/objects)
+        try:
+            app_config = getattr(self.config, 'app_config')
+            globals_obj = getattr(app_config, 'globals')
+            section_obj = getattr(globals_obj, section)
+            return getattr(section_obj, key)
+        except (AttributeError, KeyError):
+            # Any missing level: Fallback to global
+            return get_config_value(f'app_config.globals.{section}.{key}', default=default)
+
     def __init__(self, cache_dir: Path, config=None):
         """Initialize the audio cache system (only runs once for the singleton)."""
         # Singleton check—skip if already initialized
@@ -37,9 +53,12 @@ class AudioCache:
         self.cache_file = self.cache_dir / "audio_cache.json"
         self.cache_dir.mkdir(parents=True, exist_ok=True)
 
-        # Config for eviction limits (safe nested access via get_config_value)
-        self.max_entries = get_config_value('app_config.globals.audio.max_cache_entries', default=1000)
-        self.max_total_size_mb = get_config_value('app_config.globals.audio.max_cache_size_mb', default=1024)  # 1GB default
+        # Store config for helper use
+        self.config = config
+
+        # Config for eviction limits (concise via helper; prioritizes passed config, fallback to globals)
+        self.max_entries = self._get_nested_config('audio', 'max_cache_entries', default=1000)
+        self.max_total_size_mb = self._get_nested_config('audio', 'max_cache_size_mb', default=1024)
 
         # In-memory cache of audio paths (shared across all references)
         self.audio_cache: Dict[str, dict] = {}  # Dict of {'path': str, 'size': int, 'added_time': float, 'last_used': float}
@@ -52,14 +71,14 @@ class AudioCache:
         # Singleton flag (set after full init)
         self._initialized = True
 
-        # Safe logging (no direct self.config access; uses cached values)
-        logger.info(f"AudioCache singleton initialized at {self.cache_dir} with max_entries={self.max_entries}, max_size={self.max_total_size_mb}MB")
+        # Logging with the resolved values (no dependency on internal config attrs)
+        logger.info(f"AudioCache singleton initialized at {self.cache_dir} (max_entries={self.max_entries}, max_size={self.max_total_size_mb}MB)")
 
     def load_cache(self) -> None:
         """Load audio cache metadata from disk to memory (only once for the singleton)."""
         with self.cache_lock:
-            self.total_size = 0  # Reset total size
-            self.audio_cache = {}  # Reset cache
+            self.total_size = 0
+            self.audio_cache = {}
             if self.cache_file.exists():
                 try:
                     with open(self.cache_file, 'r') as f:
@@ -77,10 +96,8 @@ class AudioCache:
                                     'last_used': time.time()
                                 }
                                 self.total_size += size
-                            else:
-                                logger.debug(f"Load skip invalid path for key {key}: {path}")
                         logger.info(f"Loaded old-format: {len(self.audio_cache)} valid entries (total size: {self.total_size / (1024*1024):.1f}MB)")
-                    elif isinstance(loaded_data, dict) and isinstance(loaded_data, dict) and all(isinstance(v, dict) for v in loaded_data.values()):
+                    elif isinstance(loaded_data, dict) and all(isinstance(v, dict) for v in loaded_data.values()):
                         # New format: {'key': {'path': str, ...}}
                         for key, entry_data in loaded_data.items():
                             path = entry_data.get('path')
@@ -95,7 +112,7 @@ class AudioCache:
                                 }
                                 self.total_size += size
                             else:
-                                logger.debug(f"Load skip invalid entry for key {key}")
+                                logger.trace(f"Load skip invalid entry for key {key}")
                         logger.info(f"Loaded new-format: {len(self.audio_cache)} valid entries (total size: {self.total_size / (1024*1024):.1f}MB)")
                     else:
                         logger.warning(f"Unexpected cache format: {type(loaded_data)} - starting empty")
@@ -128,10 +145,10 @@ class AudioCache:
                         }
                         self.total_size += entry['size']
                     else:
-                        logger.debug(f"Save skip invalid path for key {key}: {path}")
+                        logger.trace(f"Save skip invalid path for key {key}: {path}")
                 with open(self.cache_file, 'w') as f:
                     json.dump(save_data, f, indent=2)
-                logger.trace(f"Saved {len(save_data)} entries (total size: {self.total_size / (1024*1024):.1f}MB)")
+                logger.trace(f"Saved {len(save_data)} entries")
             except Exception as e:
                 logger.error(f"Failed to save audio cache: {str(e)}")
 
@@ -168,8 +185,8 @@ class AudioCache:
         file_size = os.path.getsize(path)
 
         with self.cache_lock:
-            # Apply dual-limit condition (using cached config values)
-            max_entries = self.max_entries  # From __init__ via get_config_value
+            # Apply dual-limit condition (using pre-fetched limits)
+            max_entries = self.max_entries  # From __init__
             max_total_size = self.max_total_size_mb * 1024 * 1024  # MB to bytes
 
             # Evict until below limit (prioritizes oldest by added_time)
@@ -200,7 +217,7 @@ class AudioCache:
             if len(self.audio_cache) >= max_entries * 0.8:
                 self.save_cache()
 
-            logger.debug(f"Audio cached: {key} → {path} ({file_size / (1024*1024):.1f}MB) | Cache stats: {len(self.audio_cache)} entries, {self.total_size / (1024*1024):.1f}MB total")
+            logger.debug(f"Audio cached: {key} → {Path(path).name} ({file_size / (1024*1024):.1f}MB) | Cache stats: {len(self.audio_cache)} entries, {self.total_size / (1024*1024):.1f}MB total")
 
     def _remove_entry(self, key: str) -> None:
         """Internal helper: Remove a specific entry from the cache."""
@@ -245,4 +262,3 @@ class AudioCache:
                 "disk_entries": entries,   # Assuming all valid
                 "disk_size": disk_size
             }
-

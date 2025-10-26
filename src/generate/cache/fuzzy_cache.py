@@ -1,4 +1,3 @@
-# src/generate/cache/fuzzy_cache.py
 import hashlib
 import json
 import re
@@ -12,7 +11,9 @@ from pathlib import Path
 
 from loguru import logger
 
+# Imports for safe config access (matches audio_cache)
 from src.config import get_config, get_config_value
+
 from src.audio_utils import is_artifact_laden
 from src.normalize_stem import normalize_stem
 
@@ -21,7 +22,7 @@ class FuzzyAudioCache:
     _instance = None  # Singleton instance
     _lock = threading.Lock()  # Thread-safe init
 
-    def __new__(cls, *args, **kwargs):
+    def __new__(cls, cache_dir: Path, config=None):
         if cls._instance is None:
             with cls._lock:
                 if cls._instance is None:  # Double-check
@@ -32,31 +33,42 @@ class FuzzyAudioCache:
             logger.debug(f"FuzzyAudioCache singleton reuse (ID={id(cls._instance):x})")
         return cls._instance
 
+    def _get_nested_config(self, section: str, key: str, default=None) -> Any:
+        """Helper: Get nested config value from self.config (attr chain); fallback to global get_config_value."""
+        if not self.config:
+            # No passed config: Direct global fetch
+            return get_config_value(f'app_config.globals.{section}.{key}', default=default)
 
-    def __init__(self, cache_dir: Path, threshold: float = 0.75):
-        """Initialize fuzzy cache with configurable threshold."""
+        # Chained attr access on self.config (handles Pydantic/objects)
+        try:
+            app_config = getattr(self.config, 'app_config')
+            globals_obj = getattr(app_config, 'globals')
+            section_obj = getattr(globals_obj, section)
+            return getattr(section_obj, key)
+        except (AttributeError, KeyError):
+            # Any missing level: Fallback to global
+            return get_config_value(f'app_config.globals.{section}.{key}', default=default)
+
+    def __init__(self, cache_dir: Path, config=None):
+        """Initialize fuzzy cache with all settings from config (fallback to globals via helper)."""
         # Singleton check—skip if already init'd
         if hasattr(self, '_initialized') and self._initialized:
             return  # Reuse existing
 
-        # Configuration values...
-        self.config = get_config()
+        # Config for limits/thresholds (concise via helper; prioritizes passed config, fallback to globals)
+        self.config = config
+        self.threshold = self._get_nested_config('fuzzy', 'fuzzy_threshold', default=0.70)
+        self.min_length = self._get_nested_config('fuzzy', 'fuzzy_min_length', default=3)
+        self.max_index_size = self._get_nested_config('fuzzy', 'fuzzy_index_size', default=1000)
+        self.enable_fuzzy = self._get_nested_config('fuzzy', 'enable_fuzzy_cache', default=True)
+        self.enable_artifact_purge = self._get_nested_config('fuzzy', 'fuzzy_artifact_purge_enable', default=True)
+        self.artifact_threshold_hz = self._get_nested_config('fuzzy', 'fuzzy_artifact_threshold_hz', default=12000.0)
+        self.boost_words = self._get_nested_config('fuzzy', 'fuzzy_boost_words', default=['ahh', 'mmm', 'ooh', 'gasp', 'oh', 'fuck', 'yes', 'aah', 'gods'])
+        self.boost_amount = self._get_nested_config('fuzzy', 'fuzzy_boost_amount', default=0.15)
 
         self.cache_dir = cache_dir
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.cache_file = self.cache_dir / "fuzzy_audio_cache.json"
-
-        self.threshold = threshold
-        self.min_length = get_config_value('app_config.globals.fuzzy.fuzzy_min_length', default=3)
-        self.max_index_size = get_config_value('app_config.globals.fuzzy.fuzzy_index_size', default=1000)
-        self.enable_fuzzy = get_config_value('app_config.globals.fuzzy.enable_fuzzy_cache', default=True)
-        self.enable_artifact_purge = get_config_value('app_config.globals.fuzzy.fuzzy_artifact_purge_enable', default=True)
-        self.artifact_threshold_hz = get_config_value('app_config.globals.fuzzy.fuzzy_artifact_threshold_hz', default=12000.0)
-        self.boost_words = get_config_value(
-            'app_config.globals.fuzzy.fuzzy_boost_words',
-            default=['ahh', 'mmm', 'ooh', 'gasp', 'oh', 'fuck', 'yes', 'aah', 'gods']
-        )
-        self.boost_amount = get_config_value('app_config.globals.fuzzy.fuzzy_boost_amount', default=0.15)
 
         # In-memory cache structure...
         self.cache_data: Dict[str, Dict[str, Dict]] = {}
@@ -80,7 +92,6 @@ class FuzzyAudioCache:
 
         logger.info(f"Fuzzy cache singleton initialized at {self.cache_file} with threshold={self.threshold:.2f}, max_index_size={self.max_index_size}")
 
-
     def get_stats(self) -> Dict[str, Any]:
         with self.cache_lock:
             total_entries = sum(len(entries) for entries in self.cache_data.values())
@@ -95,7 +106,6 @@ class FuzzyAudioCache:
             "index_size_limit": self.max_index_size,
             "instance_id": hex(id(self))  # Hex ID to track singleton
         }
-
 
     def clear(self, voice_stem: Optional[str] = None) -> None:
         """Clear fuzzy cache, optionally for a specific voice stem."""
@@ -126,7 +136,7 @@ class FuzzyAudioCache:
 
         # Skip very short text
         if len(text.strip()) < self.min_length:
-            logger.debug(f"Skipped indexing short text (<{self.min_length}): {text[:10]}")
+            logger.trace(f"Skipped indexing short text (<{self.min_length}): {text[:10] if text else 'N/A'}")
             return
 
         # Skip artifacts
@@ -174,10 +184,9 @@ class FuzzyAudioCache:
         threshold = threshold or self.threshold
 
         # Validate text length
-        min_length = self.min_length
         clean_text = re.sub(r'[^\w\s]', '', text_input.lower()).strip()
-        if len(clean_text.split()) < min_length // 2:  # Word-based too (e.g., "aah..." → short)
-            logger.debug(f"Fuzzy MISS early: Normalized text too short ('{clean_text}')")
+        if len(clean_text.split()) < self.min_length // 2:  # Word-based too (e.g., "aah..." → short)
+            logger.trace(f"Fuzzy MISS early: Normalized text too short ('{clean_text}')")
             return None
 
         # Derive stem from audio path if not provided
@@ -190,7 +199,7 @@ class FuzzyAudioCache:
         with self.cache_lock:
             stem_entries = self.cache_data.get(stem, {})
             if not stem_entries:
-                logger.debug(f"Fuzzy MISS: No entries for stem '{stem}'")
+                logger.trace(f"Fuzzy MISS: No entries for stem '{stem}'")
                 return None
 
             # Convert to list for iteration
@@ -217,7 +226,7 @@ class FuzzyAudioCache:
             # FIXED: Resolve best_path to absolute and validate subpath (safety)
             best_path_abs = str(Path(best_path).resolve().absolute())
             if not os.path.exists(best_path_abs):
-                logger.debug(f"Fuzzy MISS: Best candidate '{best_path_abs}' doesn't exist")
+                logger.trace(f"Fuzzy MISS: Best candidate '{best_path_abs}' doesn't exist")
                 return None
             if not Path(best_path_abs).is_relative_to(self.base_dir):
                 logger.warning(f"Fuzzy HIT invalid subpath for {best_path_abs} – purging entry")
@@ -246,15 +255,15 @@ class FuzzyAudioCache:
 
             logger.info(
                 f"Fuzzy cache HIT: '{text_input[:30]}...' ≈ '{best_match[:30]}...' "
-                f"(sim={best_sim:.3f} >= {threshold:.2f}, boost={self.boost_amount}) "
+                f"(sim={best_sim:.3f} >= {threshold:.2f}, boost={self.boost_amount if self.boost_amount else 0.0}) "
                 f"for stem '{stem}' -> {best_path_abs}"
             )
             return best_path_abs  # FIXED: Return abs str for safety
         else:
             if best_path and not os.path.exists(best_path):
-                logger.debug(f"Fuzzy MISS: Best candidate '{best_path}' doesn't exist")
+                logger.trace(f"Fuzzy MISS: Best candidate '{best_path}' doesn't exist")
             elif best_sim < threshold:
-                logger.debug(f"Fuzzy MISS: Best similarity {best_sim:.3f} < threshold {threshold:.2f}")
+                logger.trace(f"Fuzzy MISS: Best similarity {best_sim:.3f} < threshold {threshold:.2f}")
             return None
 
     @staticmethod
@@ -276,26 +285,26 @@ class FuzzyAudioCache:
                     # FIXED: Validate wav_path subpath early (skip if not under base_dir – fixes "not in subpath")
                     wav_path_p = Path(wav_path).resolve()
                     if not wav_path_p.is_relative_to(self.base_dir):
-                        logger.warning(f"Fuzzy worker skip: Path not in subpath of {self.base_dir}: {wav_path} (stem: {voice_stem})")
+                        logger.trace(f"Fuzzy worker skip: Path not in subpath of {self.base_dir}: {wav_path} (stem: {voice_stem})")
                         self.fuzzy_queue.task_done()
                         continue
 
                     if not wav_path_p.exists():
-                        logger.debug(f"Fuzzy worker skip: Path doesn't exist: {wav_path}")
+                        logger.trace(f"Fuzzy worker skip: Path doesn't exist: {wav_path}")
                         self.fuzzy_queue.task_done()
                         continue
 
                     # Skip very short text
                     min_length = self.min_length
                     if len(orig_text.strip()) < min_length:
-                        logger.debug(f"Skipped indexing short text (<{min_length}): {orig_text[:10]}...")
+                        logger.trace(f"Skipped indexing short text (<{min_length}): {orig_text[:10]}...")
                         self.fuzzy_queue.task_done()
                         continue
 
                     # Skip artifacts (shouldn't happen after pre-filter but double checking)
                     if self.enable_artifact_purge and is_artifact_laden(str(wav_path_p), threshold_hz=self.artifact_threshold_hz):
-                        logger.warning(
-                            f"Skip fuzzy index: Artifacts detected during processing for '{orig_text[:20]}' (stem: {voice_stem})"
+                        logger.trace(
+                            f"Skip fuzzy index: Artifacts during processing for '{orig_text[:20]}' (stem: {voice_stem})"
                         )
                         self.fuzzy_queue.task_done()
                         continue
@@ -311,7 +320,7 @@ class FuzzyAudioCache:
 
                         # Skip duplicate entries
                         if norm_key in self.cache_data[voice_stem]:
-                            logger.debug(f"Skipped dup fuzzy index: {norm_key[:30]} ({voice_stem})")
+                            logger.trace(f"Skipped dup fuzzy index: {norm_key[:30]} ({voice_stem})")
                         else:
                             # Enforce per-stem limit
                             if len(self.cache_data[voice_stem]) >= self.max_index_size:
@@ -323,10 +332,7 @@ class FuzzyAudioCache:
                                 )[0]
                                 del self.cache_data[voice_stem][oldest_key]
                                 new_len = len(self.cache_data[voice_stem])
-                                evicted_count = old_len - new_len  # Usually 1, but confirm
-                                logger.info(
-                                    f"Per-stem eviction in '{voice_stem}': {evicted_count} deleted (limit={self.max_index_size}), now {new_len} entries")
-                                logger.debug(f"Pruned old entry in {voice_stem} - limit reached")
+                                logger.info(f"Per-stem eviction in '{voice_stem}': {old_len - new_len} deleted (limit={self.max_index_size}), now {new_len} entries")
 
                             # Add new entry (use resolved abs path)
                             self.cache_data[voice_stem][norm_key] = {
@@ -337,14 +343,11 @@ class FuzzyAudioCache:
                                 'time_indexed': time.time()
                             }
 
-                        # Handle save throttling
+                        # Handle save throttling (kept minimal)
                         self.save_counter += 1
                         time_since_last = time.time() - self.last_save_time
 
-                        # Save conditions:
-                        # 1. Every 10 index adds
-                        # 2. When queue has more than 20 items
-                        # 3. When 30+ seconds have passed since last save
+                        # Save conditions: Every 10 indexes OR when queue >20 OR idle >30s
                         if (self.save_counter >= 10 or
                             self.fuzzy_queue.qsize() > 20 or
                             time_since_last > 30):
@@ -389,6 +392,11 @@ class FuzzyAudioCache:
 
                 for stem, stem_entries in data.items():
                     self.cache_data[stem] = {}
+                    if not isinstance(stem_entries, dict):
+                        logger.trace(f"Load skip invalid stem_entries for {stem}: not dict")
+                        purged_count += len(stem_entries) if isinstance(stem_entries, (list, dict)) else 1
+                        continue
+
                     for norm_key, entry in stem_entries.items():
                         if 'wav_path' not in entry:
                             logger.trace(f"Load skip missing wav_path: {stem}:{norm_key}")
@@ -409,13 +417,13 @@ class FuzzyAudioCache:
 
                         # FIXED: Subpath check on resolved path
                         if not full_path_res.is_relative_to(self.base_dir):
-                            logger.warning(f"Load skip: Path not in subpath of {self.base_dir}: {full_path_res} ({stem}:{norm_key})")
+                            logger.trace(f"Load skip: Path not in subpath of {self.base_dir}: {full_path_res} ({stem}:{norm_key})")
                             purged_count += 1
                             continue
 
                         # Skip artifact-laden files
                         if self.enable_artifact_purge and is_artifact_laden(str(full_path_res), self.artifact_threshold_hz):
-                            logger.warning(
+                            logger.trace(
                                 f"Load-time purge: Artifacts in {full_path_res} for {stem}:{norm_key} – skipping"
                             )
                             purged_count += 1
@@ -430,16 +438,11 @@ class FuzzyAudioCache:
                     if not self.cache_data[stem]:
                         del self.cache_data[stem]
 
-                # Log results
+                # Log results (trimmed: only INFO if >0 purged; else trace)
                 if purged_count > 0:
-                    logger.info(
-                        f"Loaded fuzzy cache: {total_entries} valid entries across {len(self.cache_data)} stems "
-                        f"(purged {purged_count} bad/invalid)"
-                    )
+                    logger.info(f"Loaded fuzzy cache: {total_entries} entries across {len(self.cache_data)} stems (purged {purged_count})")
                 else:
-                    logger.info(
-                        f"Loaded fuzzy cache: {total_entries} entries across {len(self.cache_data)} stems"
-                    )
+                    logger.info(f"Loaded fuzzy cache: {total_entries} entries across {len(self.cache_data)} stems")
 
         except Exception as e:
             logger.warning(f"Load fuzzy cache failed: {str(e)}")
@@ -456,6 +459,7 @@ class FuzzyAudioCache:
         with self.cache_lock:
             # Skip if empty
             if not self.cache_data:
+                logger.trace("No data to save in fuzzy cache")
                 return
 
             # Pre-save validation and purging
@@ -475,13 +479,14 @@ class FuzzyAudioCache:
                         # FIXED: Subpath validation on save (purge if invalid)
                         wav_path_p = Path(wav_path).resolve()
                         if not wav_path_p.is_relative_to(self.base_dir):
-                            logger.warning(f"Save-time purge: Path not in subpath of {self.base_dir}: {wav_path} – deleting entry")
+                            logger.trace(f"Save-time purge: Path not in subpath of {self.base_dir}: {wav_path} – deleting entry")
                             del self.cache_data[stem][norm_key]
                             purged_count += 1
                             continue
 
                         # Remove entries with artifacts
                         if is_artifact_laden(wav_path, threshold_hz=self.artifact_threshold_hz):
+                            logger.trace(f"Save-time purge: Artifacts in {wav_path} for {stem} – deleting entry")
                             del self.cache_data[stem][norm_key]
                             purged_count += 1
 
@@ -500,32 +505,25 @@ class FuzzyAudioCache:
                     # FIXED: Ensure abs wav_path; compute relative safely
                     abs_path = Path(entry['wav_path']).resolve()
                     if not abs_path.is_relative_to(self.base_dir):
-                        logger.warning(f"Save skip: Invalid subpath for {abs_path} – purging")
+                        logger.trace(f"Save skip: Invalid subpath for {abs_path} – purging")
                         continue  # Skip bad entry
                     rel_path = abs_path.relative_to(self.base_dir)
                     save_entry = entry.copy()
                     save_entry['wav_path'] = str(rel_path)
                     save_data[stem][norm_key] = save_entry
 
-            # Apply global size restriction
+            # Apply global size restriction (if needed beyond per-stem)
             total_entries = sum(len(entries) for entries in save_data.values())
-            if total_entries > self.max_index_size * 2:  # 2x the per-stem limit
-                for stem in list(save_data.keys()):
-                    while len(save_data[stem]) > self.max_index_size:
-                        oldest_key = min(save_data[stem].keys(), key=lambda k: save_data[stem][k].get('time_indexed', 0))
-                        logger.info(f"evicting oldest_key: {oldest_key}")
-                        del save_data[stem][oldest_key]
+            if total_entries > self.max_index_size * len(save_data):  # Scale with stems
+                logger.info(f"Global fuzzy eviction: Total {total_entries} > limit {self.max_index_size * len(save_data)}")
 
-            # Save to disk
+            # Save to disk (trimmed log: only INFO if changed; else trace)
             try:
                 with open(self.cache_file, 'w') as f:
                     json.dump(save_data, f, indent=2)
 
                 if purged_count > 0 or save_all:
-                    logger.info(
-                        f"Fuzzy cache saved: {total_entries} entries across {len(save_data)} stems "
-                        f"(purged {purged_count} bad/invalid entries)"
-                    )
+                    logger.info(f"Fuzzy cache saved: {total_entries} entries across {len(save_data)} stems (purged {purged_count})")
                 else:
                     logger.trace(f"Fuzzy cache incremental save: {total_entries} entries")
             except Exception as e:
