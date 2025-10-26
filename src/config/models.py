@@ -67,7 +67,7 @@ CAPS = {
     'TINY_PAD_MULTIPLIER_MIN': 1.0, 'TINY_PAD_MULTIPLIER_MAX': 3.0,
     'TINY_THRESHOLD_SEC_MIN': 0.1, 'TINY_THRESHOLD_SEC_MAX': 1.0,
     'TEXT_ELLIPSES_COUNT_MIN': 0, 'TEXT_ELLIPSES_COUNT_MAX': 5,
-    'SHORT_WORD_LEN_MIN': 1, 'SHORT_WORD_LEN_MAX': 5,
+    'SHORT_WORD_LEN_MIN': 1, 'SHORT_WORD_LEN_MAX': 15,
     'FUZZY_BOOST_WORDS': ['ahh', 'mmm', 'ooh', 'gasp'],  # Default list for parse
     'COMPRESS_LEVEL_MIN': 1, 'COMPRESS_LEVEL_MAX': 9,
     # Add these for completeness (based on defaults; adjust values)
@@ -123,6 +123,7 @@ def _get_field_bounds(field_name: str) -> Optional[Dict[str, Any]]:
         'n_mels': ('N_MELS_MIN', 'N_MELS_MAX'),
         'ebu_post_gain_db': ('EBU_POST_GAIN_DB_MIN', 'EBU_POST_GAIN_DB_MAX'),
         'ebu_true_peak': ('EBU_TRUE_PEAK_MIN', 'EBU_TRUE_PEAK_MAX'),
+        'max_short_word_len': ('SHORT_WORD_LEN_MIN','SHORT_WORD_LEN_MAX'),
         # Fuzzy
         'fuzzy_threshold': ('FUZZY_THRESHOLD_MIN', 'FUZZY_THRESHOLD_MAX'),
         'fuzzy_boost_amount': ('FUZZY_BOOST_AMOUNT_MIN', 'FUZZY_BOOST_AMOUNT_MAX'),
@@ -196,6 +197,7 @@ class AudioConfig(BaseModel):
     n_mels: int = Field(default=80, ge=CAPS['N_MELS_MIN'], le=CAPS['N_MELS_MAX'])
     ebu_post_gain_db: float = Field(default=0.0, ge=CAPS['EBU_POST_GAIN_DB_MIN'], le=CAPS['EBU_POST_GAIN_DB_MAX'])
     ebu_true_peak: float = Field(default=0.0, ge=CAPS['EBU_TRUE_PEAK_MIN'], le=CAPS['EBU_TRUE_PEAK_MAX'])
+    max_short_word_len: int = Field(default=3, ge=CAPS['SHORT_WORD_LEN_MIN'], le=CAPS['SHORT_WORD_LEN_MAX'])
 
     # Validator fallback for any missed clamps (e.g., complex logic)
     @model_validator(mode='after')

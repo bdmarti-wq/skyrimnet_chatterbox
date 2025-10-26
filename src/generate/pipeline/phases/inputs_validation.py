@@ -1,6 +1,8 @@
 from pathlib import Path
 from typing import Optional
 import torch
+
+from src.audio_utils import pad_short_text
 from .base import GenerationPhase
 from ...pipeline.context import AudioGenerationContext
 from loguru import logger
@@ -15,6 +17,20 @@ class InputsValidationPhase(GenerationPhase):
         """REFACTORED: Core validation using shared helpers; ensure all audio params have sane defaults."""
         # Text
         self.validate_text(context)
+        # After self.validate_text(context):
+        text = context.text  # Get current validated text
+        voice_params = context.config.get_voice_params(context.voice_stem) if hasattr(context.config,
+                                                                                      'get_voice_params') else {}
+        padding_params = {
+            'enable_text_padding': voice_params.get('enable_text_padding', True),  # Configurable per voice
+            'text_ellipses_count': voice_params.get('text_ellipses_count', 2),
+            'max_short_word_len': voice_params.get('max_short_word_len', 3),
+            'vocalise_patterns': voice_params.get('vocalise_patterns', ['ah', 'oh', 'aah', 'mmm', 'uh', 'mmh'])
+            # Extend as needed
+        }
+        padded_text = pad_short_text(text, padding_params)
+        context.text = padded_text  # Set padded text for downstream (cache keys, TTS)
+        logger.debug(f"Applied text padding: '{text}' → '{padded_text}' (params={padding_params})")
 
         # Voice stem
         self.derive_stem(context)

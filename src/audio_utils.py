@@ -196,10 +196,10 @@ def pad_short_text(text: str, params: Dict[str, Any]) -> str:
     patterns = params.get('vocalise_patterns', ['ah', 'oh', 'aah', 'mmm'])
 
     words = text.strip().split()
-    if (len(words) == 1 and len(words[0]) <= max_len and words[0].lower() in patterns) or '...' in text:
+    if (len(words) == 1 and len(words[0]) <= max_len or words[0].lower() in patterns) or '...' in text:
         pad = '.' * (3 * ellipses)  # 3 dots per ellipses
         padded = f"{pad} {text.strip()} {pad}".strip()
-        logger.debug(f"Text padded: '{text}' → '{padded}' (patterns={patterns})")
+        logger.debug(f"max-len {max_len} Text padded: '{text}' → '{padded}' (patterns={patterns})")
         return padded
     return text
 
