@@ -180,8 +180,8 @@ def _create_generation_context(
     text: str,
     audio_prompt_path: Optional[str],
     cache_uuid: int,
-    exaggeration: float,
-    temperature: float,
+    exaggeration: Optional[float],  # UI param (or None)
+    temperature: Optional[float],  # UI param (or None)
     cfgw: float,
     min_p: float,
     top_p: float,
@@ -196,9 +196,9 @@ def _create_generation_context(
 ) -> AudioGenerationContext:
     """Creates context object with UI-provided parameters + injected loaders."""
     if config is None:
-        config = get_config()  # Fallback global load
+        config = get_config()
     if model is None:
-        model = ModelManager.get_instance().get_model()  # Fallback load via singleton
+        model = ModelManager.get_instance().get_model()
 
     # Validate and normalize audio path first (needed for voice stem)
     if audio_prompt_path and not Path(audio_prompt_path).exists():
@@ -211,21 +211,19 @@ def _create_generation_context(
         from src.normalize_stem import normalize_stem
         voice_stem = normalize_stem(audio_path=audio_prompt_path)
 
-    # Get voice-specific parameters
-    voice_params = {}
-    if voice_stem:
-        voice_params = config.get_merged_audio_params(voice_name=voice_stem)
+    # FIXED: Use get_voice_params (sole merger; replaces deprecated)
+    voice_params = config.get_voice_params(voice_name=voice_stem) if voice_stem else {}
 
     # Coerce seeds
     seed = cpp_uuid_to_seed(cache_uuid) if seed_num is None else seed_num
 
-    # Create and initialize context (now with full internals)
+    # Create and initialize context
     context = AudioGenerationContext(
         text=text,
         audio_prompt_path=audio_prompt_path,
         cache_uuid=cache_uuid,
-        exaggeration=exaggeration or voice_params.get('exaggeration', 0.5),
-        temperature=temperature or voice_params.get('temperature', 0.8),
+        exaggeration=exaggeration or voice_params.get('exaggeration'),  # From merged (or None -> model default)
+        temperature=temperature or voice_params.get('temperature'),    # From merged (or None -> model default)
         cfgw=cfgw or voice_params.get('cfg_weight', 0.45),
         min_p=min_p or voice_params.get('min_p', 0.05),
         top_p=top_p or voice_params.get('top_p', 1.0),
@@ -235,27 +233,23 @@ def _create_generation_context(
         enable_memory_cache=enable_memory_cache,
         enable_disk_cache=enable_disk_cache,
         voice_stem=voice_stem or "default",
-        voice_params=voice_params,
+        voice_params=voice_params,  # Now from get_voice_params (merged + cached)
         t3_params={
             "generate_token_backend": "cudagraphs-manual",
             "stride_length": 4,
             "skip_when_1": True
         },
         device=torch.device(config.app_config.globals.device if config else "cuda" if torch.cuda.is_available() else "cpu"),
-        dtype=config.app_config.globals.dtype if config else torch.bfloat16,  # Fixed: config.globals.dtype
-        model=model,  # FIXED: Set loaded model
-        config=config,  # FIXED: Set loaded config
-        cache_manager=cache_manager,  # FIXED: Set cache_manager
-        sr=config.app_config.globals.sr if config else 24000,  # FIXED: Direct from config.globals.sr
-        multilingual=config.app_config.globals.multilingual if config else False  # FIXED: From config.globals
+        dtype=config.app_config.globals.dtype if config else torch.bfloat16,
+        model=model,
+        config=config,
+        cache_manager=cache_manager,
+        sr=config.app_config.globals.sr if config else 24000,
+        multilingual=config.app_config.globals.multilingual if config else False
     )
 
-    # Legacy compat (set in __post_init__, but reinforce)
-    context.cfg_weight = cfgw or voice_params.get('cfg_weight', 0.45)
-    context.save_cache = enable_memory_cache or enable_disk_cache
 
     logger.debug(f"Context created: voice_stem={voice_stem}, model present={model is not None}, cache_manager={cache_manager is not None}")
-
     return context
 
 def setup_bridge_api(demo, audio_output, api_status_md, config=None):

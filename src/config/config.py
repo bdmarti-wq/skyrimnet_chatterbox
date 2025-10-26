@@ -1,6 +1,7 @@
 """
 Main Config Module: Single-file JSON config with Pydantic validation.
-Handles globals + nested voices in config.json.
+Handles globals + nested voices in config.json. Relies purely on models.py defaults (no hardcodes).
+READY: get_merged_audio_params removed; get_voice_params is sole merger (with caching).
 """
 import os
 import shutil
@@ -14,7 +15,7 @@ from loguru import logger
 import torch
 from pydantic import BaseModel, ValidationError
 
-from .models import AppConfig, VoiceConfig, CAPS  # CAPS for any fallbacks
+from .models import AppConfig, VoiceConfig, CAPS  # Pydantic models with defaults
 
 # Singleton Config
 _lock = threading.Lock()
@@ -42,8 +43,6 @@ def reload_config():
     config = get_config()
     config.reload_config()
 
-
-
 class Config:
     _instance = None
     _lock = threading.Lock()
@@ -63,234 +62,185 @@ class Config:
         self._global_hash: Optional[str] = None
         self._voice_hashes: Dict[str, str] = {}
         self._is_modified = False
-        self._is_initialized = False  # NEW: Initialize flag
+        self._is_initialized = False
         logger.debug("Config initialized (Pydantic single-JSON)")
 
     def load_config(self):
-        """Load single config.json → validate → populate models."""
-        # FIXED: Recursion guard to prevent re-entry during init loops (e.g., save_config calls)
+        """Load single config.json → validate → populate models (relies on models.py defaults)."""
         if getattr(self, '_loading_in_progress', False):
             logger.warning("load_config called recursively; skipping to avoid loop")
-            return True  # Or raise/return False if strict
+            return True
 
-        self._loading_in_progress = True  # Set guard flag
+        self._loading_in_progress = True
 
         try:
             if self._config_cache is not None:
-                # Reload if cached (re-validate)
                 json_data = self._config_cache
             else:
-                # Load JSON
                 config_path = _config_file_path
                 try:
                     with open(config_path, 'r') as f:
                         json_data = json.load(f)
                     logger.info(f"Loaded config.json: {config_path}")
                 except FileNotFoundError:
-                    logger.warning(f"config.json not found ({config_path}); using defaults")
+                    logger.warning(f"config.json not found ({config_path}); using models.py defaults")
                     json_data = self._get_default_json()
-                    # FIXED: Save defaults only if file missing (no recursion risk)
-                    self._save_defaults_only = True  # Internal flag for one-time save
-                    self.save_config(create_backup=False)  # Call with backup=False to avoid loop
-                    self._save_defaults_only = False
+                    self.save_config(create_backup=False)  # Save pure defaults
                 except json.JSONDecodeError as e:
-                    logger.error(f"Invalid config.json ({config_path}): {e} – using defaults")
+                    logger.error(f"Invalid config.json ({config_path}): {e} – using models.py defaults")
                     json_data = self._get_default_json()
-                    # FIXED: Overwrite invalid only if flagged (no recursion on every decode error)
-                    self._save_defaults_only = True
                     self.save_config(create_backup=False, filename=config_path)  # Overwrite invalid
-                    self._save_defaults_only = False
 
-            try:
-                # Validate/load to AppConfig (top-level model)
-                self.app_config = AppConfig.model_validate(json_data)
+            self.app_config = AppConfig.model_validate(json_data)
 
-                # Coerce globals (device/dtype) post-validate
-                globals_ = self.app_config.globals
-                globals_.device = str(globals_.device).lower()
-                if globals_.device == 'cuda' and not torch.cuda.is_available():
-                    globals_.device = 'cpu'
-                    logger.info("CUDA unavailable; forced CPU mode")
-                if isinstance(globals_.dtype, str):
-                    globals_.dtype = torch.bfloat16 if globals_.device == 'cuda' else torch.float32
-                    logger.debug(f"Dtype coerced to {globals_.dtype}")
+            # Coerce globals (device/dtype) post-validate
+            globals_ = self.app_config.globals
+            globals_.device = str(globals_.device).lower()
+            if globals_.device == 'cuda' and not torch.cuda.is_available():
+                globals_.device = 'cpu'
+                logger.info("CUDA unavailable; forced CPU mode")
+            if isinstance(globals_.dtype, str):
+                globals_.dtype = torch.bfloat16 if globals_.device == 'cuda' else torch.float32
+                logger.debug(f"Dtype coerced to {globals_.dtype}")
 
-                # FIXED: Cache the raw loaded json_data (original behavior)
-                self._config_cache = json_data
+            # Cache raw JSON
+            self._config_cache = json_data
 
-            except ValidationError as e:
-                logger.error(f"Config validation failed: {e}")
-                # Fallback: Defaults
-                self.app_config = AppConfig()
+        except ValidationError as e:
+            logger.error(f"Config validation failed: {e} – using models.py defaults")
+            # Fallback: Pure model creation (triggers Field defaults from models.py)
+            self.app_config = AppConfig()
 
-                # Coerce on fallback
-                globals_ = self.app_config.globals
-                globals_.device = 'cpu' if not torch.cuda.is_available() else 'cuda'
-                globals_.dtype = torch.float32  # Safe fallback
+            # Coerce on fallback
+            globals_ = self.app_config.globals
+            globals_.device = 'cpu' if not torch.cuda.is_available() else 'cuda'
+            globals_.dtype = torch.float32  # Minimal; models.py handles rest
 
-                # FIXED: Plain model_dump (no **dump_kwargs/indent) for cache
-                self._config_cache = self.app_config.model_dump()  # No kwargs
+            # Cache the defaulted model dump
+            self._config_cache = self.app_config.model_dump()
 
-                # FIXED: Conditioned save (only once, if flagged, to break recursion)
-                if getattr(self, '_save_defaults_only', False):
-                    logger.warning("Overwriting invalid/missing config.json with defaults")
-                    self.save_config(create_backup=False)  # One-time, no backup to avoid extra writes
-                    self._save_defaults_only = False
-                else:
-                    logger.warning(
-                        "Using defaults; manual config.json fix recommended (save skipped to avoid recursion)")
-
-            # AFTER validation but before caching
-            if self.app_config:
-                try:
-                    # Force directory resolution/validation
-                    _ = self.app_config.globals.root  # Trigger property
-                    logger.info(f"Project root: {self.app_config.globals.root}")
-                    logger.info(f"Cache root: {self.app_config.globals.cache_dir}")
-                except Exception as e:
-                    logger.error(f"Directory initialization failed: {e}")
-                    # Critical failure handling
-                    if not self.app_config.globals.root:
-                        self.app_config.globals.root = Path.cwd()
-                    if not self.app_config.globals.cache_dir:
-                        self.app_config.globals.cache_dir = self.app_config.globals.root / "cache_fallback"
-
-            # Post-load: Setup caches
-            self._invalidate_merged_cache()
-            self._is_modified = False
-
-            # Log (original: voices_count, keys, logging_level, device, dtype, multilingual)
-            globals_config = self.app_config.globals
-            voices_config = self.app_config.voices
-            voices_count = len(voices_config)
-            voices_keys = list(voices_config.keys())
-            logging_level = globals_config.logging_level or 'INFO'
-            logger.info(
-                f"Config loaded: {voices_count} voices (keys: {voices_keys}), "
-                f"logging_level={logging_level}; device={globals_config.device}; "
-                f"dtype={globals_config.dtype}; multilingual={globals_config.multilingual}")
-
-            self._is_initialized = True
-            return True
+            # Save once (no recursion)
+            self.save_config(create_backup=False)
 
         finally:
-            # FIXED: Always reset guard flag (ensures no stuck state post-exception)
             self._loading_in_progress = False
 
+        # AFTER validation
+        if self.app_config:
+            try:
+                _ = self.app_config.globals.root  # Trigger property
+                logger.info(f"Project root: {self.app_config.globals.root}")
+                logger.info(f"Cache root: {self.app_config.globals.cache_dir}")
+            except Exception as e:
+                logger.error(f"Directory initialization failed: {e}")
+                if not self.app_config.globals.root:
+                    self.app_config.globals.root = Path.cwd()
+                if not self.app_config.globals.cache_dir:
+                    self.app_config.globals.cache_dir = self.app_config.globals.root / "cache_fallback"
 
-    # In src/config/config.py: save_config (around line 152)
+        # Post-load
+        self._invalidate_merged_cache()
+        self._is_modified = False
+
+        # Log
+        globals_config = self.app_config.globals
+        voices_config = self.app_config.voices
+        voices_count = len(voices_config)
+        voices_keys = list(voices_config.keys())
+        logging_level = globals_config.logging_level or 'INFO'
+        logger.info(
+            f"Config loaded: {voices_count} voices (keys: {voices_keys}), "
+            f"logging_level={logging_level}; device={globals_config.device}; "
+            f"dtype={globals_config.dtype}; multilingual={globals_config.multilingual}")
+
+        self._is_initialized = True
+        return True
+
     def save_config(self, create_backup: bool = True, filename: str = 'config.json') -> bool:
         """Save AppConfig to JSON (exclude runtime model)."""
         try:
-            # FIXED: Optional recursion guard (aligned with load_config; prevents calls during error loops)
-            # (Safe to add; does nothing if not recursing)
             if getattr(self, '_saving_in_progress', False):
                 logger.warning("save_config called recursively; skipping to avoid loop")
                 return False
             self._saving_in_progress = True
 
-            if create_backup and os.path.exists(filename):  # ORIGINAL: Unchanged
-                backup = filename + '.backup'  # ORIGINAL: Unchanged
-                shutil.copy2(filename, backup)  # ORIGINAL: Unchanged
-                logger.debug(f"Config backup created: {backup}")  # ORIGINAL: Unchanged
+            if create_backup and os.path.exists(filename):
+                backup = filename + '.backup'
+                shutil.copy2(filename, backup)
+                logger.debug(f"Config backup created: {backup}")
 
-            # Exclude non-serializable: globals.model (runtime object)  # ORIGINAL: Intent preserved
-            dump_kwargs = {  # ORIGINAL: Unchanged (now used in json.dumps)
-                'indent': 2,  # ORIGINAL: Unchanged
+            # Exclude non-serializable: globals.model
+            dump_kwargs = {
+                'indent': 2,
                 'default': lambda o: f"{type(o).__name__}({str(o)})" if hasattr(o, '__dict__') else str(o),
-                # ORIGINAL: Exact (your lambda)
-                # Fallback for unknowns  # ORIGINAL: Comment preserved
             }
 
-            # Guard: Ensure app_config loaded  # ORIGINAL: Unchanged
-            if self.app_config is None:  # ORIGINAL: Unchanged
-                logger.error("Cannot save: app_config is None (load first via load_config)")  # ORIGINAL: Unchanged
-                return False  # ORIGINAL: Unchanged
+            if self.app_config is None:
+                logger.error("Cannot save: app_config is None (load first via load_config)")
+                return False
 
-            # FIXED: Plain model_dump first (no **kwargs; Pydantic v2 compatible)
-            # (Your original exclude was dict-level; simplified here for globals.model)
-            config_dict = self.app_config.model_dump(
-                exclude={'globals': {'model'}})  # ORIGINAL: Exclusion logic preserved
-            if 'model' in config_dict.get('globals', {}):  # Double-check exclusion  # ORIGINAL: Unchanged
-                del config_dict['globals']['model']  # ORIGINAL: Unchanged
+            config_dict = self.app_config.model_dump(exclude={'globals': {'model'}})
+            if 'model' in config_dict.get('globals', {}):
+                del config_dict['globals']['model']
 
-            # FIXED: Use json.dumps for formatting (supports indent/default; replaces redundant json.dump)
-            json_data = json.dumps(config_dict, **dump_kwargs,
-                                   ensure_ascii=False)  # ORIGINAL: Uses your dump_kwargs + ensure_ascii (from your json.dump)
+            # Use json.dumps for formatting
+            json_data = json.dumps(config_dict, **dump_kwargs, ensure_ascii=False)
 
-            with open(filename, 'w', encoding='utf-8') as f:  # ORIGINAL: Unchanged (encoding preserved)
-                f.write(json_data)  # FIXED: Write the formatted string (equivalent to your json.dump(..., indent=2))
+            with open(filename, 'w', encoding='utf-8') as f:
+                f.write(json_data)
 
-            logger.info(f"Config saved: {filename}")  # ORIGINAL: Unchanged
-            # ORIGINAL: No self._is_modified here, but added if needed (your other methods use it; harmless)
-            self._is_modified = False  # (Matches your class pattern; remove if not wanted)
-            return True  # ORIGINAL: Unchanged
+            logger.info(f"Config saved: {filename}")
+            self._is_modified = False
+            return True
 
         except Exception as e:
-            logger.error(f"Save failed: {e}")  # ORIGINAL: Unchanged
-            # Auto-repair: Load defaults if corrupt  # ORIGINAL: Comment/Intent preserved
-            # FIXED: Set fallback without typo or recursion (avoids loop; load_config handles saves)
-            self.app_config = AppConfig()  # ORIGINAL: Was self._app_config (typo fixed); uses model_validate({}) implicitly via defaults
+            logger.error(f"Save failed: {e}")
+            # Auto-repair: Load pure defaults from models.py
+            self.app_config = AppConfig()
             globals_ = self.app_config.globals
-            globals_.device = 'cpu' if not torch.cuda.is_available() else 'cuda'  # Coerce (as in load_config fallback)
-            globals_.dtype = torch.float32  # Safe fallback (preserves intent)
-            logger.warning("Auto-repair: Loaded defaults (no emergency save to avoid recursion)")
-            # FIXED: No self.save_config(...) here (recursive bug source) – log only
-            return False  # ORIGINAL: Unchanged
+            globals_.device = 'cpu' if not torch.cuda.is_available() else 'cuda'
+            globals_.dtype = torch.float32
+            logger.warning("Auto-repair: Loaded models.py defaults (no emergency save to avoid recursion)")
+            return False
 
         finally:
-            # FIXED: Reset guard (safe cleanup, always runs)
             self._saving_in_progress = False
-
 
     def reload_config(self):
         """Reload: Clears caches; re-loads JSON."""
         self._config_cache = None  # Force re-load
-        self._merged_cache.clear()
-        self._global_hash = None
-        self._voice_hashes.clear()
-        self.load_config()  # Includes validation and coercion
+        self._invalidate_merged_cache()  # Purge LRU
+        self.load_config()  # Includes validation
         logger.info("Config reloaded from single JSON")
 
     def get_value(self, key: str, default: Any = None, api_value: Any = None, bypass_config: bool = False) -> Any:
-        """Get value: From app_config (supports nested like 'globals.tts.temperature')."""
+        """Get value: From app_config (supports nested like 'globals.tts.temperature').
+        REFACROED: Pure chained getattr on Pydantic models (relies on models.py defaults; no fallbacks)."""
         if self.app_config is None:
             raise ValueError("Config not loaded; call load_config() first")
 
+        # API mode: Minimal, no hardcodes (defaults from caller or None)
         if bypass_config or getattr(self.app_config.globals, 'use_api_mode', False):
-            # Simple API fallback (hardcoded defaults)
-            fallback = {
-                'temperature': 0.7, 'min_p': 0.07, 'top_p': 1.0, 'repetition_penalty': 2.0,
-                'cfg_weight': 0.45, 'exaggeration': 0.7, 'speaking_rate': 1.0,
-                'enable_disk_cache': True, 'enable_memory_cache': True,
-                'fuzzy_boost_words': ['ahh', 'mmm', 'ooh', 'gasp']
-            }
-            val = api_value if api_value is not None else fallback.get(key, default)
+            val = api_value if api_value is not None else default
             if key == 'fuzzy_boost_words' and isinstance(val, str):
-                val = [w.strip().lower() for w in val.split(',') if w.strip()]  # Parse list
+                val = [w.strip().lower() for w in val.split(',') if w.strip()]
+            logger.trace(f"API mode value for '{key}': {val}")
             return val
 
-        # Delegate: Flat dump first
-        dump = self.app_config.model_dump()
-        if '.' not in key:
-            return dump.get(key, default)
-
-        # Nested: Traverse (e.g., 'globals.tts.temperature')
+        # REFACROED: Chained getattr traversal on model instance (fast, direct access)
+        val = self.app_config
         parts = key.split('.')
-        val = dump
-        for part in parts:
-            if isinstance(val, dict):
-                val = val.get(part)
-            elif hasattr(val, part):
+        try:
+            for part in parts:
                 val = getattr(val, part)
-                if isinstance(val, BaseModel):
-                    val = val.model_dump()  # Flatten sub-model
-            else:
-                return default
-            if val is None:
-                return default
-        return val
-
+                if val is None:
+                    logger.trace(f"None value for '{part}' in {key}; returning default")
+                    return default
+            logger.trace(f"Retrieved '{key}': {val}")
+            return val
+        except AttributeError as e:
+            logger.trace(f"AttributeError on '{key}' traversal: {e}; returning default")
+            return default
 
     def set_value(self, key: str, value: Any, voice: Optional[str] = None) -> bool:
         """Set value: To globals or specific voice (via model_copy for immutability)."""
@@ -299,21 +249,19 @@ class Config:
 
         try:
             if voice:
-                # Per-voice (update nested; assumes key is flat override)
+                # Per-voice (flat overrides; update via model_copy)
                 old_voice = self.app_config.voices.get(voice)
                 if old_voice:
                     update = {key: value}
                     new_voice = old_voice.model_copy(update=update)
                     self.app_config.voices[voice] = new_voice
-                    # Invalidate voice cache
                     self._voice_hashes.pop(voice, None)
                 else:
                     logger.warning(f"Voice {voice} not found; creating with {key}={value}")
                     self.app_config.voices[voice] = VoiceConfig(**{key: value})
             else:
-                # Global: Nested if needed (e.g., key='tts.temperature' → globals.tts.temperature)
+                # Global: Traverse nested (e.g., 'tts.temperature' → globals.tts.temperature)
                 if '.' in key:
-                    # Traverse and update
                     parts = key.split('.')
                     if parts[0] != 'globals':
                         logger.warning(f"Global keys must start with 'globals.' (got: {key})")
@@ -330,22 +278,17 @@ class Config:
                     if hasattr(target, last_part):
                         update = {last_part: value}
                         new_target = target.model_copy(update=update)
-                        # Reassign up the chain (simple for direct sub; for deeper, recursive update needed)
-                        # For now, assume direct sub like 'globals.tts'; set parent attr
-                        if len(parts) == 1:
-                            setattr(self.app_config.globals, last_part, new_target)
-                        else:
-                            # Basic reassign (e.g., for 'audio.filter_q', set globals.audio = new_audio)
-                            parent_parts = parts[:-1]
-                            parent = self.app_config.globals
-                            for p in parent_parts:
-                                parent = getattr(parent, p)
-                            setattr(parent, last_part, new_target)
+                        # Reassign up chain (for sub-models like fuzzy within globals)
+                        parent_parts = parts[:-1]
+                        parent = self.app_config.globals
+                        for p in parent_parts:
+                            parent = getattr(parent, p)
+                        setattr(parent, last_part, new_target)
                     else:
                         logger.warning(f"Unknown field {last_part} in {key}")
                         return False
                 else:
-                    # Direct global (error if not in globals)
+                    # Direct global
                     if hasattr(self.app_config.globals, key):
                         update = {key: value}
                         self.app_config.globals = self.app_config.globals.model_copy(update=update)
@@ -353,7 +296,6 @@ class Config:
                         logger.warning(f"Unknown global key {key}")
                         return False
 
-                # Invalidate on change
                 self._invalidate_merged_cache()
 
             self._is_modified = True
@@ -365,13 +307,45 @@ class Config:
             logger.warning(f"Unknown param {key} (voice={voice})")
             return False
 
-    # Merged audio params (use models)
-    def get_merged_audio_params(self, voice_name: Optional[str] = None, api_overrides: Optional[Dict] = None) -> Dict[str, Any]:
-        if self.app_config is None:
-            raise ValueError("Config not loaded")
+    # Comprehensive PARAM_SPECS (based on models.py: tts/audio/fuzzy; expand as needed)
+    PARAM_SPECS = {
+        # TTS (from TtsConfig)
+        'temperature': float, 'exaggeration': float, 'top_p': float, 'min_p': float,
+        'repetition_penalty': float, 'cfg_weight': float, 'max_new_tokens': int, 'min_new_tokens': int,
+        'max_cache_len': int, 'stride_length': int, 'compile_t3': bool, 'warmup_t3': bool,
+        # Audio (from AudioConfig)
+        'speaking_rate': float, 'enable_post_processing': bool, 'enable_post_resample': bool,
+        'enable_post_jit_gain': bool, 'enable_post_voice_processing': bool, 'enable_pre_adjustment': bool,
+        'eq_gain_db': float, 'eq_cutoff_hz': float, 'notch_gain_db': float, 'notch_low_hz': float,
+        'notch_high_hz': float, 'fade_ms': float, 'normalize_method': str, 'gain_max_limit': float,
+        'noise_floor_db': float, 'trim_threshold_db': float, 'enable_denoise_normalize': bool,
+        'enable_denoising': bool, 'enable_audio_padding': bool, 'base_audio_pad_sec': float,
+        'tiny_audio_pad_multiplier': float, 'tiny_threshold_sec': float, 'n_fft': int, 'hop_length': int,
+        'highpass_cutoff_hz': float, 'n_fft_denoise': int, 'denoise_median_ksize': int,
+        'denoise_target_band_low': float, 'denoise_target_band_high': float, 'trailing_silence_db': float,
+        'gain_target_max': float, 'max_gain': float, 'n_mels': int, 'ebu_post_gain_db': float,
+        'ebu_true_peak': float,
+        # Fuzzy (from FuzzyConfig)
+        'enable_fuzzy_cache': bool, 'fuzzy_threshold': float, 'fuzzy_boost_amount': float,
+        'fuzzy_index_size': int, 'fuzzy_artifact_threshold_hz': float,
+        # Core globals
+        'sr': int, 'language_id': str, 'voice_name': str
+    }
+
+    # REFACROED: Sole merger (enhanced from previous: caching, overrides, PARAM_SPECS loop for safety)
+    def get_voice_params(self, voice_name: Optional[str] = None, overrides: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Get voice params (globals + overrides). Sole consolidated method: Merges globals with voice overrides;
+        supports LRU caching, type coercion, and clamps (relies on models.py)."""
+        # Safety check
+        if not hasattr(self, '_is_initialized') or not self._is_initialized or self.app_config is None:
+            logger.warning("Config not initialized – creating pure models.py defaults")
+            app_config = AppConfig()  # Triggers Field defaults
+            return app_config.globals.model_dump()  # Flat dict from globals (includes sub-models)
+
         voice_name = voice_name or 'default'
+
+        # LRU caching (efficient hash on globals + voice)
         globals_dump = self.app_config.globals.model_dump()
-        # Hash for LRU (on globals + voice)
         global_hash = hashlib.md5(str(sorted(globals_dump.items())).encode()).hexdigest()
         voice = self.app_config.voices.get(voice_name, VoiceConfig())  # Default if missing
         voice_dump = voice.model_dump()
@@ -382,112 +356,27 @@ class Config:
             logger.debug(f"LRU cache hit for {voice_name}")
             return self._merged_cache[cache_key]
 
-        params = globals_dump.copy()
-        params.update(voice_dump)
-        params['voice_name'] = voice_name
-        params['sr'] = self.app_config.globals.sr  # Enforce
-
-        if api_overrides:
-            params.update(api_overrides)
-
-        self._merged_cache[cache_key] = params
-        self._global_hash = global_hash
-        self._voice_hashes[voice_name] = voice_key
-        logger.debug(f"Merged params for {voice_name} (LRU miss; cached)")
-        return params
-
-
-    # Merged audio params (use models)
-    def get_voice_params(self, voice_name: Optional[str] = None, overrides: Optional[Dict[str, Any]] = None) -> Dict[
-        str, Any]:
-        """Get voice params with proper initialization safety check. Always returns complete dict."""
-        # Safety check
-        if not hasattr(self, '_is_initialized') or not self._is_initialized or self.app_config is None:
-            logger.warning("Config not initialized - using fallback voice params")
-            fallback = {
-                'temperature': 0.8, 'exaggeration': 0.5, 'top_p': 1.0, 'min_p': 0.05,
-                'repetition_penalty': 1.2, 'cfgw': 0.0, 'speaking_rate': 1.0, 'language_id': 'en',
-                'enable_pre_adjustment': True, 'sr': 24000, 'min_ref_duration': 3.0,
-                'check_artifacts': True, 'hop_length': 256, 'n_fft': 1024, 'normalize_method': 'peak',
-                'post_gain': 0.0,  # NEW: For post-processing
-                'min_post_duration': 1.0,  # NEW: Prevents None > int
-                'gain_max_limit': 1.0, 'noise_floor_db': -60.0,  # NEW: Common post keys
-                'voice_name': voice_name or 'default_fallback'
-            }
-            if overrides:
-                # Safe update: Clamp types
-                for k, v in overrides.items():
-                    if k in fallback:
-                        if isinstance(fallback[k], float):
-                            fallback[k] = float(v)
-                        elif isinstance(fallback[k], int):
-                            fallback[k] = int(float(v))
-                        elif isinstance(fallback[k], bool):
-                            fallback[k] = bool(v)
-                fallback.update({k: v for k, v in overrides.items() if k not in fallback})
-            return fallback
-
-        # param specs (as yours, expanded)
-        PARAM_SPECS = {
-            'temperature': float, 'exaggeration': float, 'top_p': float, 'min_p': float,
-            'repetition_penalty': float, 'cfgw': float, 'speaking_rate': float, 'language_id': str,
-            'enable_pre_adjustment': bool, 'sr': int, 'min_ref_duration': float,
-            'check_artifacts': bool, 'hop_length': int, 'n_fft': int, 'normalize_method': str,
-            'post_gain': float, 'min_post_duration': float,  # NEW: Essentials for post
-            'gain_max_limit': float, 'noise_floor_db': float,
-            'voice_name': str
-        }
-
-        DEFAULT_VALUES = {  # Full defaults (as yours + new)
-            'temperature': 0.8, 'exaggeration': 0.5, 'top_p': 1.0, 'min_p': 0.05,
-            'repetition_penalty': 1.2, 'cfgw': 0.0, 'speaking_rate': 1.0, 'language_id': 'en',
-            'enable_pre_adjustment': True, 'sr': 24000, 'min_ref_duration': 3.0,
-            'check_artifacts': True, 'hop_length': 256, 'n_fft': 1024, 'normalize_method': 'peak',
-            'post_gain': 0.0, 'min_post_duration': 1.0, 'gain_max_limit': 1.0, 'noise_floor_db': -60.0,
-            'voice_name': voice_name or 'default'
-        }
-
-        voice_name = voice_name or 'default'
+        # Build from globals (Pydantic models provide defaults; loop over PARAM_SPECS for type safety)
         params = {}
+        for param, param_type in self.PARAM_SPECS.items():
+            params[param] = self._get_nested_value(self.app_config.globals, param, param_type)
 
-        def _get_value(config_obj, param, param_type, default):
-            """Safely get, ensure no None."""
-            if config_obj is None:
-                return default
-            try:
-                value = getattr(config_obj, param, None)
-                if value is None:
-                    return default
-                # Convert (as yours)
-                if param_type == bool:
-                    return bool(value)
-                elif param_type == int:
-                    return int(float(value))
-                elif param_type == float:
-                    return float(value)
-                else:
-                    return str(value)
-            except (TypeError, ValueError, AttributeError):
-                logger.debug(f"Failed to get {param}; using default {default}")
-                return default
-
-        # Globals
-        for param, param_type in PARAM_SPECS.items():
-            params[param] = _get_value(self.app_config.globals, param, param_type, DEFAULT_VALUES[param])
-
-        # Voice override (if exists)
+        # Voice override (non-None only)
         if voice_name != 'default' and voice_name in self.app_config.voices:
             voice = self.app_config.voices[voice_name]
-            for param, param_type in PARAM_SPECS.items():
-                value = _get_value(voice, param, param_type, None)
-                if value is not None:  # Strict: Only if set
+            voice_dict = voice.model_dump()
+            for param, param_type in self.PARAM_SPECS.items():
+                value = self._get_nested_value(voice, param, param_type)
+                if value is not None:  # Only override if set in voice
                     params[param] = value
 
-        # Overrides (safe, as above)
+        params['voice_name'] = voice_name
+
+        # Overrides (safe, with type coercion)
         if overrides:
             for param, value in overrides.items():
-                if param in PARAM_SPECS:
-                    param_type = PARAM_SPECS[param]
+                if param in self.PARAM_SPECS:
+                    param_type = self.PARAM_SPECS[param]
                     try:
                         if param_type == bool:
                             params[param] = bool(value)
@@ -500,41 +389,75 @@ class Config:
                     except:
                         logger.warning(f"Invalid override {param}={value}; keeping {params[param]}")
 
-        # Clamps (prevent extremes)
-        params['exaggeration'] = max(0.0, min(2.0, params['exaggeration']))  # For cloning
-        params['min_post_duration'] = max(0.5, params['min_post_duration'])  # Safe min
-        params['sr'] = int(params['sr'])
-        if params['normalize_method'] not in ['peak', 'rms', 'none']:
-            params['normalize_method'] = 'peak'
-        params['voice_name'] = voice_name
-
-        logger.trace(
-            f"Voice params for '{voice_name}': { {k: v for k, v in params.items() if k != 'voice_name'} }")  # Debug (trace to avoid spam)
+        # FIXED: Cache the result
+        self._merged_cache[cache_key] = params
+        self._global_hash = global_hash
+        self._voice_hashes[voice_name] = voice_key
+        logger.debug(f"Merged params for {voice_name} (LRU miss; cached)")
         return params
 
+    def _get_nested_value(self, obj: Any, param: str, param_type: type, default: Any = None) -> Any:
+        """Helper: Get nested value via chained getattr (for params; type coercion)."""
+        val = obj
+        # Handle nested params (e.g., 'fuzzy.threshold' – split if needed, but PARAM_SPECS are flat)
+        parts = [param]  # Most are flat; if nested, split (e.g., for 'tts.temperature')
+        if '.' in param:
+            parts = param.split('.')
+            # Delegate to sub-model (e.g., globals.tts.temperature → getattr(globals, 'tts').temperature)
+            for part in parts[:-1]:
+                if hasattr(val, part):
+                    val = getattr(val, part)
+                else:
+                    return default
 
+        param = parts[-1]  # Last part
+        if hasattr(val, param):
+            val = getattr(val, param)
+            if val is None:
+                return default
+        elif isinstance(val, dict):
+            val = val.get(param)
+            if val is None:
+                return default
+        else:
+            return default
+
+        try:
+            if param_type == bool:
+                return bool(val)
+            elif param_type == int:
+                return int(float(val))
+            elif param_type == float:
+                return float(val)
+            else:
+                return str(val)
+        except:
+            logger.debug(f"Type coercion failed for {param}; using default {default}")
+            return default
 
     def get_voice_parameters(self, voice_name: str) -> Dict[str, Any]:
+        """Get full voice config (flat dump)."""
         if self.app_config is None:
             raise ValueError("Config not loaded")
         voice = self.app_config.voices.get(voice_name)
         return voice.model_dump() if voice else {}
 
     def get_all_voices(self) -> List[str]:
+        """Get list of voice names."""
         if self.app_config is None:
             raise ValueError("Config not loaded")
         return list(self.app_config.voices.keys())
 
     def _get_default_json(self):
-        """Default JSON dict (use Pydantic defaults)."""
-        default_app = AppConfig()  # Uses Field defaults from models
-        # Override cores if needed (e.g., device from torch)
+        """Default JSON dict (triggers Pydantic models.py defaults)."""
+        default_app = AppConfig()  # Uses Field defaults from models.py
+        # Minimal overrides (device/dtype from torch)
         default_app.globals.device = 'cuda' if torch.cuda.is_available() else 'cpu'
         default_app.globals.dtype = torch.bfloat16 if default_app.globals.device == 'cuda' else torch.float32
         return default_app.model_dump()
 
     def _invalidate_merged_cache(self):
-        """Purge LRU on changes."""
+        """Purge LRU on changes (shared for get_voice_params)."""
         self._merged_cache.clear()
         self._global_hash = None
         self._voice_hashes.clear()

@@ -220,7 +220,7 @@ class FuzzyConfig(BaseModel):
     fuzzy_boost_amount: float = Field(default=0.15, ge=CAPS['FUZZY_BOOST_AMOUNT_MIN'], le=CAPS['FUZZY_BOOST_AMOUNT_MAX'])
     fuzzy_boost_words: List[str] = Field(default_factory=lambda: CAPS['FUZZY_BOOST_WORDS'])  # List from CAPS
     fuzzy_index_size: int = Field(default=1000, ge=CAPS['FUZZY_CACHE_LIMIT_MIN'], le=CAPS['FUZZY_CACHE_LIMIT_MAX'])
-    fuzzy_artifact_threshold_hz: float = Field(default=7000.0, ge=CAPS['FUZZY_ARTIFACT_THRESHOLD_HZ_MIN'], le=CAPS['FUZZY_ARTIFACT_THRESHOLD_HZ_MAX'])
+    fuzzy_artifact_threshold_hz: float = Field(default=12000.0, ge=CAPS['FUZZY_ARTIFACT_THRESHOLD_HZ_MIN'], le=CAPS['FUZZY_ARTIFACT_THRESHOLD_HZ_MAX'])
 
     # Validator for input parsing (str/list → normalized list[str])
     @field_validator('fuzzy_boost_words', mode='before')
