@@ -48,7 +48,7 @@ class CacheManager:
             d.mkdir(parents=True, exist_ok=True)
 
         # Initialize all cache systems
-        self.audio_cache = AudioCache(self.cache_config.audio_cache_dir)
+        self.audio_cache = AudioCache(self.cache_config.audio_cache_dir,  self.config)
         self.conditionals_cache = ConditionalsCache(self.cache_config.conditionals_cache_dir)
         self.fuzzy_cache = FuzzyAudioCache(
             cache_dir=self.cache_config.audio_cache_dir,

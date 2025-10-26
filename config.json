@@ -48,7 +48,9 @@
       "max_gain": 2.0,
       "n_mels": 80,
       "ebu_post_gain_db": 0.0,
-      "ebu_true_peak": 0.0
+      "ebu_true_peak": 0.0,
+      "max_cache_entries": 1000,
+      "max_cache_size_mb": 1024
     },
     "fuzzy": {
       "enable_fuzzy_cache": true,
