@@ -26,7 +26,7 @@ class ConditionalsCache:
     def __init__(self, cache_dir: Path):
         """Initialize the conditionals cache system. FIXED: Take root cache_dir (e.g., ./cache), append 'conditionals' once – no nesting."""
         # FIXED: Assume cache_dir is root (e.g., ./cache from manager); append 'conditionals' once for clean path
-        self.cache_dir = cache_dir / "conditionals"  # e.g., ./cache/conditionals/ – single level
+        self.cache_dir = cache_dir   # e.g., ./cache/conditionals/ – single level
         self.cache_dir.mkdir(parents=True, exist_ok=True)
 
         self.memory_cache: Dict[str, Any] = {}

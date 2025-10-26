@@ -52,8 +52,8 @@
     },
     "fuzzy": {
       "enable_fuzzy_cache": true,
-      "fuzzy_threshold": 0.7,
-      "fuzzy_boost_amount": 0.15,
+      "fuzzy_threshold": 0.75,
+      "fuzzy_boost_amount": 0.10,
       "fuzzy_boost_words": [
         "ahh",
         "mmm",

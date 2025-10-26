@@ -14,7 +14,7 @@ class AudioCache:
         """Initialize the audio cache system."""
         """Initialize the audio cache system."""
         # CRITICAL: Use proper audio subdirectories
-        self.cache_dir = cache_dir / "audio" / "output"
+        self.cache_dir = cache_dir
         self.cache_file = self.cache_dir / "audio_cache.json"
         self.cache_dir.mkdir(parents=True, exist_ok=True)
 

@@ -29,7 +29,7 @@ class FuzzyAudioCache:
         # Configuration values (from config system)
         self.config = get_config()
 
-        self.cache_dir = cache_dir / "audio"
+        self.cache_dir = cache_dir
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.cache_file = self.cache_dir / "fuzzy_audio_cache.json"
 
