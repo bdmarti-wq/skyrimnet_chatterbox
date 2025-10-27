@@ -8,7 +8,7 @@ import torch
 from pathlib import Path
 import torchaudio
 
-class GenerationPhase:
+class BaseGenerationPhase:
     """Base class for all audio generation pipeline phases. FIXED: _is_nonempty_conds allows dummy (structure OK)."""
 
     process_after_cache: bool = False

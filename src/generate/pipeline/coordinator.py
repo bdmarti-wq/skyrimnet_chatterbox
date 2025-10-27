@@ -78,8 +78,8 @@ class GenerationCoordinator:
         """Use shared base _fallback_silence. Remove dupes."""
         logger.warning(f"Coordinator fallback due to {error}")
         # Fallback to first phase's handle_error or implement shared
-        from src.generate.pipeline.phases.base import GenerationPhase
-        return GenerationPhase()._fallback_silence(context, str(error))  # Static call
+        from src.generate.pipeline.phases.base import BaseGenerationPhase
+        return BaseGenerationPhase()._fallback_silence(context, str(error))  # Static call
 
     def _log_pipeline_results(self, total_time: float, phase_times: Dict[str, float], context: AudioGenerationContext):
         """Use context globals/sr/audio_duration (DRY). Simplify conds stats."""

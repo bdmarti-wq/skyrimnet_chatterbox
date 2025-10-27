@@ -9,12 +9,12 @@ from loguru import logger
 from src.config import get_config
 from src.generate.cache import CacheManager  # For fuzzy/exact
 from src.audio_utils import get_silence  # For silence fallback
-from .base import GenerationPhase
+from .base import BaseGenerationPhase
 from ...cache.cache_manager import get_cache_manager
 from ...pipeline.context import AudioGenerationContext
 
 
-class OutputPhase(GenerationPhase):
+class OutputPhase(BaseGenerationPhase):
     """Saves generated audio to file and caches for reuse. FIXED: Direct set_audio_cache after save (sync, log)."""
 
     process_after_cache = True  # Always run (verify even on HIT)

@@ -186,25 +186,113 @@ def is_artifact_laden(wav_path: str, threshold_hz: float = None, ratio_threshold
 
 
 def pad_short_text(text: str, params: Dict[str, Any]) -> str:
-    """Pad short/vocalise text to reduce artifacts (e.g., 'ah' → '... ah ...'; from params)."""
+    """Enhanced: Pad with silence tokens ('.' or custom) for short vocals; tunable."""
     enable = params.get('enable_text_padding', True)
     if not enable:
-        logger.debug("Text padding skipped")
         return text
-    ellipses = params.get('text_ellipses_count', 2)
+    ellipses_count = params.get('text_ellipses_count', 2)
     max_len = params.get('max_short_word_len', 3)
-    patterns = params.get('vocalise_patterns', ['ah', 'oh', 'aah', 'mmm'])
+    patterns = params.get('vocalise_patterns', ['ah', 'oh', 'aah', 'mmm', 'yes', 'no', 'uh'])  # Added 'yes', 'no'
+    silence_token = params.get('silence_token', '.')  # Or '<pad>'/'<silence>'
 
     words = text.strip().split()
-    if (len(words) == 1 and len(words[0]) <= max_len or words[0].lower() in patterns) or '...' in text:
-        pad = '.' * (3 * ellipses)  # 3 dots per ellipses
+    is_short_vocal = len(words) == 1 and len(words[0]) <= max_len or words[0].lower() in patterns
+    has_ellipses = '...' in text  # Existing
+
+    if is_short_vocal or has_ellipses:
+        pad = silence_token * (3 * ellipses_count)  # '.' x6 for pause
         padded = f"{pad} {text.strip()} {pad}".strip()
-        logger.debug(f"max-len {max_len} Text padded: '{text}' → '{padded}' (patterns={patterns})")
+        logger.debug(f"Padded short vocal: '{text}' → '{padded}' (token='{silence_token}', patterns={patterns})")
         return padded
     return text
 
 
-def create_silence_tensor(sr: int, duration_s: float = 2.0, device: str = 'cpu') -> torch.Tensor:
+def trim_trailing_artifacts(audio: np.ndarray, sr: int, tail_threshold_db: float = -35.0, tail_fraction: float = 0.2) -> np.ndarray:
+    """Trim only trailing low-energy (aggressive for phantoms; faster than full trim)."""
+    if tail_threshold_db is None or tail_threshold_db > -20:
+        logger.debug("Tail trim skipped (threshold too high)")
+        return audio
+    threshold = 10 ** (tail_threshold_db / 20)
+    tail_len = int(len(audio) * tail_fraction)
+    tail_audio = audio[-tail_len:] if len(audio) > tail_len else audio
+    # Simple reverse trim on tail only
+    abs_tail = np.abs(tail_audio[::-1])
+    end_idx = len(tail_audio) - np.argmax(abs_tail > threshold)
+    if end_idx < len(tail_audio):
+        trimmed_tail = tail_audio[:len(tail_audio) - end_idx]
+        # Pad if over-trimmed
+        if len(trimmed_tail) < len(tail_audio):
+            trimmed_tail = np.pad(trimmed_tail, (0, end_idx), 'constant')
+        audio[-len(trimmed_tail):] = trimmed_tail
+        logger.debug(f"Tail trimmed: {end_idx / sr:.2f}s @ threshold={tail_threshold_db}dB")
+    return audio
+
+
+def gate_trailing_phantoms(audio: np.ndarray, sr: int, gate_threshold: float = 0.05, tail_fraction: float = 0.3) -> np.ndarray:
+    """Light gate on tail: Ramp to zero if below relative threshold (for weak 'ee')."""
+    if gate_threshold <= 0:
+        logger.debug("Tail gate skipped (threshold <=0)")
+        return audio
+    tail_len = int(len(audio) * tail_fraction)
+    tail_audio = audio[-tail_len:] if len(audio) > tail_len else audio
+    peak = np.max(np.abs(tail_audio))
+    if peak <= 0:
+        return audio
+    rel_threshold = gate_threshold * peak
+    # Gate: Linear ramp down where below threshold
+    gate_mask = np.abs(tail_audio) < rel_threshold
+    ramp_start = np.argmax(gate_mask[::-1])  # From end
+    if ramp_start > 0:
+        ramp_len = len(tail_audio) - ramp_start
+        ramp = np.linspace(1.0, 0.0, ramp_len)
+        tail_audio[ramp_start:] *= ramp
+        audio[-len(tail_audio):] = tail_audio
+        logger.debug(f"Tail gated: {ramp_len / sr:.2f}s @ rel_threshold={gate_threshold} (peak={peak:.3f})")
+    return audio
+
+
+def reverse_tail_suppress(audio: np.ndarray, sr: int, tail_sec: float = 0.2, onset_threshold: float = 0.3) -> np.ndarray:
+    """Reverse for tail onset detection + suppress low-confidence ends."""
+    tail_samples = int(sr * tail_sec)
+    if len(audio) < tail_samples * 2:
+        return audio
+    tail_reversed = audio[-tail_samples:][::-1]
+    # Onset detect (librosa: peaks in spectral flux)
+    onsets = librosa.onset.onset_detect(y=tail_reversed, sr=sr, units='samples', hop_length=512, threshold=onset_threshold)
+    if len(onsets) == 0:  # No strong onsets – suppress tail
+        suppress_len = int(tail_samples * 0.7)
+        taper = np.linspace(1.0, 0.0, suppress_len)
+        tail_audio = audio[-tail_samples:]
+        tail_audio[-suppress_len:] *= taper
+        audio[-tail_samples:] = tail_audio
+        logger.debug(f"Tail suppressed (no onsets): {tail_sec}s → {suppress_len / sr:.2f}s taper")
+    return audio
+
+
+
+def suppress_tail_artifacts(audio: np.ndarray, sr: int, tail_fraction: float = 0.25, low_hz: float = 2000.0, high_hz: float = 4000.0, strength: float = 0.5) -> np.ndarray:
+    """Spectral gating on tail: Suppress high-freq phantoms (e.g., 'ee')."""
+    tail_len = int(len(audio) * tail_fraction)
+    tail_audio = audio[-tail_len:] if len(audio) > tail_len else audio
+    if len(tail_audio) < sr * 0.1:  # Too short
+        return audio
+
+    hop_length = min(512, len(tail_audio) // 4)  # Safe
+    stft = librosa.stft(tail_audio, n_fft=1024, hop_length=hop_length)
+    mag, phase = np.abs(stft), np.angle(stft)
+    freqs = librosa.fft_frequencies(sr=sr, n_fft=1024)
+    mask = (freqs >= low_hz & freqs <= high_hz)
+    mag[mask] *= strength  # Attenuate phantom range
+
+    suppressed_tail = librosa.istft(mag * np.exp(1j * phase), hop_length=hop_length, length=len(tail_audio))
+    audio[-len(suppressed_tail):] = suppressed_tail
+    logger.debug(f"Tail spectral suppressed: {low_hz}-{high_hz}Hz, strength={strength} (tail={tail_fraction})")
+    return audio
+
+
+
+def create_silence_tensor(sr: int, duration_s: float = 2.0, device: str = 'cpu',
+                          dtype: torch.dtype = torch.float32) -> torch.Tensor:
     """Sample silence (1D fp32 mono; [samples])."""
     if device == 'cuda' and torch.cuda.is_available():
         device = 'cuda:0'
@@ -212,7 +300,7 @@ def create_silence_tensor(sr: int, duration_s: float = 2.0, device: str = 'cpu')
         device = 'cpu'  # Safe for save
     dev = torch.device(device)
     samples = int(sr * duration_s)
-    return torch.zeros(samples, dtype=torch.float32, device=dev)
+    return torch.zeros(samples, dtype=dtype, device=dev)
 
 # Modular Post-Processing Functions
 def trim_silence(audio: np.ndarray, threshold_db: float | None = -25.0) -> np.ndarray:
@@ -525,299 +613,3 @@ def get_silence(duration: float = 2.0, sr: int = 24000, dtype: torch.dtype = tor
     return silence
 
 
-async def apply_post_processing(wav: torch.Tensor, sr: int, params: dict | None = None) -> np.ndarray:
-    """Async post: Trim → Pad → Heavy (denoise/EQ/notch/norm) → Rate → Trail Cut → Fade → Clamp. FIXED: Guards all * ops; frame_factor/None fallback; outer vars safe."""
-    if params is None:
-        params = {}
-        logger.debug("Post skipped (no params) – raw")
-        return wav.cpu().squeeze().numpy()
-
-    enable_post = params.get('enable_post_processing', get_config_value('enable_post_processing', True))
-    if not enable_post:
-        logger.debug("Post disabled – raw")
-        return wav.cpu().squeeze().numpy()
-
-    voice_name = params.get('voice_name', 'unknown')
-    non_none_params = {k: v for k, v in params.items() if v is not None}
-    logger.debug(f"Post params for {voice_name}: {non_none_params}")
-
-    # Ensure 1D np (sync)
-    if wav.dim() > 1:
-        wav_np = wav.mean(dim=0).cpu().numpy()
-    else:
-        wav_np = wav.cpu().numpy()
-    orig_len = len(wav_np)
-    orig_dur = orig_len / sr
-    logger.debug(f"Post input: {orig_len} samples @ {sr}Hz ({orig_dur:.2f}s)")
-
-    if orig_len == 0:
-        logger.warning("Post input empty – raw fallback")
-        return wav_np
-
-    loop = asyncio.get_running_loop()
-
-    # FIXED: All params/vars defined early (outer; before heavy; None guards)
-    min_dur_sec =  _get_audio_param('min_post_duration_sec', params, 0.05)
-    min_samples = int(sr * min_dur_sec)
-    light_mode = orig_len < min_samples
-    if light_mode:
-        logger.debug(f"Short input < {min_dur_sec}s – light post (skip heavy)")
-
-    # Trim params (FIXED: Guard frame_factor/None before *)
-    trim_db = _get_audio_param('trim_threshold_db', params, -30.0)
-    hop = _get_audio_param('hop_length', params, 256 ) # Guard None
-    hop = int(hop)  # Ensure int
-    frame_factor = _get_audio_param('trim_frame_length_factor', params, 4)
-    frame_factor = int(frame_factor) if frame_factor is not None else 4  # FIXED: Fallback int on None
-    frame_length = hop * frame_factor  # Now safe: both int
-    n_fft_trim = _get_audio_param('max_n_fft_for_trim', params, 2048)
-    n_fft_trim = min(int(n_fft_trim), orig_len)  # Ensure int/guard
-    did_trim = False
-
-    # Pad params (FIXED: Guard base_pad_sec/None before *)
-    enable_audio_pad = params.get('enable_audio_padding', CONFIG.get_value('enable_audio_padding', True))
-    base_pad_sec = params.get('base_audio_pad_sec', params.get('post_pad_sec', CONFIG.get_value('base_audio_pad_sec', 0.15)) or 0.15)
-    base_pad_sec = float(base_pad_sec) if base_pad_sec is not None else 0.15  # Guard
-    multiplier = _get_audio_param('tiny_audio_pad_multiplier', params, 2.0)
-    multiplier = float(multiplier) if multiplier is not None else 2.0
-    tiny_threshold = _get_audio_param('tiny_threshold_sec', params, 0.5)
-    tiny_threshold = float(tiny_threshold) if tiny_threshold is not None else 0.5
-    did_pad = False
-    is_tiny = False
-
-    # Heavy params (FIXED: Guards on None)
-    noise_floor_db = _get_audio_param('noise_floor_db', params, -60.0)
-    min_denoise_samples = _get_audio_param('min_samples_for_denoise', params, 100)
-    n_fft_denoise = _get_audio_param('n_fft_denoise', params, 1024)
-    n_fft_denoise = min(int(n_fft_denoise), orig_len * 2)  # Safe * (orig_len int)
-    eq_gain_db = _get_audio_param('eq_gain_db', params, 0.0)
-    eq_cutoff_hz = _get_audio_param('eq_cutoff_hz', params, 3000)
-    notch_gain_db = _get_audio_param('notch_gain_db', params, 0)
-
-    notch_low_hz = _get_audio_param('notch_low_hz', params, 8000)
-    notch_high_hz = _get_audio_param('notch_high_hz', params, 11000)
-    norm_method = _get_audio_param('normalize_method', params,'peak')
-    enable_norm = _get_audio_param('enable_denoise_normalize', params, False)
-    enable_denoise = _get_audio_param('enable_denoising', params, False)
-    enable_resample = _get_audio_param('enable_post_resample', params, False)
-    rate = _get_audio_param('speaking_rate', params, 1.0)
-    trail_db = _get_audio_param('trailing_silence_db', params, -45.0)
-    fade_ms = _get_audio_param('fade_ms', params, 0)
-    gain_limit = _get_audio_param('gain_max_limit', params, 1.0)
-
-
-    # Trim (sync; fast) – FIXED: Now frame_length safe
-    if trim_db is not None and abs(trim_db) > 5 and not light_mode:
-        try:
-            wav_np_trim, _ = librosa.effects.trim(wav_np, top_db=abs(trim_db), frame_length=frame_length, hop_length=hop)
-            if len(wav_np_trim) == 0:
-                logger.warning(f"Trim {trim_db}dB zeroed – fallback full (tune > -35)")
-                wav_np_trim = wav_np
-            else:
-                logger.debug(f"Trim applied ({trim_db}dB, frame={frame_length}, hop={hop}, n_fft={n_fft_trim}): {len(wav_np_trim)/sr:.2f}s")
-                did_trim = True
-            wav_np = wav_np_trim
-        except Exception as trim_e:
-            logger.warning(f"Trim failed: {trim_e} – skip")
-    else:
-        logger.debug(f"Trim skipped (db={trim_db}; light={light_mode})")
-
-    # Gated pad (after trim; FIXED: int() guards on *)
-    if not enable_audio_pad:
-        logger.debug("Audio padding skipped (enable=False)")
-    else:
-        is_tiny = orig_dur < tiny_threshold
-        if is_tiny:
-            base_pad_sec *= multiplier  # float * float safe
-            logger.debug(f"Tiny audio ({orig_dur:.2f}s < {tiny_threshold}s) – pad x{multiplier}: {base_pad_sec}s/side")
-        if base_pad_sec > 0 and len(wav_np) > 0:
-            # FIXED: Guard before int(*)
-            pad_sec_total = base_pad_sec * 2  # Side pad *2
-            pad_len = int(sr * pad_sec_total) if pad_sec_total is not None else 0
-            silence_side_len = int(sr * base_pad_sec) if base_pad_sec is not None else 0
-            if pad_len > 0:
-                silence = np.zeros(silence_side_len, dtype=wav_np.dtype)
-                wav_np = np.concatenate([silence, wav_np, silence])
-                did_pad = True
-                logger.debug(f"Pad applied: {base_pad_sec}s silence each side (total {pad_len} samples; tiny_extra={is_tiny})")
-        else:
-            logger.debug(f"Pad skipped (sec={base_pad_sec}; len={len(wav_np)})")
-
-    # new_len early (post-trim/pad)
-    new_len = len(wav_np)
-    new_dur = new_len / sr
-    heavy_skip = new_len < min_samples
-    if heavy_skip:
-        logger.debug("Post-trim/pad short – skip heavy")
-    elif did_pad:
-        logger.debug(f"Post-pad length: {new_len} samples ({new_dur:.2f}s)")
-
-    # Flags
-    did_denoise = did_eq = did_notch = did_normalize = did_rate = did_trail_cut = did_fade = False
-
-    # Heavy steps in executor (FIXED: All outer, no new Nones)
-    def heavy_processing(params: dict):
-        from .config import get_config_value
-        nonlocal wav_np, did_denoise, did_eq, did_notch, did_normalize
-
-        # Denoise (gated)
-        if enable_denoise and not heavy_skip and new_len >= min_denoise_samples:
-            try:
-                # Pre: High-pass (FIXED: Guard hz/None before /)
-                highpass_hz = _get_audio_param('denoise_highpass_hz', params, 80)
-                if highpass_hz > 0:
-                    nyquist = sr / 2.0
-                    highpass_norm = highpass_hz / nyquist
-                    sos_hp = butter(4, highpass_norm, btype='high', output='sos')
-                    wav_np = sosfilt(sos_hp, wav_np)
-                    logger.debug(f"Denoise pre-highpass: {highpass_hz}Hz")
-
-                # Spectral gating
-                stft = librosa.stft(wav_np, n_fft=n_fft_denoise, hop_length=hop)  # hop int safe
-                mag, phase = np.abs(stft), np.angle(stft)
-
-                freqs = librosa.fft_frequencies(sr=sr, n_fft=n_fft_denoise)
-                target_low = _get_audio_param('denoise_target_band_low', params,5000)
-                target_high = _get_audio_param('denoise_target_band_high', params, 12000)
-                band_mask = (freqs >= target_low) & (freqs <= target_high)
-                ksize = _get_audio_param('denoise_median_ksize', params,3)
-                ksize = int(ksize)  # Ensure int
-                for frame in range(mag.shape[1]):
-                    high_mag = mag[band_mask, frame]
-                    if len(high_mag) > ksize:
-                        median_high = np.median(high_mag)
-                        mag[band_mask, frame] = np.clip(high_mag, 0, median_high * 0.5)  # * 0.5 float safe
-
-                clean_stft = mag * np.exp(1j * phase)
-                wav_np = librosa.istft(clean_stft, hop_length=hop, length=new_len)
-                did_denoise = True
-                logger.debug(f"Denoise gating applied (band {target_low}-{target_high}Hz, k={ksize}, n_fft={n_fft_denoise})")
-            except Exception as denoise_e:
-                logger.warning(f"Denoise failed ({new_len} samples): {denoise_e} – skip")
-        else:
-            logger.debug(f"Denoise skipped (enable={enable_denoise}; skip={heavy_skip})")
-
-        # EQ (safe, no new *)
-        if eq_gain_db != 0.0 and not heavy_skip and len(wav_np) > 0:
-            nyquist = sr / 2.0
-            cutoff_norm = min(1.0, max(0.01, eq_cutoff_hz / nyquist))
-            sos = butter(4, cutoff_norm, btype='lowpass' if eq_gain_db < 0 else 'highpass', output='sos')
-            wav_np = sosfilt(sos, wav_np)
-            did_eq = True
-            logger.debug(f"EQ applied ({eq_gain_db}dB {'low' if eq_gain_db < 0 else 'high'}-pass @ {eq_cutoff_hz}Hz)")
-        else:
-            logger.debug(f"EQ skipped (gain={eq_gain_db}, heavy_skip={heavy_skip})")
-
-        # Notch (safe, guards in function)
-        if notch_gain_db < 0 and not heavy_skip and len(wav_np) > 0:
-            wav_np = apply_notch(wav_np, sr, notch_low_hz, notch_high_hz, notch_gain_db)
-            did_notch = True  # Assume applied if no except in func
-        else:
-            logger.debug(f"Notch skipped (gain={notch_gain_db}, heavy_skip={heavy_skip})")
-
-        # Normalize
-        if enable_norm and len(wav_np) > 0:
-            if norm_method == 'peak':
-                peak = np.max(np.abs(wav_np))
-                if peak > 0:
-                    wav_np = (wav_np / peak) * 0.95
-                    did_normalize = True
-                    logger.debug(f"Normalize ({norm_method}: peak -1dB)")
-            elif norm_method == 'rms':
-                rms = np.sqrt(np.mean(wav_np ** 2))
-                if rms > 0:
-                    target_rms_db = params.get('ebu_post_gain_db', CONFIG.get_value('ebu_post_gain_db', -18)) or -18
-                    target_rms = 10 ** (target_rms_db / 20)
-                    wav_np *= target_rms / rms
-                    did_normalize = True
-                    logger.debug(f"Normalize ({norm_method}: RMS {target_rms_db}dB)")
-
-        return wav_np
-
-    # Async heavy
-    wav_np_heavy = await loop.run_in_executor(None, heavy_processing)
-    new_len_heavy = len(wav_np_heavy)
-    logger.debug(f"Post-heavy: {new_len_heavy/sr:.2f}s (from {new_dur:.2f}s)")
-
-    # Rate (FIXED: Guard rate before *)
-    speaking_rate = _get_audio_param('speaking_rate', params, 1.0)
-    if enable_resample and abs(speaking_rate - 1.0) > 0.05 and new_len_heavy > 0:
-        def rate_stretch(rate: float):
-            nonlocal wav_np
-            speaking_rate = float(rate) if rate is not None else 1.0  # Guard
-            target_len = int(new_len_heavy * speaking_rate)
-            if target_len > 0:
-                stretch_rate = 1.0 / rate
-                wav_stretch = librosa.effects.time_stretch(wav_np_heavy, rate=stretch_rate)
-                if len(wav_stretch) > target_len:
-                    return wav_stretch[:target_len]
-                else:
-                    pad_len = target_len - len(wav_stretch)
-                    return np.pad(wav_stretch, (0, pad_len), 'constant')
-            return wav_np_heavy
-        wav_np = await loop.run_in_executor(None, rate_stretch)
-        did_rate = True
-        logger.debug(f"Rate applied ({rate}x; {len(wav_np)/sr:.2f}s)")
-    else:
-        logger.debug(f"Rate skipped (enable={enable_resample}; rate={rate})")
-        wav_np = wav_np_heavy
-
-    # Trail cut (gated)
-    if abs(trail_db) > 30 and len(wav_np) > sr * 0.1:
-        def cut_trails():
-            nonlocal wav_np
-            threshold = 10 ** (trail_db / 20)
-            abs_audio = np.abs(wav_np)
-            end_idx = len(wav_np) - np.argmax(abs_audio[::-1] > threshold)
-            if end_idx < len(wav_np):
-                trimmed = wav_np[:end_idx]
-                logger.debug(f"Trail cut ({trail_db}dB): {len(trimmed)/sr:.2f}s (cut {(len(wav_np)-end_idx)/sr :.2f}s trail)")
-                return trimmed
-            return wav_np
-        if is_tiny:
-            logger.debug("Trail cut skipped for tiny audio (preserve sustain)")
-        else:
-            wav_np = await loop.run_in_executor(None, cut_trails)
-            did_trail_cut = len(wav_np) < new_len_heavy
-    else:
-        logger.debug(f"Trail cut skipped (db={trail_db})")
-
-    # Fade (safe from guards)
-    wav_np = apply_fade(wav_np, sr, fade_ms)
-    if fade_ms > 0:
-        did_fade = True
-
-    # Clamp (FIXED: gain_limit guard)
-    gain_limit = float(gain_limit) if gain_limit is not None else 1.0
-    wav_np = np.clip(wav_np, -gain_limit, gain_limit)
-    if gain_limit != 1.0:
-        logger.debug(f"Gain clamped to {gain_limit}")
-
-    # Final clip
-    wav_np = np.clip(wav_np, -1.0, 1.0)
-    final_len = len(wav_np)
-    final_dur = final_len / sr
-
-    # Flags summary
-    applied = []
-    if did_trim: applied.append('trim')
-    if did_denoise: applied.append('denoise')
-    if did_eq: applied.append('eq')
-    if did_notch: applied.append('notch')
-    if did_normalize: applied.append('normalize')
-    if did_rate: applied.append('rate')
-    if did_trail_cut: applied.append('trail_cut')
-    if did_fade: applied.append('fade')
-    applied_str = ', '.join(applied) if applied else 'none (no-op)'
-    logger.debug(f"Post complete for {voice_name}: {final_dur:.2f}s (from {orig_dur:.2f}s; applied: {applied_str}; light={light_mode})")
-
-    # Final empty guard
-    min_final_sec = min_dur_sec / 2
-    if final_dur < min_final_sec:
-        fallback_sec = params.get('fallback_silence_sec', CONFIG.get_value('fallback_silence_sec', 2.0)) or 2.0
-        fallback_len = int(sr * fallback_sec)
-        if final_len < sr * 0.1:
-            wav_np = np.zeros(fallback_len)
-            logger.debug(f"Fallback silence {fallback_sec}s")
-
-    return wav_np

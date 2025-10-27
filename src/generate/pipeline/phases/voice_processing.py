@@ -2,11 +2,11 @@ import os
 
 import torch
 
-from .base import GenerationPhase
+from .base import BaseGenerationPhase
 from ...pipeline.context import AudioGenerationContext
 from loguru import logger
 
-class VoiceProcessingPhase(GenerationPhase):
+class VoiceProcessingPhase(BaseGenerationPhase):
     def __init__(self, cache_manager=None):
         self.cache_manager = cache_manager
         self.conditionals_cache = getattr(cache_manager, 'conditionals_cache', None) if cache_manager else None

@@ -5,11 +5,11 @@ import torch
 from typing import Dict, Optional, Any
 
 from loguru import logger
-from .base import GenerationPhase
+from .base import BaseGenerationPhase
 from ...pipeline.context import AudioGenerationContext
 from src.tts_model import GEN_ACTIVE_LOCK, create_dummy_conds  # Minimal imports
 
-class GenerationPhase(GenerationPhase):  # Inherit from base
+class GenerationPhase(BaseGenerationPhase):  # Inherit from base
     def _execute_core(self, context: AudioGenerationContext) -> AudioGenerationContext:
         """Core TTS generation with conds. FIXED: Use _build_generate_args helper (proper args, no invalid kwargs)."""
         # Restore conds from cache if present (voice phase sets)

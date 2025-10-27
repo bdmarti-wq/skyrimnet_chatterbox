@@ -7,14 +7,14 @@ from pathlib import Path
 import torch
 import torchaudio
 
-from .base import GenerationPhase
+from .base import BaseGenerationPhase
 from ...pipeline.context import AudioGenerationContext
 from ...cache.voice_reference import VoiceReferenceCache  # For process_voice_reference call
 from loguru import logger
 from src.audio_utils import is_artifact_laden  # For validate_cached_audio
 
 
-class CacheCheckPhase(GenerationPhase):
+class CacheCheckPhase(BaseGenerationPhase):
     """REFACTORED: Early full audio_cache/fuzzy_cache + voice_reference (before gen). FIXED: Use context.sr (no MODEL_SR); pass context to process_voice_reference; fix path refs."""
 
     def __init__(self, cache_manager=None):

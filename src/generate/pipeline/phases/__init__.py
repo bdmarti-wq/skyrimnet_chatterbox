@@ -5,6 +5,7 @@ from .voice_processing import VoiceProcessingPhase
 from .generation import GenerationPhase
 from .post_processing import PostProcessingPhase
 from .output import OutputPhase
+from .base import BaseGenerationPhase
 
 __all__ = [
     "InputsValidationPhase",
@@ -12,5 +13,6 @@ __all__ = [
     "VoiceProcessingPhase",
     "GenerationPhase",
     "PostProcessingPhase",
-    "OutputPhase"
+    "OutputPhase",
+    "BaseGenerationPhase"
 ]

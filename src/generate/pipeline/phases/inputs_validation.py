@@ -3,13 +3,13 @@ from typing import Optional
 import torch
 
 from src.audio_utils import pad_short_text
-from .base import GenerationPhase
+from .base import BaseGenerationPhase
 from ...pipeline.context import AudioGenerationContext
 from loguru import logger
 from src.normalize_stem import normalize_stem
 from src.config import get_config  # For defaults from config
 
-class InputsValidationPhase(GenerationPhase):
+class InputsValidationPhase(BaseGenerationPhase):
     """REFACTORED: Master validator – shared helpers for text, stem, seed, and audio params (exagg, temp, etc.). Validates early to prevent None errors.
     OPTIMIZED: Single call to get_voice_params, then use the full dict for all params (avoids repetition)."""
 
