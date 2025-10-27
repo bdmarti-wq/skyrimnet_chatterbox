@@ -144,8 +144,6 @@ async def generate_audio_ui(
             repetition_penalty=confidence_rep or 1.2,
             language_id=language,
             seed_num=cpp_uuid_to_seed(uuid_seed) if randomize_seed_toggle else None,
-            enable_memory_cache=True,
-            enable_disk_cache=True,
             model=model,  # FIXED: Pass the loaded model
             config=config,  # FIXED: Pass the loaded config
             cache_manager=cache_manager  # FIXED: Pass the cache_manager

@@ -73,7 +73,7 @@ CAPS = {
     # Add these for completeness (based on defaults; adjust values)
     'FUZZY_BOOST_AMOUNT_MIN': 0.0, 'FUZZY_BOOST_AMOUNT_MAX': 0.3,
     'N_MELS_MIN': 64, 'N_MELS_MAX': 128,
-    'EBU_POST_GAIN_DB_MIN': -12, 'EBU_POST_GAIN_DB_MAX': 6,  # Reuse EQ
+    'EBU_POST_GAIN_DB_MIN': -18, 'EBU_POST_GAIN_DB_MAX': 6,  # Reuse EQ
     'EBU_TRUE_PEAK_MIN': -1.0, 'EBU_TRUE_PEAK_MAX': 1.0,
     'MAX_GAIN_MIN': 0.0, 'MAX_GAIN_MAX': 5.0,  # Reasonable
 }
@@ -258,8 +258,6 @@ class Globals(BaseModel):
     compress_pt_saves: bool = Field(default=True)
     compress_level: int = Field(default=6, ge=CAPS['COMPRESS_LEVEL_MIN'], le=CAPS['COMPRESS_LEVEL_MAX'])
     enable_deferred_cleanup: bool = Field(default=True)
-    enable_memory_cache: bool = Field(default=True)
-    enable_disk_cache: bool = Field(default=True)
     tts_name: str = Field(default='Chatterbox')
 
     # Core fields
@@ -344,9 +342,6 @@ class Globals(BaseModel):
 
         except Exception as e:
             logger.error(f"Directory setup failed: {e}")
-            # Fallback to memory cache if disk fails
-            self.enable_disk_cache = False
-            self.enable_memory_cache = True
 
         return self
 

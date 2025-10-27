@@ -79,9 +79,6 @@ class AudioGenerationContext:
     voice_ref_processed: bool = field(default=False, init=True, repr=False)
     process_after_cache: bool = field(default=True, init=True, repr=False)
 
-    # Cache save flag (computed from enable flags)
-    save_cache: bool = field(default=False, init=False, repr=False)
-
     # Private field for audio_duration (with getter/setter)
     _audio_duration: float = field(default=0.0, init=False, repr=False)
 
@@ -103,9 +100,6 @@ class AudioGenerationContext:
         # REFACTORED: Ensure common attrs (paths, seeds, etc.) – DRY across phases
         self.ensure_attrs()
 
-        # Compute save_cache
-        object.__setattr__(self, 'save_cache', self.enable_memory_cache or self.enable_disk_cache)
-
         # Legacy compatibility
         if self.seed is None and self.seed_num != 42:
             object.__setattr__(self, 'seed', self.seed_num)
@@ -124,7 +118,6 @@ class AudioGenerationContext:
 
         # Reset _audio_duration
         object.__setattr__(self, '_audio_duration', 0.0)
-        logger.debug(f"Context post-init: save_cache={self.save_cache}")
 
     def ensure_attrs(self):
         """FIXED: Ensure voice_params is dict (prevents str from unpack misalign)."""
