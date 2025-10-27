@@ -9,9 +9,10 @@ from .base import BaseGenerationPhase
 from ...pipeline.context import AudioGenerationContext
 from src.tts_model import GEN_ACTIVE_LOCK, create_dummy_conds  # Minimal imports
 
-class GenerationPhase(BaseGenerationPhase):  # Inherit from base
+
+class GenerationPhase(BaseGenerationPhase):
     def _execute_core(self, context: AudioGenerationContext) -> AudioGenerationContext:
-        """Core TTS generation with conds. FIXED: Use _build_generate_args helper (proper args, no invalid kwargs)."""
+        """Core TTS generation with conds. FIXED: Set generated_wav for PostProcessing; defer processed_wav."""
         # Restore conds from cache if present (voice phase sets)
         if hasattr(context, 'conds') and context.conds is not None:
             context.model.conds = context.conds
@@ -19,7 +20,10 @@ class GenerationPhase(BaseGenerationPhase):  # Inherit from base
         else:
             # Fallback stub if no conds (e.g., error)
             logger.warning("No conds in context; skipping gen (empty WAV)")
-            context.processed_wav = torch.zeros((1, context.sr * 2), dtype=torch.float32, device=context.device)  # 2s silence
+            context.processed_wav = torch.zeros((1, context.sr * 2), dtype=torch.float32,
+                                                device=context.device)  # 2s silence
+            # For fallback, set generated_wav as empty too for post-consistency
+            context.generated_wav = torch.zeros(0, dtype=torch.float32, device=context.device)  # Empty trigger
             return context
 
         # Build gen_args using helper (proper structure, no 'conditionals'/'seed' kwargs)
@@ -28,30 +32,43 @@ class GenerationPhase(BaseGenerationPhase):  # Inherit from base
         # Log shapes/dims for debug (simple, no f-string issues)
         conds_desc = 'Present (type: Conditionals)' if context.model.conds else 'None'
         logger.debug(f"Conds shapes: {{'conds': '{conds_desc}'}}")
-        logger.debug(f"Gen args: text_len={len(gen_args['text']) if gen_args['text'] else 0}, conds_shapes={{'conds': '{conds_desc}'}}")
+        logger.debug(
+            f"Gen args: text_len={len(gen_args['text']) if gen_args['text'] else 0}, conds_shapes={{'conds': '{conds_desc}'}}")
 
         try:
             if len(gen_args['text'].strip()) == 0:
                 raise ValueError("Empty text input")
 
             gen_start = time.perf_counter()
-            context.processed_wav = self._generate_core(context.model, gen_args, context.t3_params)
+            raw_output = self._generate_core(context.model, gen_args, context.t3_params)
             gen_time = time.perf_counter() - gen_start
 
-            context.audio_duration = context.processed_wav.shape[1] / context.sr
+            if raw_output is None or raw_output.numel() == 0:
+                raise ValueError("Generated empty/None WAV")
+
+            # FIXED: Set generated_wav to raw output for PostProcessing to handle
+            context.generated_wav = raw_output  # Raw tensor from model.generate
+            # Do NOT set processed_wav here – let PostProcessing set it after processing
+
+            context.audio_duration = context.generated_wav.shape[
+                                         -1] / context.sr  # Use shape for duration (assume [1, N])
             if context.audio_duration > 0:
-                logger.info(f"Generation success: {context.audio_duration:.2f}s WAV @ {context.sr}Hz (gen time {gen_time:.2f}s)")
+                logger.info(
+                    f"Generation success: {context.audio_duration:.2f}s WAV @ {context.sr}Hz (gen time {gen_time:.2f}s)")
             else:
-                raise ValueError("Generated empty WAV")
+                raise ValueError("Computed duration <=0 despite valid WAV")
 
         except Exception as gen_e:
             logger.error(f"Core gen failed: {gen_e}")
             gen_args['text'] = gen_args['text'][:30] + '...' if len(gen_args['text']) > 30 else gen_args['text']
             msg = f"Gen error on '{gen_args['text']}' (exag={gen_args['exaggeration']}): {gen_e}"
+            # FIXED: Set both for consistency in fallback
+            context.generated_wav = torch.zeros(0, dtype=torch.float32,
+                                                device=context.device)  # Empty trigger for post
             return self.handle_error(context, ValueError(msg))
 
         logger.debug("Gen complete")
-        return context
+        return context  # Post will process and set processed_wav
 
     def _build_generate_args(self, context: AudioGenerationContext) -> dict:
         """Build args for model.generate() – uses context.voice_params; adds audio_prompt_path if conds None."""
@@ -118,9 +135,12 @@ class GenerationPhase(BaseGenerationPhase):  # Inherit from base
             logger.debug(f"Gen complete: {time.time() - gen_start:.2f}s")
 
     def handle_error(self, context: AudioGenerationContext, error: Exception) -> AudioGenerationContext:
-        """REFACTORED: Delegate to base (silence + paths/attrs)."""
+        """REFACTORED: Delegate to base (silence + paths/attrs); ensure generated_wav for post fallback."""
         logger.error(f"Generation error: {error} – silence fallback")
         # Ensure paths post-error (DRY)
         context.audio_prompt_path = getattr(context, 'audio_prompt_path', "") or ""
         context.processed_voice_path = getattr(context, 'processed_voice_path', "") or ""
+        # FIXED: Set generated_wav empty for post to fallback gracefully
+        context.generated_wav = torch.zeros(0, dtype=torch.float32, device=context.device)
+        # Base handles processed_wav if needed, but post will override
         return super().handle_error(context, error)
