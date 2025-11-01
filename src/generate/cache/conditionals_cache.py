@@ -3,6 +3,8 @@ import sys
 import time
 import threading
 from typing import Any, Dict, Optional
+
+import numpy as np
 from pathlib import Path
 import torch
 from src.config import get_config
@@ -26,7 +28,7 @@ class ConditionalsCache:
     def __init__(self, cache_dir: Path):
         """Initialize the conditionals cache system. FIXED: Take root cache_dir (e.g., ./cache), append 'conditionals' once – no nesting."""
         # FIXED: Assume cache_dir is root (e.g., ./cache from manager); append 'conditionals' once for clean path
-        self.cache_dir = cache_dir   # e.g., ./cache/conditionals/ – single level
+        self.cache_dir = cache_dir  # e.g., ./cache/conditionals/ – single level
         self.cache_dir.mkdir(parents=True, exist_ok=True)
 
         self.memory_cache: Dict[str, Any] = {}
@@ -60,16 +62,58 @@ class ConditionalsCache:
         with self.cache_lock:
             if cache_key in self.memory_cache:
                 conditionals = self.memory_cache[cache_key]
-                if self._is_empty_conditionals(conditionals) or self._is_mock_conditionals(conditionals):
+                # REVISED: Handle dict in memory (core fix: recon like disk; upgrade to object)
+                reconstructed = False
+                if isinstance(conditionals, dict):
+                    try:
+                        logger.debug(f"Reconstructing Conditionals from dict (memory hit): {cache_key[:20]}...")
+                        if T3_AVAILABLE and "t3" in conditionals:
+                            # Recon: Mirror disk logic
+                            t3_obj = T3Cond(**conditionals["t3"])
+                            t3_obj = t3_obj.to(device=device, dtype=dtype)
+                            conditionals = Conditionals(t3_obj, conditionals.get("gen", None))
+                            conditionals = conditionals.to(device)
+                            reconstructed = True
+                        else:
+                            # Fallback for non-T3 dict
+                            conditionals = conditionals  # Or raise if invalid
+                    except Exception as recon_e:
+                        logger.warning(f"Memory dict recon failed for {cache_key[:20]}: {recon_e} – treat as miss")
+                        del self.memory_cache[cache_key]
+                        self.stats["misses"] += 1
+                        return None
+
+                # REVISED: Unified validation (now handles dict post-recon or raw object; enhanced mock for dict if needed pre-recon)
+                is_invalid = self._is_empty_conditionals(conditionals) or self._is_mock_conditionals(conditionals)
+                if is_invalid:
                     del self.memory_cache[cache_key]
                     self.stats["misses"] += 1
                     logger.warning(f"Memory cache invalid/mock for {cache_key} – discarded")
                     return None
+
+                # REVISED: Post-load hooks for memory (mirror disk: set model, emb dtype, set_conditionals)
+                if model is not None and reconstructed:
+                    model.conds = conditionals
+                    if T3_AVAILABLE and hasattr(conditionals, 't3') and hasattr(conditionals.t3,
+                                                                                'speaker_emb') and conditionals.t3.speaker_emb is not None:
+                        conditionals.t3.speaker_emb = conditionals.t3.speaker_emb.to(dtype=dtype)
+                        logger.debug(f"Loaded emb to dtype {dtype} for {cache_key}")
+                    if hasattr(model, 'set_conditionals'):
+                        model.set_conditionals(conditionals)
+                        logger.debug(f"set_conditionals post-cache load for {cache_key} (emb linked)")
+                    else:
+                        logger.debug(f"Cache load: self.conds = conds (no set; assume direct use)")
+
+                # REVISED: Upgrade memory to object if reconned (future hits fast/object)
+                if reconstructed:
+                    self.memory_cache[cache_key] = conditionals
+
                 self.stats["memory_hits"] += 1
-                logger.debug(f"Memory hit for conditionals: {cache_key[:20]}...")
+                log_msg = "Memory hit & reconstructed conditionals" if reconstructed else "Memory hit for conditionals"
+                logger.info(f"{log_msg}: {cache_key[:20]}...")
                 return conditionals
 
-        # 2. Check disk cache
+        # 2. Check disk cache (existing logic unchanged, already reconstructs)
         cache_path = self._get_cache_path(cache_key)
         if os.path.exists(cache_path) and os.path.getsize(cache_path) > 0:
             try:
@@ -133,7 +177,7 @@ class ConditionalsCache:
         return None
 
     def _is_empty_conditionals(self, conditionals: Any) -> bool:
-        """Helper: Check if conditionals are empty/invalid."""
+        """Helper: Check if conditionals are empty/invalid. REVISED: Minor: Better dict tensor handling (assume numpy post-serialize)."""
         if conditionals is None:
             return True
         if isinstance(conditionals, torch.Tensor):
@@ -150,9 +194,30 @@ class ConditionalsCache:
 
     # FIXED: NEW: Check if conditionals are mock/dummy (zero emb, no .to, or small tensors)
     def _is_mock_conditionals(self, conditionals: Any) -> bool:
-        """Helper: Detect mock/dummy conditionals (e.g., from create_dummy_conds: zero emb, no .to method)."""
+        """Helper: Detect mock/dummy conditionals (e.g., from create_dummy_conds: zero emb, no .to method). REVISED: Handle dict (pre/post-recon) for memory uniformity."""
         if conditionals is None:
             return True
+
+        # REVISED: Handle dict (e.g., memory raw or disk loaded before recon)
+        if isinstance(conditionals, dict):
+            if T3_AVAILABLE and "t3" in conditionals and "speaker_emb" in conditionals["t3"]:
+                emb_data = conditionals["t3"]["speaker_emb"]
+                # Convert if numpy (post-serialize)
+                if isinstance(emb_data, (list, np.ndarray)):  # Assume import numpy as np if needed; or torch.from_numpy
+                    try:
+                        emb = torch.tensor(emb_data) if not isinstance(emb_data, torch.Tensor) else emb_data
+                    except:
+                        emb = torch.zeros(1, 256)  # Fallback
+                else:
+                    emb = emb_data
+                emb_size = emb.numel() if hasattr(emb, 'numel') else len(emb) if hasattr(emb, '__len__') else 0
+                is_zero_emb = emb_size > 0 and torch.all(emb == 0).item()
+                if is_zero_emb or emb_size == 0 or emb_size < 256:  # Real emb [1,256]
+                    logger.debug(f"Mock dict detected: zero/small emb (size={emb_size})")
+                    return True
+            return False  # Dict but no t3/emb → not mock, but may fail recon later
+
+        # Existing: For object (post-recon)
         if T3_AVAILABLE and hasattr(conditionals, 't3') and hasattr(conditionals.t3, 'speaker_emb'):
             emb = conditionals.t3.speaker_emb
             has_to_method = callable(getattr(conditionals.t3, 'to', None))  # Real has .to()
@@ -237,6 +302,11 @@ class ConditionalsCache:
             model.prepare_conditionals(audio_path, exaggeration=exag)
             conds = model.conds  # Reference or copy? (assume set in model already)
 
+            # REVISED: Post-prep validation (ensure object, call set_conditionals for full link)
+            if hasattr(model, 'set_conditionals'):
+                model.set_conditionals(conds)
+                logger.debug(f"set_conditionals post-prepare for {cache_key} (emb linked)")
+
             # Validate
             if self._is_empty_conditionals(conds) or self._is_mock_conditionals(conds):
                 logger.warning(f"Prepared empty/mock conds for {cache_key}; no save")
@@ -253,11 +323,7 @@ class ConditionalsCache:
     def delete(self, key: str) -> None:
         """Delete specific key from cache (for purge in manager). FIXED: Use hash paths."""
         try:
-            # Memory: Pop from dict (assume self.conditionals; adjust if self.cache)
-            if hasattr(self, 'conditionals') and key in self.conditionals:
-                del self.conditionals[key]
-            elif hasattr(self, 'cache') and key in self.cache:
-                del self.cache[key]
+            # Memory: Pop from dict (assume self.memory_cache)
             with self.cache_lock:
                 if key in self.memory_cache:
                     del self.memory_cache[key]
@@ -276,26 +342,28 @@ class ConditionalsCache:
             logger.warning(f"Delete failed for {key}: {del_e};")
 
     def _serialize_conditionals(self, conditionals: Any, device: str, dtype: torch.dtype) -> Dict:
-        """Safely serialize conditionals based on type. FIXED: Skip if mock detected here too."""
+        """Safely serialize conditionals based on type. REVISED: Remove numel filter (include all tensors; .cpu() for disk) to avoid incomplete dicts (e.g., emotion_adv dropped)."""
         # FIXED: Double-check mock before serialize (safety)
         if self._is_mock_conditionals(conditionals):
             raise ValueError("Cannot serialize mock conds – skipping save")
 
         if T3_AVAILABLE and isinstance(conditionals, Conditionals):
+            # REVISED: Full __dict__ (no numel skip; all attrs safe for disk ~MB size)
             t3_dict = {
-                k: v for k, v in conditionals.t3.__dict__.items()
-                if not isinstance(v, torch.Tensor) or v.numel() < 10000
+                k: v.cpu() if isinstance(v, torch.Tensor) else v  # .cpu() non-tensors unchanged
+                for k, v in conditionals.t3.__dict__.items()
             }
+            gen_data = conditionals.gen.cpu() if isinstance(conditionals.gen, torch.Tensor) else conditionals.gen
             return {
                 "t3": t3_dict,
-                "gen": conditionals.gen,
+                "gen": gen_data,
                 "device": str(device),
                 "dtype": str(dtype),
                 "class": "Conditionals"
             }
         elif isinstance(conditionals, dict):
             return {
-                k: v.cpu().numpy() if isinstance(v, torch.Tensor) else v
+                k: v.cpu().numpy() if isinstance(v, torch.Tensor) else v  # Existing, but .cpu() safe
                 for k, v in conditionals.items()
             }
         else:
@@ -339,7 +407,7 @@ class ConditionalsCache:
         """Clear conditionals cache, optionally for a specific voice. FIXED: Handle hash keys (glob *.pt; optional stem match)."""
         with self.cache_lock:
             if voice_stem:
-                # Memory: Clear by prefix (old keys with stem)
+                # Memory: Clear by prefix (old keys with stem; for hash, approximate if stem in key)
                 keys_to_remove = [k for k in list(self.memory_cache) if voice_stem in k]
                 for k in keys_to_remove:
                     del self.memory_cache[k]

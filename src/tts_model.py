@@ -341,6 +341,7 @@ def create_dummy_conds(model, device, dtype, reason="dummy"):
             self.t3 = t3
             self.cmel = torch.zeros((1, 80, 100), dtype=dtype, device=device)  # Match lengths
             self.cmap = torch.zeros((1, 1024, 200), dtype=dtype, device=device)
+            self.cond_prompt_speech_tokens = torch.zeros((1, 100), dtype=torch.long, device=device)  # Neutral dummy shape
 
         # FIXED: Implement .to for conds (coordinator/set_conditionals may call)
         def to(self, device=None, dtype=None):

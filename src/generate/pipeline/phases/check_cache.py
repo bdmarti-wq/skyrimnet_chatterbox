@@ -22,7 +22,7 @@ class CacheCheckPhase(BaseGenerationPhase):
         super().__init__()
 
     def _execute_core(self, context: AudioGenerationContext) -> AudioGenerationContext:
-        """Early audio_cache/fuzzy_cache checks (before voice_reference). If HIT, set flags/path, return (full bypass). Else, continue to voice. FIXED: Pass context to process_voice_reference; use context.sr."""
+        """Early audio_cache/fuzzy_cache checks (before voice_reference). If HIT, set flags/path, return (full bypass). Else, continue to voice. FIXED: Safe unpack guard; set path/conds always (real for new); MISS key='none' for neutral."""
         context.ensure_attrs()  # Stem/text ready
 
         if not self.cache_manager:
@@ -50,12 +50,15 @@ class CacheCheckPhase(BaseGenerationPhase):
                 try:
                     # FIXED: Load WAV tensor on exact HIT to enable .shape access (use context.sr if avail)
                     wav_tensor, _ = torchaudio.load(exact_path)  # Load audio (handle multi-channel by mean)
-                    context.processed_wav = wav_tensor.mean(dim=0, keepdim=True).to(context.device, context.dtype)  # Average channels, to device/dtype
+                    context.processed_wav = wav_tensor.mean(dim=0, keepdim=True).to(context.device,
+                                                                                    context.dtype)  # Average channels, to device/dtype
                     sr = getattr(context, 'sr', 24000)  # Fallback if sr not set
                     context.audio_duration = context.processed_wav.shape[1] / sr  # Compute from tensor
-                    logger.info(f"AUDIO EXACT HIT: {cache_key} → {exact_path} (loaded tensor, duration: {context.audio_duration:.2f}s; bypass gen/conds/post; RTF ∞)")
+                    logger.info(
+                        f"AUDIO EXACT HIT: {cache_key} → {exact_path} (loaded tensor, duration: {context.audio_duration:.2f}s; bypass gen/conds/post; RTF ∞)")
                 except Exception as load_e:
-                    logger.warning(f"Failed to load tensor from exact {exact_path}: {load_e}; use path for play (duration=0.0)")
+                    logger.warning(
+                        f"Failed to load tensor from exact {exact_path}: {load_e}; use path for play (duration=0.0)")
                     context.audio_duration = 0.0  # Fallback for play
                 context.cached_path = exact_path
                 context.is_cached = True
@@ -76,12 +79,15 @@ class CacheCheckPhase(BaseGenerationPhase):
                 try:
                     # FIXED: Load WAV tensor on fuzzy HIT to enable .shape access (use context.sr if avail)
                     wav_tensor, _ = torchaudio.load(fuzzy_path)  # Load audio (handle multi-channel by mean)
-                    context.processed_wav = wav_tensor.mean(dim=0, keepdim=True).to(context.device, context.dtype)  # Average channels, to device/dtype
+                    context.processed_wav = wav_tensor.mean(dim=0, keepdim=True).to(context.device,
+                                                                                    context.dtype)  # Average channels, to device/dtype
                     sr = getattr(context, 'sr', 24000)  # Fallback if sr not set
                     context.audio_duration = context.processed_wav.shape[1] / sr  # Compute from tensor
-                    logger.info(f"AUDIO FUZZY HIT (sim≥0.70): '{text[:30]}...' → {fuzzy_path} (loaded tensor, duration: {context.audio_duration:.2f}s; bypass gen/conds/post; RTF ∞)")
+                    logger.info(
+                        f"AUDIO FUZZY HIT (sim≥0.70): '{text[:30]}...' → {fuzzy_path} (loaded tensor, duration: {context.audio_duration:.2f}s; bypass gen/conds/post; RTF ∞)")
                 except Exception as load_e:
-                    logger.warning(f"Failed to load tensor from fuzzy {fuzzy_path}: {load_e}; use path for play (duration=0.0)")
+                    logger.warning(
+                        f"Failed to load tensor from fuzzy {fuzzy_path}: {load_e}; use path for play (duration=0.0)")
                     context.audio_duration = 0.0  # Fallback for play
                 context.cached_path = fuzzy_path
                 context.is_cached = True
@@ -101,33 +107,49 @@ class CacheCheckPhase(BaseGenerationPhase):
         # FIXED: Pass context to process_voice_reference so it can set attributes
         result = self.cache_manager.process_voice_reference(context)  # Use audio_prompt (context.audio_prompt_path)
 
-        # FIXED: Parse 5-item tuple safely (position-based for robustness)
+        # FIXED: Safe unpack (now bool-str-str-dict-Optional from aligned return); log for trace
+        is_valid_voice = False
+        resampled_path = ""
+        conds_key = ""
+        voice_params = {}
+        hit_entry = None
         if isinstance(result, tuple) and len(result) == 5:
             is_valid_voice, resampled_path, conds_key, voice_params, hit_entry = result
-            # Apply any additional params if needed (voice_cache already did via context)
+            logger.debug(
+                f"Voice result unpack: success={is_valid_voice}, path={bool(resampled_path)}, key={conds_key[:20] if conds_key else 'none'}")
         else:
-            logger.warning(f"Unexpected result from process_voice_reference: {type(result)}, {result} – treating as MISS")
+            logger.warning(
+                f"Unexpected result from process_voice_reference: {type(result)}, {result} – treating as MISS")
             is_valid_voice = False
             resampled_path = ""
             conds_key = ""
             voice_params = {}
             hit_entry = None
 
-        # FIXED: Set voice fields regardless (resampled_path is str, always set)
-        context.processed_voice_path = resampled_path if is_valid_voice else ""
-        context.conditionals_key = conds_key if conds_key else f"voice_new_{voice_stem}_{int(time.time() % 10000)}"
+        # FIXED: Set voice fields; on MISS (rare), key="none" for neutral skip (no dummy)
+        context.processed_voice_path = resampled_path if is_valid_voice and resampled_path else ""
+        if conds_key:
+            context.conditionals_key = conds_key
+        elif not is_valid_voice:
+            context.conditionals_key = f"none_{voice_stem or 'default'}"
+        else:
+            context.conditionals_key = f"voice_new_{voice_stem}_{int(time.time() % 10000)}"
         context.conds_key = context.conditionals_key
-        context.voice_params = voice_params  # Ensure dict for later use
+        context.voice_params = voice_params or context.voice_params  # Merge; ensure dict
 
         # Voice HIT/MISS (partial conds skip if HIT)
         if hit_entry is not None:
             logger.info(f"VOICE HIT: {voice_stem} (stable; after audio miss)")
         else:
-            logger.debug(f"VOICE MISS: {voice_stem} (new; after audio miss)")
+            logger.info(f"VOICE MISS: {voice_stem} (new; after audio miss)")
 
         context.cache_key = cache_key  # Full key
-        logger.debug(f"CacheCheck MISS (full pipeline) | voice: {voice_stem} | path: {bool(resampled_path)}")
+        path_set = bool(context.processed_voice_path and os.path.exists(context.processed_voice_path))
+        logger.debug(
+            f"CacheCheck MISS (full pipeline) | voice: {voice_stem} | key: {context.conditionals_key[:20]} | path: {path_set}")
         return context
+
+
 
     def _validate_cached_audio(self, path: str, stem: str) -> bool:
         """Validate cached path. FIXED: Use context.sr for SR check and duration (no MODEL_SR)."""

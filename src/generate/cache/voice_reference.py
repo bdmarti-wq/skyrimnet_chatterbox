@@ -148,6 +148,20 @@ class VoiceReferenceCache:
             stem = Path(audio_path).stem or "default"
             return stem.replace('_fixed', '')  # Clean common suffixes
 
+    def _get_audio_info(self, audio_path: str) -> Optional[Tuple[int, int, float]]:
+        """Get audio metadata."""
+        try:
+            info = torchaudio.info(audio_path)
+            if info.sample_rate == 0:
+                logger.debug(f"Invalid SR (0) for {audio_path}")
+                return None
+            duration = info.num_frames / info.sample_rate
+            return info.num_frames, info.sample_rate, duration
+        except Exception as e:
+            logger.debug(f"Audio info failed for {audio_path}: {e}")
+            return None
+
+
     def quick_metadata_match(self, incoming_path: str, cached_entry: VoiceReferenceEntry) -> bool:
         """Cheap match for reuse. OPTIMIZED: Use cached info where possible."""
         try:
@@ -341,6 +355,53 @@ class VoiceReferenceCache:
             except Exception as e:
                 logger.error(f"Save failed: {e}")
 
+    def validate_voice_prompt(self, audio_path: str, stem: str = None) -> Tuple[bool, str]:
+        """Validate prompt."""
+        if not os.path.exists(audio_path):
+            return False, f"Missing: {audio_path}"
+
+        if stem is None:
+            from src.normalize_stem import normalize_stem
+            stem = normalize_stem(audio_path) or Path(audio_path).stem.replace('_fixed', '') or 'default'
+
+        info_tuple = self._get_audio_info(audio_path)
+        if info_tuple is None:
+            return False, f"Invalid audio: {stem}"
+
+        num_frames, sample_rate, duration = info_tuple
+
+        config = get_config()
+        min_duration = get_config_value('globals.min_ref_duration', 3.0)
+
+        if num_frames == 0 or duration == 0:
+            return False, f"Empty for {stem}"
+
+        if duration < min_duration:
+            return False, f"Short for {stem}: {duration:.2f}s < {min_duration}s"
+
+        if sample_rate != MODEL_SR:
+            logger.warning(f"SR mismatch for {stem}: {sample_rate}Hz != {MODEL_SR}Hz")
+
+        # Artifact check (skip for refs)
+        try:
+            is_voice_ref = ('voices' in str(audio_path).lower() or
+                            any(s in Path(audio_path).stem for s in ['_fixed_new', '_padded', '_resampled', '_24kHz']))
+            if not is_voice_ref and get_config_value('globals.check_artifacts', True):
+                if hasattr(config, 'app_config') and hasattr(config.app_config, 'globals'):
+                    threshold = config.app_config.globals.sr // 3
+                else:
+                    threshold = 8000
+                if is_artifact_laden(audio_path, threshold_hz=self.content_hash_threshold):
+                    return False, f"Artifacts in {stem}"
+            logger.trace(f"Artifact passed (or skipped) for {audio_path}")
+        except ImportError:
+            logger.warning("Artifact check skipped (missing func)")
+        except Exception as a_e:
+            logger.warning(f"Artifact check error for {stem}: {a_e}")
+
+        logger.debug(f"Valid {stem}: {duration:.2f}s @ {sample_rate}Hz")
+        return True, f"Valid ({duration:.2f}s)"
+
     def process_new_reference(self, voice_stem: str, new_path: str, force_update: bool = False, context: Optional[Any] = None) -> Tuple[
         bool, str, str, Dict[str, Any], Optional[VoiceReferenceEntry]]:
         """
@@ -423,7 +484,7 @@ class VoiceReferenceCache:
             device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
             dtype = torch.float32
             sr = 24000
-        voice_params = self.get_voice_params(voice_stem)
+        voice_params = self._get_voice_params(voice_stem)  # TODO check vs older code?
 
         # Config path?
         config_path = voice_params.get("reference_path")

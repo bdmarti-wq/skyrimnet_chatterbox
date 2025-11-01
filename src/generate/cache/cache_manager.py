@@ -134,15 +134,15 @@ class CacheManager:
         return is_valid, "Valid" if is_valid else "Invalid voice reference"
 
     def process_voice_reference(self, context: AudioGenerationContext, force: bool = False) -> Tuple[
-        str, str, str, Dict[str, Any], Optional[VoiceReferenceEntry]]:
+        bool, str, str, Dict[str, Any], Optional[VoiceReferenceEntry]]:
         """
-        SIMPLIFIED: Takes only context (extracts audio_path/voice_stem internally); call process_new_reference; return tuple + hit_entry.
-        FIXED: Extract audio_path = context.audio_prompt_path, voice_stem = context.voice_stem; pass to VoiceReferenceCache.
+        SIMPLIFIED: Takes only context (extracts audio_path/voice_stem internally); call process_new_reference; return (success, path, conds_key, params, entry).
+        FIXED: Bool-first return (success) for unpack align; path=str if success (resampled for new); drop useless second ''.
         """
         if context is None:
             logger.warning("process_voice_reference called without context; fallback to defaults")
             voice_params = self.config.get_voice_params('default', {'exaggeration': 1.0})
-            return "", '', 'fallback_key', voice_params, None
+            return False, "", 'fallback_key', voice_params, None
 
         audio_path = getattr(context, 'audio_prompt_path', None)
         voice_stem = getattr(context, 'voice_stem', 'default')
@@ -151,7 +151,7 @@ class CacheManager:
             logger.warning(f"Invalid voice path from context: {audio_path}")
             voice_params = self.config.get_voice_params(voice_stem, {'exaggeration': 1.0})
             context.audio_prompt_path = ""  # Reset in context
-            return "", '', 'fallback_key', voice_params, None
+            return False, "", 'fallback_key', voice_params, None
 
         # Always derive norm_stem (stable)
         norm_stem = self.get_voice_stem(audio_path)
@@ -167,7 +167,7 @@ class CacheManager:
             if duration < min_duration:
                 logger.warning(f"Short {voice_stem}: {duration:.2f}s")
                 voice_params = self.config.get_voice_params(voice_stem, {})
-                return "", '', 'short_fallback_key', voice_params, None
+                return False, "", 'short_fallback_key', voice_params, None
 
             if get_config_value('globals.check_artifacts', True):
                 threshold = sr // 3  # Dynamic from context/config SR
@@ -178,7 +178,7 @@ class CacheManager:
         except Exception as v_e:
             logger.warning(f"Validation fail for {voice_stem}: {v_e}")
             voice_params = self.config.get_voice_params(voice_stem, {})
-            return "", '', 'invalid_fallback_key', voice_params, None
+            return False, "", 'invalid_fallback_key', voice_params, None
 
         # FIXED: Pass context to process_new_reference
         success, processed_path, conds_key, voice_params, hit_entry = self.voice_reference.process_new_reference(
@@ -191,7 +191,7 @@ class CacheManager:
                 self.voice_reference.voice_cache.pop(voice_stem, None)
                 self.voice_reference.save_cache()
             voice_params = self.config.get_voice_params(voice_stem, {})
-            return "", '', f'{voice_stem}_fail_key', voice_params, None
+            return False, "", f'{voice_stem}_fail_key', voice_params, None
 
         if hit_entry:
             logger.info(f"Voice HIT/reuse {voice_stem} (stable norm)")
@@ -201,18 +201,10 @@ class CacheManager:
         if not success or not processed_path:
             processed_path = audio_path if os.path.exists(audio_path) else ''
 
-        return str(processed_path), '', conds_key, voice_params, hit_entry
+        # FIXED: Return bool-first: (success, str(path), conds_key, ...) – aligns unpack; no useless ''
+        return success, str(processed_path), conds_key, voice_params, hit_entry
 
-    def _compute_content_hash(self, audio_path: str) -> str:
-        """Helper: Compute MD5 hash of file for caching (safe fallback)."""
-        if not audio_path or not os.path.exists(audio_path):
-            return hashlib.md5(str(audio_path).encode('utf-8')).hexdigest()  # Path-based fallback
-        try:
-            with open(audio_path, 'rb') as f:
-                return hashlib.md5(f.read()).hexdigest()
-        except Exception as e:
-            logger.warning(f"File hash failed for '{audio_path}': {e}")
-            return hashlib.md5(str(audio_path).encode('utf-8')).hexdigest()
+
 
     def get_conditionals(self, conditionals_key: str, model: Any) -> bool:
         """Load conditionals from cache system (memory or disk). FIXED: Safe globals access."""
