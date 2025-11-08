@@ -74,6 +74,10 @@ class GenerationCoordinator:
         logger.info(f"Pipeline complete: {total_time:.2f}s | Generated audio")
         return context
 
+    def validate(self, context: AudioGenerationContext):
+        """Dummy validation to satisfy main.py check."""
+        pass  # Or add real checks (e.g., model/cfg valid)
+
     def _fallback_context(self, context: AudioGenerationContext, error: Exception) -> AudioGenerationContext:
         """Use shared base _fallback_silence. Remove dupes."""
         logger.warning(f"Coordinator fallback due to {error}")

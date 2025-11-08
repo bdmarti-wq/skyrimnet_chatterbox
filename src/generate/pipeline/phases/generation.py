@@ -32,15 +32,17 @@ class GenerationPhase(BaseGenerationPhase):
         # Log shapes/dims for debug (simple, no f-string issues)
         conds_desc = 'Present (type: Conditionals)' if context.model.conds else 'None'
         logger.debug(f"Conds shapes: {{'conds': '{conds_desc}'}}")
+        text_len = len(context.text.split())  # Estimate tokens for validation
         logger.debug(
-            f"Gen args: text_len={len(gen_args['text']) if gen_args['text'] else 0}, conds_shapes={{'conds': '{conds_desc}'}}")
+            f"Gen args: text_len={text_len}, conds_shapes={{'conds': '{conds_desc}'}}")
 
         try:
-            if len(gen_args['text'].strip()) == 0:
+            if len(context.text.strip()) == 0:  # Use context.text directly
                 raise ValueError("Empty text input")
 
             gen_start = time.perf_counter()
-            raw_output = self._generate_core(context.model, gen_args, context.t3_params)
+            # UPDATED: Pass sr and text_len
+            raw_output = self._generate_core(context.model, gen_args, context.t3_params, context.sr, text_len)
             gen_time = time.perf_counter() - gen_start
 
             if raw_output is None or raw_output.numel() == 0:
@@ -98,33 +100,67 @@ class GenerationPhase(BaseGenerationPhase):
 
         return generate_args
 
-    def _generate_core(self, model: Any, gen_args: dict, t3_params: dict) -> Optional[torch.Tensor]:
-        """REFACTORED: Integrated from _generate_audio_core; simplified retry; use base clear graphs."""
+    # Updated _generate_core (simplified: primary + clear + helpers; pass sr from _execute_core if needed)
+    def _generate_core(self, model: Any, gen_args: dict, t3_params: dict, sr: int = 24000, text_len: int = 0) -> \
+    Optional[torch.Tensor]:
+        """ENHANCED: Primary gen + tiered retries via helpers. Cleaner flow for graph errors."""
         gen_start = time.time()
+
+        # Estimate text_len if not provided (rough token count)
+        if text_len == 0:
+            text_len = len(gen_args['text'].split()) if gen_args.get('text') else 0
+            logger.debug(f"Estimated text_len: {text_len}")
+
+        # Primary: Standard generation (with validation)
         try:
             if 't3_params' not in gen_args:
                 gen_args['t3_params'] = t3_params
             logger.debug("Calling model.generate...")
-            return model.generate(**gen_args)
+            output = model.generate(**gen_args)
+            # UPDATED: Pass text_len to validation
+            if self._validate_output(output, sr, text_len):
+                return output
+            else:
+                raise ValueError("Invalid output from primary generation")
         except RuntimeError as graph_e:
             err_str = str(graph_e).lower()
             if any(term in err_str for term in ["graph", "capture", "offset", "stream is capturing"]):
-                logger.warning(f"Graph/CUDA error: {graph_e} – clear & eager retry")
-                # REFACTORED: Shared clear (base-like)
+                logger.warning(f"Graph/CUDA error: {graph_e} – enhanced clear & tiered retry")
+
+                # Tier 1: Deeper clear (Torch 2.8+ / 50-series focus)
+                orig_params = None
                 if hasattr(model, 't3') and hasattr(model.t3, '_bucket_graphs'):
                     model.t3._bucket_graphs.clear()
+                if hasattr(model, 't3') and hasattr(model.t3, 'params'):
+                    orig_params = model.t3.params.copy()
+                    if isinstance(model.t3.params, dict) and 'compile' not in model.t3.params:
+                        model.t3.params['compile'] = False  # Disable if possible; harmless skip if key absent
+                try:
+                    import torch._dynamo as dynamo
+                    dynamo.reset()  # Clears compiled caches
+                except ImportError:
+                    pass
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
                     torch.cuda.synchronize()
 
-                # Eager retry (use original gen_args, override t3_params)
-                mod_args = gen_args.copy()
-                mod_t3 = t3_params.copy()
-                mod_t3['generate_token_backend'] = 'eager'
-                mod_args['t3_params'] = mod_t3
-                return model.generate(**mod_args)
+                # Tier 2: Eager helper
+                eager_result = self._retry_eager(model, gen_args, t3_params, sr, orig_params,
+                                                 text_len)  # UPDATED: Pass text_len
+                if eager_result is not None:
+                    return eager_result
+
+                # Tier 3: Safe helper
+                safe_result = self._retry_safe(model, gen_args, t3_params, sr, orig_params,
+                                               text_len)  # UPDATED: Pass text_len
+                if safe_result is not None:
+                    return safe_result
+
+                # Exhaustion
+                logger.error("All graph retries exhausted")
+                return None
             else:
-                raise
+                raise  # Non-graph error
         except Exception as e:
             logger.exception(f"Core gen failed: {e}")
             return None
@@ -133,6 +169,84 @@ class GenerationPhase(BaseGenerationPhase):
                 torch.cuda.empty_cache()
                 torch.cuda.synchronize()
             logger.debug(f"Gen complete: {time.time() - gen_start:.2f}s")
+
+    def _validate_output(self, output: Optional[torch.Tensor], sr: int, text_len: int = 0) -> bool:
+        """Quick check for valid generated audio tensor. Allows low-energy but rejects NaNs/empty/graph artifacts."""
+        if output is None or output.numel() == 0:
+            logger.debug("Output None or empty")
+            return False
+        if torch.isnan(output).any() or torch.isinf(output).any():
+            logger.debug("Output has NaN/Inf")
+            return False
+        samples = output.shape[-1]
+        min_samples = max(sr * 0.5, text_len * 80)  # ~0.5s min + ~80 samples/token estimate
+        if samples < min_samples:
+            logger.debug(
+                f"Output too short: samples={samples}, min={min_samples} (text_len={text_len}, shape={output.shape})")
+            return False
+        energy = torch.norm(output).item()
+        if energy < 5e-5:  # Relaxed threshold; tune to 1e-5 if still too strict
+            logger.debug(
+                f"Output energy too low: {energy} (text_len={text_len}, samples={samples}, shape={output.shape}, min/max={output.min().item():.2e}/{output.max().item():.2e})")
+            return False
+        logger.debug(
+            f"Output valid: energy={energy:.2e}, samples={samples}, shape={output.shape} (text_len={text_len})")
+        return True
+
+    # New helper: Tier 2 - Eager backend retry (extracted for clarity)
+    def _retry_eager(self, model: Any, gen_args: dict, t3_params: dict, sr: int, orig_params: dict = None,
+                     text_len: int = 0) -> Optional[torch.Tensor]:
+        """Retry with eager backend (original logic, validated). Restores params if provided."""
+        mod_args = gen_args.copy()
+        mod_t3 = t3_params.copy()
+        mod_t3['generate_token_backend'] = 'eager'
+        mod_args['t3_params'] = mod_t3
+        try:
+            eager_output = model.generate(**mod_args)
+            # UPDATED: Pass text_len to validation
+            if self._validate_output(eager_output, sr, text_len):
+                logger.debug("Eager retry succeeded")
+                if orig_params:
+                    model.t3.params = orig_params  # Restore
+                return eager_output
+            else:
+                logger.warning("Eager retry invalid output")
+            return None
+        except Exception as eager_e:
+            logger.warning(f"Eager retry failed: {eager_e}")
+            return None
+        finally:
+            if orig_params:
+                model.t3.params = orig_params
+
+    # New helper: Tier 3 - Safe params fallback (exag=0 for offset dodge)
+    def _retry_safe(self, model: Any, gen_args: dict, t3_params: dict, sr: int, orig_params: dict = None,
+                    text_len: int = 0) -> Optional[torch.Tensor]:
+        """Fallback with neutral params (exag=0, eager) to avoid dynamic offsets."""
+        safe_args = gen_args.copy()
+        safe_args['exaggeration'] = 0.0  # Neutral trigger avoidance
+        safe_args['temperature'] = safe_args.get('temperature', 1.0)  # Stable default
+        safe_t3 = t3_params.copy()
+        safe_t3['generate_token_backend'] = 'eager'
+        safe_args['t3_params'] = safe_t3
+        try:
+            safe_output = model.generate(**safe_args)
+            # UPDATED: Pass text_len to validation
+            if self._validate_output(safe_output, sr, text_len):
+                logger.info("Safe params recovery succeeded (neutral exag)")
+                if orig_params:
+                    model.t3.params = orig_params
+                return safe_output
+            else:
+                logger.warning("Safe params invalid output")
+            return None
+        except Exception as safe_e:
+            logger.warning(f"Safe retry failed: {safe_e}")
+            return None
+        finally:
+            if orig_params:
+                model.t3.params = orig_params
+
 
     def handle_error(self, context: AudioGenerationContext, error: Exception) -> AudioGenerationContext:
         """REFACTORED: Delegate to base (silence + paths/attrs); ensure generated_wav for post fallback."""

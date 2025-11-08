@@ -159,7 +159,7 @@ class CacheManager:
         logger.debug(f"Process voice under stable norm_stem '{voice_stem}' from context")
 
         # Basic validation (min dur/artifacts) using context.sr if available
-        min_duration = get_config_value('globals.min_ref_duration', 3.0)
+        min_duration = get_config_value('globals.min_ref_duration', 1.5)
         sr = getattr(context, 'sr', 24000)  # Use context.sr or fallback
         try:
             info = torchaudio.info(audio_path)
@@ -204,6 +204,37 @@ class CacheManager:
         # FIXED: Return bool-first: (success, str(path), conds_key, ...) – aligns unpack; no useless ''
         return success, str(processed_path), conds_key, voice_params, hit_entry
 
+
+    def _pad_short_audio(self, audio, target_dur=3.0, sr=24000):
+        """
+        Pad short audio by repeating the clip until it reaches the target duration.
+        Assumes audio is a 1D or (1, samples) torch tensor (mono).
+        """
+        if len(audio.shape) == 1:
+            audio = audio.unsqueeze(0)  # Ensure (1, samples)
+
+        current_samples = audio.shape[1]
+        current_dur = current_samples / sr
+        if current_dur >= target_dur:
+            return audio  # No padding needed
+
+        target_samples = int(target_dur * sr)
+        repeats = max(1, int(target_samples / current_samples))  # At least 1 repeat, ceil to reach target
+
+        # Repeat the audio tensor
+        padded_audio = audio.repeat(1, repeats)
+
+        # Trim or zero-pad the last bit if over
+        if padded_audio.shape[1] > target_samples:
+            padded_audio = padded_audio[:, :target_samples]
+        else:
+            # Add zeros if under (unlikely, but safe)
+            extra = torch.zeros((1, target_samples - padded_audio.shape[1]), device=padded_audio.device,
+                                dtype=padded_audio.dtype)
+            padded_audio = torch.cat([padded_audio, extra], dim=1)
+
+        logger.debug(f"Padded {current_dur:.2f}s audio to {target_dur}s (repeats: {repeats})")
+        return padded_audio
 
 
     def get_conditionals(self, conditionals_key: str, model: Any) -> bool:
