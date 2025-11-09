@@ -45,11 +45,16 @@ class ConditionalsCache:
 
         logger.info(f"Conditionals cache initialized at {self.cache_dir}")
 
+    # Drop-in replacement for ConditionalsCache._get_cache_path (rest of class unchanged)
     def _get_cache_path(self, key: str) -> Path:
-        """Get the file path for a cache key (now hash-based for stable reuse)."""
-        # FIXED: Stable hash for content (e.g., "conds_08e97b7a.pt" – persists/reuses across uploads)
-        filename = f"conds_{key[:12]}.pt"  # Key is hash (e.g., 08e97b7a...); 12 chars for uniqueness
-        return self.cache_dir / filename
+        """Get the file path for a cache key. FIXED: Use [:20] to avoid prefix collisions for similar stems (e.g., 'laci' vs 'lydia' in 'femaleunique*'). Ensures uniqueness without full key (too long for FS)."""
+        # FIXED: 20 chars covers stem divergence + part of '_ref_' (laci: "v2_femaleuniquelaci_re", lydia: "v2_femaleuniquelydia_").
+        # Alt for max safety: hashlib.md5(key.encode()).hexdigest()[:8] → Fully unique, ignores prefix.
+        filename = f"conds_{key[:20]}.pt"
+        path = self.cache_dir / filename
+        logger.debug(
+            f"Computed conds path: {path} for full_key={key[:30]}...")  # ENHANCED: Log path + key snippet for diagnosis
+        return path
 
     def is_cached(self, cache_key: str) -> bool:
         """Check if conditionals are cached for a given key."""
