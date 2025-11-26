@@ -6,11 +6,10 @@ from pathlib import Path
 
 # CONFIG singleton
 from src.config import get_config, get_config_value
-from src.tts_model import get_model, ModelManager
 
 # Path helpers
 from src.ui_helpers import (
-    update_api_status, stub_wav_path, test_voice_generation,
+    update_api_status, stub_wav_path,
 )
 
 # Hidden API supports communication with SkyrimNet via a Zonos bridge
@@ -109,14 +108,43 @@ def create_ui(
                     use_audio_cache = gr.Checkbox(value=True, label="Use audio cache (exact)")
                     use_fuzzy_cache = gr.Checkbox(value=True, label="Use fuzzy cache")
 
+                # Post-processing parameters moved to right column per request
+
+            with gr.Column(scale=1):
+                # Move buttons to top of right column
                 with gr.Row():
                     generate_btn = gr.Button("Generate Audio", variant="primary")
                     save_overrides_btn = gr.Button("Save Voice Overrides", variant="secondary")
-                    persist_note = gr.Markdown("Will save per-voice overrides only and make a timestamped backup of config.json", elem_id="persist-note")
-
-            with gr.Column(scale=1):
+                persist_note = gr.Markdown("Will save per-voice overrides only and make a timestamped backup of config.json", elem_id="persist-note")
                 audio_output = gr.Audio(label="Generated Speech", type="filepath")
                 generate_status = gr.Textbox(label="Status", interactive=False, value="Ready")
+
+                # Post-processing parameters (voice-specific) – moved here per request, below buttons and audio
+                with gr.Accordion("Post-processing (voice-specific)", open=False):
+                    pp_enable = gr.Checkbox(value=False, label="Enable post-processing")
+                    with gr.Row():
+                        trailing_silence_db = gr.Slider(-90.0, -10.0, -45.0, step=1.0, label="Trailing silence threshold (dB)")
+                        gate_threshold = gr.Slider(0.0, 0.5, 0.05, step=0.01, label="Gate threshold (relative)")
+                    with gr.Row():
+                        tail_suppress_sec = gr.Slider(0.0, 1.0, 0.2, step=0.01, label="Tail suppress fraction (of len)")
+                        tail_suppress_strength = gr.Slider(0.0, 1.0, 0.6, step=0.01, label="Tail suppress strength")
+                    with gr.Row():
+                        tail_suppress_low_hz = gr.Slider(100, 8000, 2000, step=10, label="Tail suppress low Hz")
+                        tail_suppress_high_hz = gr.Slider(2000, 16000, 4000, step=10, label="Tail suppress high Hz")
+                    with gr.Row():
+                        tail_onset_threshold = gr.Slider(0.0, 1.0, 0.3, step=0.01, label="Tail onset threshold")
+                        min_post_duration_sec = gr.Slider(0.0, 2.0, 0.5, step=0.05, label="Min post duration (sec)")
+                    with gr.Row():
+                        notch_gain_db = gr.Slider(-24.0, 0.0, 0.0, step=0.5, label="Notch gain (dB; negative to enable)")
+                        notch_low_hz = gr.Slider(1000, 12000, 8000, step=10, label="Notch low Hz")
+                        notch_high_hz = gr.Slider(2000, 16000, 11000, step=10, label="Notch high Hz")
+                    with gr.Row():
+                        eq_gain_db = gr.Slider(-12.0, 12.0, 0.0, step=0.5, label="EQ gain (dB; 0 = off)")
+                        eq_cutoff_hz = gr.Slider(100, 10000, 3000, step=10, label="EQ cutoff Hz")
+                    speaking_rate = gr.Slider(0.5, 1.5, 1.0, step=0.01, label="Speaking rate (1.0 = no change)")
+                    with gr.Row():
+                        fade_ms = gr.Number(value=0, label="Fade in/out (ms; 0 = off)", precision=0)
+                        gain_max_limit = gr.Slider(0.0, 1.0, 0.0, step=0.01, label="Peak limit (0 = off; max 1.0)")
 
         # Handlers
         def on_refresh():
@@ -127,7 +155,9 @@ def create_ui(
         def resolve_audio_choice(upload_path: str, selected_path: str) -> str:
             return upload_path or selected_path or ""
 
-        async def do_generate(text, upload_path, selected_path, seed_val, temp, cfg, minpv, toppv, rep, exagg, lang, use_audio_flag, use_fuzzy_flag):
+        async def do_generate(text, upload_path, selected_path, seed_val, temp, cfg, minpv, toppv, rep, exagg, lang, use_audio_flag, use_fuzzy_flag,
+                              pp_enable_v, trailing_db_v, gate_thr_v, tail_frac_v, tail_strength_v, tail_low_v, tail_high_v, onset_thr_v,
+                              min_post_sec_v, notch_gain_v, notch_low_v, notch_high_v, eq_gain_v, eq_cutoff_v, speak_rate_v, fade_ms_v, gain_limit_v):
             try:
                 audio_path = resolve_audio_choice(upload_path, selected_path)
                 if not audio_path:
@@ -142,13 +172,35 @@ def create_ui(
                 if use_fuzzy_flag is False:
                     sentinel_tokens.append("skip_fuzzy")
                 cache_sentinel = ",".join(sentinel_tokens) if sentinel_tokens else None
+                # Build post-processing overrides dict (no-op defaults for core PP controls)
+                pp_overrides = {
+                    'enable_post_processing': bool(pp_enable_v),
+                    'trailing_silence_db': float(trailing_db_v),
+                    'gate_threshold': float(gate_thr_v),
+                    'tail_suppress_sec': float(tail_frac_v),
+                    'tail_suppress_low_hz': int(tail_low_v),
+                    'tail_suppress_high_hz': int(tail_high_v),
+                    'tail_suppress_strength': float(tail_strength_v),
+                    'tail_onset_threshold': float(onset_thr_v),
+                    'notch_gain_db': float(notch_gain_v),
+                    'notch_low_hz': int(notch_low_v),
+                    'notch_high_hz': int(notch_high_v),
+                    'eq_gain_db': float(eq_gain_v),
+                    'eq_cutoff_hz': int(eq_cutoff_v),
+                    'speaking_rate': float(speak_rate_v),
+                    'min_post_duration_sec': float(min_post_sec_v),
+                    'fade_ms': float(fade_ms_v) if fade_ms_v is not None else 0.0,
+                    'gain_max_limit': float(gain_limit_v) if gain_limit_v is not None else 0.0,
+                }
+
+
                 out_path, status = await generate_audio_ui(
                     model_choice=None,
                     text=text or "",
                     language=lang or "en",
                     speaker_audio=audio_path,
                     prefix_audio=None,
-                    e1=None, e2=None, e3=None, e4=None, e5=None, e6=None, e7=None, e8=None,
+                    e1=pp_overrides, e2=None, e3=None, e4=None, e5=None, e6=None, e7=None, e8=None,
                     vq_single=None, fmax=None, pitch_std=None, speaking_rate=None, dnsmos_ovrl=None, speaker_noised=None,
                     cfg_scale=cfg,
                     top_p_param=toppv,
@@ -168,13 +220,17 @@ def create_ui(
 
         generate_btn.click(
             fn=do_generate,
-            inputs=[text_input, ref_upload, voice_choices, seed, temperature, cfg_scale, min_p, top_p, repetition_penalty, exaggeration, language, use_audio_cache, use_fuzzy_cache],
+            inputs=[text_input, ref_upload, voice_choices, seed, temperature, cfg_scale, min_p, top_p, repetition_penalty, exaggeration, language, use_audio_cache, use_fuzzy_cache,
+                    pp_enable, trailing_silence_db, gate_threshold, tail_suppress_sec, tail_suppress_strength, tail_suppress_low_hz, tail_suppress_high_hz, tail_onset_threshold,
+                    min_post_duration_sec, notch_gain_db, notch_low_hz, notch_high_hz, eq_gain_db, eq_cutoff_hz, speaking_rate, fade_ms, gain_max_limit],
             outputs=[audio_output, generate_status],
             show_progress=True,
             concurrency_limit=1
         )
 
-        def do_save_overrides(upload_path, selected_path, temp, cfg, minpv, toppv, rep, exagg, lang):
+        def do_save_overrides(upload_path, selected_path, temp, cfg, minpv, toppv, rep, exagg, lang,
+                              pp_enable_v, trailing_db_v, gate_thr_v, tail_frac_v, tail_strength_v, tail_low_v, tail_high_v, onset_thr_v,
+                              min_post_sec_v, notch_gain_v, notch_low_v, notch_high_v, eq_gain_v, eq_cutoff_v, speak_rate_v, fade_ms_v, gain_limit_v):
             try:
                 audio_path = resolve_audio_choice(upload_path, selected_path)
                 if not audio_path:
@@ -197,6 +253,50 @@ def create_ui(
                 if lang:
                     config.set_value('language_id', lang, voice=voice_name)
 
+                # Post-processing defaults (no-op)
+                pp_defaults = {
+                    'enable_post_processing': False,
+                    'trailing_silence_db': -45.0,
+                    'gate_threshold': 0.05,
+                    'tail_suppress_sec': 0.2,
+                    'tail_suppress_low_hz': 2000,
+                    'tail_suppress_high_hz': 4000,
+                    'tail_suppress_strength': 0.6,
+                    'tail_onset_threshold': 0.3,
+                    'notch_gain_db': 0.0,
+                    'notch_low_hz': 8000,
+                    'notch_high_hz': 11000,
+                    'eq_gain_db': 0.0,
+                    'eq_cutoff_hz': 3000,
+                    'speaking_rate': 1.0,
+                    'min_post_duration_sec': 0.5,
+                    'fade_ms': 0.0,
+                    'gain_max_limit': 0.0,
+                }
+                pp_current = {
+                    'enable_post_processing': bool(pp_enable_v),
+                    'trailing_silence_db': float(trailing_db_v),
+                    'gate_threshold': float(gate_thr_v),
+                    'tail_suppress_sec': float(tail_frac_v),
+                    'tail_suppress_low_hz': int(tail_low_v),
+                    'tail_suppress_high_hz': int(tail_high_v),
+                    'tail_suppress_strength': float(tail_strength_v),
+                    'tail_onset_threshold': float(onset_thr_v),
+                    'notch_gain_db': float(notch_gain_v),
+                    'notch_low_hz': int(notch_low_v),
+                    'notch_high_hz': int(notch_high_v),
+                    'eq_gain_db': float(eq_gain_v),
+                    'eq_cutoff_hz': int(eq_cutoff_v),
+                    'speaking_rate': float(speak_rate_v),
+                    'min_post_duration_sec': float(min_post_sec_v),
+                    'fade_ms': float(fade_ms_v) if fade_ms_v is not None else 0.0,
+                    'gain_max_limit': float(gain_limit_v) if gain_limit_v is not None else 0.0,
+                }
+                # Persist only values that differ from defaults
+                for k, v in pp_current.items():
+                    if pp_defaults.get(k) != v:
+                        config.set_value(k, v, voice=voice_name)
+
                 # Timestamped backup then save
                 cfg_path = Path('config.json')
                 backups_dir = Path('config_backups')
@@ -212,12 +312,14 @@ def create_ui(
 
         save_overrides_btn.click(
             fn=do_save_overrides,
-            inputs=[ref_upload, voice_choices, temperature, cfg_scale, min_p, top_p, repetition_penalty, exaggeration, language],
+            inputs=[ref_upload, voice_choices, temperature, cfg_scale, min_p, top_p, repetition_penalty, exaggeration, language,
+                    pp_enable, trailing_silence_db, gate_threshold, tail_suppress_sec, tail_suppress_strength, tail_suppress_low_hz, tail_suppress_high_hz, tail_onset_threshold,
+                    min_post_duration_sec, notch_gain_db, notch_low_hz, notch_high_hz, eq_gain_db, eq_cutoff_hz, speaking_rate, fade_ms, gain_max_limit],
             outputs=[generate_status]
         )
 
         # Attach Hidden API for bridge (use our generated components)
-        setup_bridge_api(demo, audio_output, generate_status, config=config)
+        setup_bridge_api(demo, audio_output, api_status_md, config=config)
 
         logger.info("Unified tab UI initialized. Bridge API connected.")
         return demo

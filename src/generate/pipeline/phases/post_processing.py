@@ -1,12 +1,16 @@
 # src/generate/pipeline/phases/post_processing.py
+import os
+import tempfile
 from typing import Dict, Any
 
 import torch
 import numpy as np
 import librosa
+import torchaudio
 from scipy.signal import sosfilt, butter
 from loguru import logger
 
+from src.audio_utils import is_artifact_laden
 from src.generate.pipeline.phases.base import BaseGenerationPhase
 from src.generate.pipeline.context import AudioGenerationContext
 
@@ -80,7 +84,8 @@ def reverse_tail_suppress(audio: np.ndarray, sr: int, tail_sec: float = 0.2, ons
     if len(audio) < tail_samples * 2:
         return audio
     tail_reversed = audio[-tail_samples:][::-1]
-    onsets = librosa.onset.onset_detect(y=tail_reversed, sr=sr, units='samples', hop_length=512, threshold=onset_threshold)
+    # Use 'delta' kw for librosa onset detection for broader version compatibility
+    onsets = librosa.onset.onset_detect(y=tail_reversed, sr=sr, units='samples', hop_length=512, delta=onset_threshold)
     if len(onsets) == 0:  # No strong onsets – suppress tail
         suppress_len = int(tail_samples * 0.7)
         taper = np.linspace(1.0, 0.0, suppress_len)
@@ -180,24 +185,23 @@ def apply_fade(audio: np.ndarray, sr: int, fade_ms: float | None = 20.0) -> np.n
 def apply_post_processing(wav_np: np.ndarray, sr: int, params: dict | None = None, text: str = '') -> np.ndarray:
     """Apply post-processing. FIXED: Optional text for vocalize, light/heavy conditional; no-op defaults."""
     if params is None:
-        params = {}
-        logger.debug("Post params skipped – raw")
+        logger.debug("Post params missing/empty – no-op")
         return wav_np
-    enable_post = params.get('enable_post_processing', True)
+    enable_post = params.get('enable_post_processing', False)
     if not enable_post:
-        logger.debug("Post disabled – raw")
+        logger.debug("Post disabled or not enabled – no-op")
         return wav_np
 
     voice_name = params.get('voice_name', 'unknown')
     non_none_params = {k: v for k, v in params.items() if v is not None}
     logger.debug(f"Post params for {voice_name}: {non_none_params}")
 
-    # Detect if short vocalize (skip heavy for "ah", "mmm", etc.)
+    # Detect if short vocalize (previously used to skip heavy; now only for logging/tuning)
     text = text or ''  # Empty text fallback
     is_vocalize = len(text.strip()) <= 3 and text.lower() in ['ah', 'oh', 'aah', 'mmm', 'uh', 'mmh', 'eh']
-    light_mode = is_vocalize or len(text) < 10  # Light for short/vocal
+    light_mode = is_vocalize or len(text) < 10  # Keep a notion of shortness, but don't skip heavy anymore
     if light_mode:
-        logger.debug(f"Vocalize/short '{text}' – light post (skip heavy)")
+        logger.debug(f"Vocalize/short '{text}' – applying light tail fixes PLUS full heavy post")
 
     orig_dur = len(wav_np) / sr
     orig_len = len(wav_np)
@@ -217,41 +221,65 @@ def apply_post_processing(wav_np: np.ndarray, sr: int, params: dict | None = Non
         wav_np = trim_trailing_artifacts(wav_np, sr, tail_threshold_db)
         logger.debug(f"Light post: Tail fixes for phantoms")
 
-    # Heavy: Only if enabled and not light
-    if not light_mode:
-        gate_threshold = params.get('gate_threshold', 0.05)
-        wav_np = gate_trailing_phantoms(wav_np, sr, gate_threshold)
-        tail_fractions = params.get('tail_suppress_sec', 0.2) or 0.25  # From params
-        low_hz = params.get('tail_suppress_low_hz', 2000)
-        high_hz = params.get('tail_suppress_high_hz', 4000)
-        strength = params.get('tail_suppress_strength', 0.6)
-        wav_np = suppress_tail_artifacts(wav_np, sr, tail_fraction=tail_fractions, low_hz=low_hz, high_hz=high_hz, strength=strength)
-        onset_thresh = params.get('tail_onset_threshold', 0.3)
-        wav_np = reverse_tail_suppress(wav_np, sr, tail_sec=0.2, onset_threshold=onset_thresh)
+    # Heavy: Always apply when post-processing is enabled (even for short strings)
+    gate_threshold = params.get('gate_threshold', 0.05)
+    wav_np = gate_trailing_phantoms(wav_np, sr, gate_threshold)
+    # Respect explicit 0.0 (do not coerce to default using 'or')
+    tail_fraction_val = params.get('tail_suppress_sec', 0.2)
+    try:
+        tail_fractions = 0.25 if tail_fraction_val is None else float(tail_fraction_val)
+    except Exception:
+        tail_fractions = 0.25
+    low_hz = params.get('tail_suppress_low_hz', 2000)
+    high_hz = params.get('tail_suppress_high_hz', 4000)
+    strength = params.get('tail_suppress_strength', 0.6)
+    wav_np = suppress_tail_artifacts(wav_np, sr, tail_fraction=tail_fractions, low_hz=low_hz, high_hz=high_hz, strength=strength)
+    onset_thresh = params.get('tail_onset_threshold', 0.3)
+    wav_np = reverse_tail_suppress(wav_np, sr, tail_sec=0.2, onset_threshold=onset_thresh)
 
-        notch_gain = params.get('notch_gain_db', 0)
-        notch_low = params.get('notch_low_hz', 8000)
-        notch_high = params.get('notch_high_hz', 11000)
-        if notch_gain < 0:
-            wav_np = apply_notch(wav_np, sr, notch_low, notch_high, notch_gain)
+    notch_gain = params.get('notch_gain_db', 0)
+    notch_low = params.get('notch_low_hz', 8000)
+    notch_high = params.get('notch_high_hz', 11000)
+    if notch_gain < 0:
+        wav_np = apply_notch(wav_np, sr, notch_low, notch_high, notch_gain)
 
-        eq_gain_db = params.get('eq_gain_db', 0.0)
-        eq_cutoff = params.get('eq_cutoff_hz', 3000)
-        if eq_gain_db != 0.0:
-            wav_np = apply_eq(wav_np, sr, eq_gain_db, eq_cutoff)
+    eq_gain_db = params.get('eq_gain_db', 0.0)
+    eq_cutoff = params.get('eq_cutoff_hz', 3000)
+    if eq_gain_db != 0.0:
+        wav_np = apply_eq(wav_np, sr, eq_gain_db, eq_cutoff)
 
-        logger.debug("Heavy post: Spectral/reverse/notch/EQ applied")
+    logger.debug("Heavy post: Spectral/reverse/notch/EQ applied")
 
     # Rate adjustment
     rate = params.get('speaking_rate', 1.0)
     if abs(rate - 1.0) > 0.05:
         wav_np = adjust_speaking_rate(wav_np, rate)
 
-    # Final clip
-    wav_np = np.clip(wav_np, -1.0, 1.0)
+    # Optional fade from overrides
+    fade_ms = params.get('fade_ms', None)
+    try:
+        wav_np = apply_fade(wav_np, sr, fade_ms)
+    except Exception as e:
+        logger.debug(f"Fade failed/skipped: {e}")
+
+    # Limiter/clipping based on overrides (peak-safe for short/garbled samples)
+    gain_max_limit = params.get('gain_max_limit', None)
+    if isinstance(gain_max_limit, (int, float)) and gain_max_limit is not None and gain_max_limit > 0:
+        peak = float(np.max(np.abs(wav_np))) if wav_np.size > 0 else 0.0
+        if peak > 0 and peak > gain_max_limit:
+            scale = gain_max_limit / peak
+            wav_np = wav_np * scale
+            logger.debug(f"Applied limiter scale {scale:.3f} to enforce peak≤{gain_max_limit:.3f}")
+        # Final clip to configured ceiling (and still within [-1,1])
+        ceiling = min(1.0, float(gain_max_limit))
+        wav_np = np.clip(wav_np, -ceiling, ceiling)
+    else:
+        # Standard safety clip
+        wav_np = np.clip(wav_np, -1.0, 1.0)
     final_len = len(wav_np)
     final_dur = final_len / sr
-    light_str = "light" if light_mode else "heavy" if not light_mode else "none"
+    # Cosmetic: simplify string (last branch unreachable previously)
+    light_str = "light" if light_mode else "heavy"
     logger.debug(f"Post complete for {voice_name}: {final_dur:.2f}s from {orig_dur:.2f}s ({light_str}; vocal={is_vocalize})")
 
     # Fallback if too short (but relaxed for all)
@@ -310,8 +338,76 @@ class PostProcessingPhase(BaseGenerationPhase):
                 resampled = resampler(input_wav)
                 wav = resampled.squeeze(0)
 
+            # Optional pre-check: detect artifacts on current waveform to auto-enable post-processing
+            device = wav.device
+            dtype = wav.dtype
+            wav_np = wav.detach().cpu().float().numpy()
+            text = getattr(context, 'text', '') or ''
+            voice_params = voice_params or {}
+
+            # Auto-detect artifacts using audio_utils.is_artifact_laden (expects a file path)
+            effective_params = dict(voice_params) if isinstance(voice_params, dict) else {}
+            auto_enabled = False
+            try:
+                # Save to a temporary wav for analysis
+                with tempfile.NamedTemporaryFile(delete=False, suffix=f"_{context.sr}.wav") as tmp:
+                    tmp_path = tmp.name
+                # Ensure 1-channel [C, N] for save
+                wav_to_save = wav.unsqueeze(0) if wav.dim() == 1 else wav
+                torchaudio.save(tmp_path, wav_to_save.detach().cpu().float(), context.sr)
+                try:
+                    if is_artifact_laden(tmp_path):
+                        # Enable post-processing with safe, simple defaults that mitigate leading/trailing garble
+                        auto_enabled = True
+                        defaults = {
+                            'enable_post_processing': True,
+                            'trailing_silence_db': -45.0,
+                            'gate_threshold': 0.05,
+                            'tail_suppress_sec': 0.2,
+                            'tail_suppress_low_hz': 2000,
+                            'tail_suppress_high_hz': 4000,
+                            'tail_suppress_strength': 0.6,
+                            'tail_onset_threshold': 0.3,
+                            'fade_ms': 15.0,            # light fade to hide clicks
+                            'gain_max_limit': 0.9,      # gentle peak limiter
+                            'min_post_duration_sec': 0.4
+                        }
+                        # Merge: do not overwrite non-default user overrides if present, but force enable_post_processing
+                        for k, v in defaults.items():
+                            if k == 'enable_post_processing':
+                                effective_params[k] = True
+                            else:
+                                if k not in effective_params or effective_params.get(k) in (None, 0, 0.0, False):
+                                    effective_params[k] = v
+                    else:
+                        # No artifacts: keep original params
+                        effective_params = voice_params
+                finally:
+                    try:
+                        os.unlink(tmp_path)
+                    except Exception:
+                        pass
+            except Exception as det_e:
+                # If detection fails, proceed with original params
+                logger.debug(f"Artifact detection skipped/failed: {det_e}")
+                effective_params = voice_params
+
+            if auto_enabled:
+                logger.info("Artifact-laden audio detected – auto-enabling post-processing with safe defaults")
+
+            # Hook: apply numpy-based post processing with enabled defaults if artifacts detected
+            processed_np = apply_post_processing(wav_np, context.sr, effective_params, text)
+            if processed_np is not None and isinstance(processed_np, np.ndarray) and processed_np.size > 0:
+                wav = torch.from_numpy(processed_np).to(device=device, dtype=dtype)
+            else:
+                logger.debug("Post-processing returned empty/invalid – using original wav")
+
             context.processed_wav = wav.unsqueeze(0) if wav.dim() == 1 else wav
-            context.audio_duration = context.audio_duration
+            # Update duration based on processed wav
+            try:
+                context.audio_duration = len(context.processed_wav.squeeze(0)) / context.sr
+            except Exception:
+                pass
             logger.info(f"Post-processing: {context.audio_duration:.2f}s @ {context.sr}Hz")
         except Exception as e:
             logger.error(f"Post-processing error: {e} – raw fallback")
@@ -323,10 +419,11 @@ class PostProcessingPhase(BaseGenerationPhase):
             if raw_wav is not None and raw_wav.numel() > 0:
                 context.processed_wav = self._inline_simple_norm(raw_wav, fallback_params)
             else:
-                context.processed_wav = self.create_silence(context.sr, 2.0)
+                context.processed_wav = self.create_silence_tensor(context.sr, 2.0)
 
         return context
 
+    @staticmethod
     def create_silence_tensor(sr: int, duration_s: float = 2.0, device: str = 'cpu') -> torch.Tensor:
         """Sample silence (1D fp32 mono; [samples])."""
         if device == 'cuda' and torch.cuda.is_available():
@@ -367,7 +464,7 @@ class PostProcessingPhase(BaseGenerationPhase):
             pad_samples = int((min_dur - current_dur) * 24000)
             wav = torch.nn.functional.pad(wav, (0, pad_samples), mode='constant')
 
-        logger.debug("Inline norm: peak=1.0, gain={post_gain:+.2f}")
+        logger.debug(f"Inline norm: peak=1.0, gain={post_gain:+.2f}")
         return wav.unsqueeze(0) if wav.dim() == 1 else wav
 
     def handle_error(self, context: AudioGenerationContext, error: Exception) -> AudioGenerationContext:
