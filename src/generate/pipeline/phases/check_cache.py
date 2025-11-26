@@ -32,8 +32,46 @@ class CacheCheckPhase(BaseGenerationPhase):
             logger.info("Cache checks bypassed: both enable_audio_cache and enable_fuzzy_cache are False")
             context.is_cached = False
             context.cache_hit_type = 'cache_disabled'
-            # Still process voice reference downstream
-            self.cache_manager.process_voice_reference(context) if self.cache_manager else None
+
+            # IMPORTANT: We still want a proper voice reference prepared so that
+            # downstream VoiceProcessing can compute real conditionals instead of
+            # falling back to dummy (which would yield silence-like output).
+            # When caches are disabled, we only bypass audio/fuzzy cache lookup,
+            # not the voice preparation step.
+            if self.cache_manager:
+                result = self.cache_manager.process_voice_reference(context)
+
+                # Safe-unpack identical to MISS path below
+                is_valid_voice = False
+                resampled_path = ""
+                conds_key = ""
+                voice_params = {}
+                hit_entry = None
+                if isinstance(result, tuple) and len(result) == 5:
+                    is_valid_voice, resampled_path, conds_key, voice_params, hit_entry = result
+                    logger.debug(
+                        f"Voice (cache_disabled) unpack: success={is_valid_voice}, path={bool(resampled_path)}, key={conds_key[:20] if conds_key else 'none'}")
+                else:
+                    logger.warning(
+                        f"Unexpected result from process_voice_reference (cache_disabled): {type(result)}, {result} – treating as MISS")
+
+                # Mirror field assignments from MISS branch
+                context.processed_voice_path = resampled_path if is_valid_voice and resampled_path else ""
+                if conds_key:
+                    context.conditionals_key = conds_key
+                elif not is_valid_voice:
+                    context.conditionals_key = f"none_{context.voice_stem or 'default'}"
+                else:
+                    context.conditionals_key = f"voice_new_{context.voice_stem}_{int(time.time() % 10000)}"
+                context.conds_key = context.conditionals_key
+                context.voice_params = voice_params or context.voice_params
+
+                if hit_entry is not None:
+                    logger.info(f"VOICE HIT (cache_disabled): {context.voice_stem}")
+                else:
+                    logger.info(f"VOICE MISS (cache_disabled): {context.voice_stem}")
+
+            # Continue pipeline (do not set skip flags or output here)
             return context
 
         if not self.cache_manager:
