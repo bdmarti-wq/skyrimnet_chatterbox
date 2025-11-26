@@ -103,8 +103,8 @@ DEFAULT_DEVICE = "cuda"  # Fallback
 DEFAULT_DTYPE = torch.bfloat16  # TODO was float32 test and review
 MODEL_SR = 24000  # Assume standard for TTS
 MAX_MEMORY_ENTRIES = get_config_value('max_memory_entries', default=100)
-ENABLE_MEMORY_CACHE = get_config_value('enable_memory_cache', default=True)
-ENABLE_DISK_CACHE = get_config_value('enable_disk_cache', default=True)
+ENABLE_MEMORY_CACHE = get_config_value('enable_audio_cache', default=True)
+ENABLE_DISK_CACHE = get_config_value('enable_fuzzy_cache', default=True)
 ENABLE_THREADED_SAVES = True  # Hardcode or add to CONFIG if needed
 MAX_QUEUE = get_config_value('save_queue_max', default=20)
 

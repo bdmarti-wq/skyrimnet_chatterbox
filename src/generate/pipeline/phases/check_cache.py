@@ -25,6 +25,17 @@ class CacheCheckPhase(BaseGenerationPhase):
         """Early audio_cache/fuzzy_cache checks (before voice_reference). If HIT, set flags/path, return (full bypass). Else, continue to voice. FIXED: Safe unpack guard; set path/conds always (real for new); MISS key='none' for neutral."""
         context.ensure_attrs()  # Stem/text ready
 
+        # Allow bypassing caches entirely via context flags (only if both disabled)
+        audio_cache_enabled = getattr(context, 'enable_audio_cache', True)
+        fuzzy_cache_enabled = getattr(context, 'enable_fuzzy_cache', True)
+        if not audio_cache_enabled and not fuzzy_cache_enabled:
+            logger.info("Cache checks bypassed: both enable_audio_cache and enable_fuzzy_cache are False")
+            context.is_cached = False
+            context.cache_hit_type = 'cache_disabled'
+            # Still process voice reference downstream
+            self.cache_manager.process_voice_reference(context) if self.cache_manager else None
+            return context
+
         if not self.cache_manager:
             context.is_cached = False
             context.cache_hit_type = 'no_cache'
@@ -43,61 +54,63 @@ class CacheCheckPhase(BaseGenerationPhase):
         cache_uuid = getattr(context, 'cache_uuid', int(time.time() * 1000) % (2 ** 32))  # Ensure
         cache_key = self.cache_manager.generate_audio_cache_key(voice_stem, text, exag, cache_uuid)
 
-        # 1. Exact match (audio_cache)
-        exact_path = self.cache_manager.get_audio_cache(cache_key)
-        if exact_path and os.path.exists(exact_path):
-            if self._validate_cached_audio(exact_path, voice_stem):
-                try:
-                    # FIXED: Load WAV tensor on exact HIT to enable .shape access (use context.sr if avail)
-                    wav_tensor, _ = torchaudio.load(exact_path)  # Load audio (handle multi-channel by mean)
-                    context.processed_wav = wav_tensor.mean(dim=0, keepdim=True).to(context.device,
-                                                                                    context.dtype)  # Average channels, to device/dtype
-                    sr = getattr(context, 'sr', 24000)  # Fallback if sr not set
-                    context.audio_duration = context.processed_wav.shape[1] / sr  # Compute from tensor
-                    logger.info(
-                        f"AUDIO EXACT HIT: {cache_key} → {exact_path} (loaded tensor, duration: {context.audio_duration:.2f}s; bypass gen/conds/post; RTF ∞)")
-                except Exception as load_e:
-                    logger.warning(
-                        f"Failed to load tensor from exact {exact_path}: {load_e}; use path for play (duration=0.0)")
-                    context.audio_duration = 0.0  # Fallback for play
-                context.cached_path = exact_path
-                context.is_cached = True
-                context.cache_hit_type = 'audio_exact'
-                context.skip_pipeline = True
-                context.output_path = exact_path  # Pre-set for Output
-                # Stub for conds (no prep needed)
-                context.conditionals_key = f"cached_exact_{voice_stem}_{cache_key[:12]}"
-                return context
-            else:
-                self.cache_manager.set_audio_cache(cache_key, None)  # Purge invalid
-                logger.warning(f"Exact path invalid {exact_path} – purged & check fuzzy")
+        # 1. Exact match (audio_cache) if enabled
+        if audio_cache_enabled:
+            exact_path = self.cache_manager.get_audio_cache(cache_key)
+            if exact_path and os.path.exists(exact_path):
+                if self._validate_cached_audio(exact_path, voice_stem):
+                    try:
+                        # FIXED: Load WAV tensor on exact HIT to enable .shape access (use context.sr if avail)
+                        wav_tensor, _ = torchaudio.load(exact_path)  # Load audio (handle multi-channel by mean)
+                        context.processed_wav = wav_tensor.mean(dim=0, keepdim=True).to(context.device,
+                                                                                        context.dtype)  # Average channels, to device/dtype
+                        sr = getattr(context, 'sr', 24000)  # Fallback if sr not set
+                        context.audio_duration = context.processed_wav.shape[1] / sr  # Compute from tensor
+                        logger.info(
+                            f"AUDIO EXACT HIT: {cache_key} → {exact_path} (loaded tensor, duration: {context.audio_duration:.2f}s; bypass gen/conds/post; RTF ∞)")
+                    except Exception as load_e:
+                        logger.warning(
+                            f"Failed to load tensor from exact {exact_path}: {load_e}; use path for play (duration=0.0)")
+                        context.audio_duration = 0.0  # Fallback for play
+                    context.cached_path = exact_path
+                    context.is_cached = True
+                    context.cache_hit_type = 'audio_exact'
+                    context.skip_pipeline = True
+                    context.output_path = exact_path  # Pre-set for Output
+                    # Stub for conds (no prep needed)
+                    context.conditionals_key = f"cached_exact_{voice_stem}_{cache_key[:12]}"
+                    return context
+                else:
+                    self.cache_manager.set_audio_cache(cache_key, None)  # Purge invalid
+                    logger.warning(f"Exact path invalid {exact_path} – purged & check fuzzy")
 
-        # 2. Fuzzy match (if exact miss)
-        fuzzy_path = self.cache_manager.get_fuzzy_audio_cache(audio_prompt, text, voice_stem, threshold=0.70)
-        if fuzzy_path and os.path.exists(fuzzy_path):
-            if self._validate_cached_audio(fuzzy_path, voice_stem):
-                try:
-                    # FIXED: Load WAV tensor on fuzzy HIT to enable .shape access (use context.sr if avail)
-                    wav_tensor, _ = torchaudio.load(fuzzy_path)  # Load audio (handle multi-channel by mean)
-                    context.processed_wav = wav_tensor.mean(dim=0, keepdim=True).to(context.device,
-                                                                                    context.dtype)  # Average channels, to device/dtype
-                    sr = getattr(context, 'sr', 24000)  # Fallback if sr not set
-                    context.audio_duration = context.processed_wav.shape[1] / sr  # Compute from tensor
-                    logger.info(
-                        f"AUDIO FUZZY HIT (sim≥0.70): '{text[:30]}...' → {fuzzy_path} (loaded tensor, duration: {context.audio_duration:.2f}s; bypass gen/conds/post; RTF ∞)")
-                except Exception as load_e:
-                    logger.warning(
-                        f"Failed to load tensor from fuzzy {fuzzy_path}: {load_e}; use path for play (duration=0.0)")
-                    context.audio_duration = 0.0  # Fallback for play
-                context.cached_path = fuzzy_path
-                context.is_cached = True
-                context.cache_hit_type = 'audio_fuzzy'
-                context.skip_pipeline = True
-                context.output_path = fuzzy_path
-                context.conditionals_key = f"cached_fuzzy_{voice_stem}_{cache_key[:12]}"
-                return context
-            else:
-                logger.warning(f"Fuzzy path invalid {fuzzy_path} – purged")
+        # 2. Fuzzy match (if exact miss) if enabled
+        if fuzzy_cache_enabled:
+            fuzzy_path = self.cache_manager.get_fuzzy_audio_cache(audio_prompt, text, voice_stem, threshold=0.70)
+            if fuzzy_path and os.path.exists(fuzzy_path):
+                if self._validate_cached_audio(fuzzy_path, voice_stem):
+                    try:
+                        # FIXED: Load WAV tensor on fuzzy HIT to enable .shape access (use context.sr if avail)
+                        wav_tensor, _ = torchaudio.load(fuzzy_path)  # Load audio (handle multi-channel by mean)
+                        context.processed_wav = wav_tensor.mean(dim=0, keepdim=True).to(context.device,
+                                                                                        context.dtype)  # Average channels, to device/dtype
+                        sr = getattr(context, 'sr', 24000)  # Fallback if sr not set
+                        context.audio_duration = context.processed_wav.shape[1] / sr  # Compute from tensor
+                        logger.info(
+                            f"AUDIO FUZZY HIT (sim≥0.70): '{text[:30]}...' → {fuzzy_path} (loaded tensor, duration: {context.audio_duration:.2f}s; bypass gen/conds/post; RTF ∞)")
+                    except Exception as load_e:
+                        logger.warning(
+                            f"Failed to load tensor from fuzzy {fuzzy_path}: {load_e}; use path for play (duration=0.0)")
+                        context.audio_duration = 0.0  # Fallback for play
+                    context.cached_path = fuzzy_path
+                    context.is_cached = True
+                    context.cache_hit_type = 'audio_fuzzy'
+                    context.skip_pipeline = True
+                    context.output_path = fuzzy_path
+                    context.conditionals_key = f"cached_fuzzy_{voice_stem}_{cache_key[:12]}"
+                    return context
+                else:
+                    logger.warning(f"Fuzzy path invalid {fuzzy_path} – purged")
 
         # No full audio HIT → MISS full pipeline (voice/conds/gen)
         logger.debug(f"No audio HIT (exact/fuzzy miss for key={cache_key[:20]}) – full pipeline")

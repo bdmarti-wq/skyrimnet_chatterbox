@@ -26,8 +26,8 @@ class AudioGenerationContext:
     cache_uuid: int = field(default=0, init=True, repr=True)
 
     # Cache flags
-    enable_memory_cache: bool = field(default=True, init=True, repr=False)
-    enable_disk_cache: bool = field(default=True, init=True, repr=False)
+    enable_audio_cache: bool = field(default=True, init=True, repr=False)
+    enable_fuzzy_cache: bool = field(default=True, init=True, repr=False)
 
     # Generation parameters (UI-driven)
     exaggeration: float = field(default=0.5, init=True, repr=True)

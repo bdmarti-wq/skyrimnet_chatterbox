@@ -87,8 +87,8 @@ class SkyrimNetConfig:
         'enable_spectral_gating': True,  # New
         'notch_enabled': False,  # New
         'hp_enabled': False,  # New
-        'enable_disk_cache': True,   # Replaces ENABLE_DISK_CACHE global (sync to self)
-        'enable_memory_cache': True, # Replaces ENABLE_MEMORY_CACHE global (sync to self)
+        'enable_fuzzy_cache': True,   # Replaces ENABLE_DISK_CACHE global (sync to self)
+        'enable_audio_cache': True, # Replaces ENABLE_MEMORY_CACHE global (sync to self)
         'force_local_refs': True,  # New: Alt flag
         'auto_update_refs': True,  # New: Alt flag
         'timings_enabled': False,  # New
@@ -242,8 +242,8 @@ class SkyrimNetConfig:
         }
         config_mode = {k: 'default' for k in default_config}
         global_flags = {
-            'enable_memory_cache': self.DEFAULTS.get('enable_memory_cache', True),
-            'enable_disk_cache': self.DEFAULTS.get('enable_disk_cache', True)
+            'enable_audio_cache': self.DEFAULTS.get('enable_audio_cache', True),
+            'enable_fuzzy_cache': self.DEFAULTS.get('enable_fuzzy_cache', True)
         }
 
         config_path = Path(self._config_file_path)  # Use self (no _CONFIG_FILE global)
@@ -356,9 +356,9 @@ class SkyrimNetConfig:
             defaults, modes, global_flags = self._config_cache
             # Re-merge old cache with fresh voices
             self._defaults.update(defaults)
-            self.enable_memory_cache = global_flags.get('enable_memory_cache',
-                                                        self.DEFAULTS.get('enable_memory_cache', True))
-            self.enable_disk_cache = global_flags.get('enable_disk_cache', self.DEFAULTS.get('enable_disk_cache', True))
+            self.enable_memory_cache = global_flags.get('enable_audio_cache',
+                                                        self.DEFAULTS.get('enable_audio_cache', True))
+            self.enable_disk_cache = global_flags.get('enable_fuzzy_cache', self.DEFAULTS.get('enable_fuzzy_cache', True))
             # Always refresh voices
             self._load_voices_json()
             logger.debug("Config from cache (txt + fresh voices.json)")
@@ -379,15 +379,15 @@ class SkyrimNetConfig:
         self.multilingual = self._defaults.get('multilingual', False)
         self._use_api_mode = self._defaults.get('use_api_mode', False)
         self.fuzzy_cache_limit = self._defaults.get('fuzzy_cache_limit', 1000)
-        self.enable_memory_cache = self._defaults.get('enable_memory_cache', True)
-        self.enable_disk_cache = self._defaults.get('enable_disk_cache', True)
+        self.enable_memory_cache = self._defaults.get('enable_audio_cache', True)
+        self.enable_disk_cache = self._defaults.get('enable_fuzzy_cache', True)
 
         # Step 3: Load voices.json (unchanged)
         self.voice_overrides = self._load_voices_json()
 
         # Step 4: Sync flags from txt (unchanged)
-        self.enable_memory_cache = global_flags.get('enable_memory_cache', self.enable_memory_cache)
-        self.enable_disk_cache = global_flags.get('enable_disk_cache', self.enable_disk_cache)
+        self.enable_memory_cache = global_flags.get('enable_audio_cache', self.enable_memory_cache)
+        self.enable_disk_cache = global_flags.get('enable_fuzzy_cache', self.enable_disk_cache)
 
         # Set self attrs from merged (unchanged)
         for attr, val in self._defaults.items():
@@ -503,8 +503,8 @@ class SkyrimNetConfig:
             f.write(f"hop_length = {self.hop_length}\n")
             f.write(f"stride_length = {self.stride_length}\n")
             f.write(f"fade_ms = {self.fade_ms}\n")
-            f.write(f"enable_memory_cache = {self.enable_memory_cache}\n")
-            f.write(f"enable_disk_cache = {self.enable_disk_cache}\n")
+            f.write(f"enable_audio_cache = {self.enable_memory_cache}\n")
+            f.write(f"enable_fuzzy_cache = {self.enable_disk_cache}\n")
             f.write(f"force_local_refs = {self.force_local_refs}\n")
             f.write(f"auto_update_refs = {self.auto_update_refs}\n")
             f.write(f"tts_name = {self.tts_name}\n")
@@ -512,7 +512,7 @@ class SkyrimNetConfig:
             # Flags section
             f.write("\n# Flags\n")
             for flag, val in self._flags.items():
-                if flag not in ['enable_pre_adjustment', 'enable_memory_cache', 'enable_disk_cache',
+                if flag not in ['enable_pre_adjustment', 'enable_audio_cache', 'enable_fuzzy_cache',
                                 'force_local_refs', 'auto_update_refs']:
                     f.write(f"{flag} = {val}\n")
 
@@ -793,8 +793,8 @@ def load_skyrimnet_config():
         default_config = CONFIG._defaults.copy()  # Shallow
         config_mode = {k: 'default' for k in default_config if
                        k in ['temperature', 'min_p', 'top_p', 'repetition_penalty', 'cfg_weight', 'exaggeration']}
-        global_flags = {'enable_memory_cache': CONFIG.enable_memory_cache,
-                        'enable_disk_cache': CONFIG.enable_disk_cache}
+        global_flags = {'enable_audio_cache': CONFIG.enable_memory_cache,
+                        'enable_fuzzy_cache': CONFIG.enable_disk_cache}
         CONFIG._config_cache = (default_config, config_mode, global_flags)  # Cache to self (no global)
     return CONFIG._config_cache  # Return self cache
 
@@ -818,7 +818,7 @@ CONFIG = SkyrimNetConfig()
 # Deprecated: _sync_globals (phase out global use; call if legacy code needs it, but update to CONFIG attrs)
 def _sync_globals():
     """Deprecated: Sync self to globals (phase out: use CONFIG directly; logs warning)."""
-    logger.warning("_sync_globals deprecated (use CONFIG.device, CONFIG.enable_disk_cache, etc.; globals for legacy only)")
+    logger.warning("_sync_globals deprecated (use CONFIG.device, CONFIG.enable_fuzzy_cache, etc.; globals for legacy only)")
     global DEVICE, DTYPE, MODEL, MULTILINGUAL, ENABLE_DISK_CACHE, ENABLE_MEMORY_CACHE, FUZZY_CACHE_LIMIT, _CONFIG_CACHE, _USE_API_MODE
     DEVICE = str(CONFIG.device)
     DTYPE = CONFIG.dtype

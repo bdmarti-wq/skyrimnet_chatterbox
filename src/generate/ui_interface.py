@@ -132,18 +132,37 @@ async def generate_audio_ui(
         cache_manager = CACHE_MANAGER_CACHE
 
         # Create generation context with params + loaded internals
+        # Determine cache usage (UI can send a sentinel via unconditional_keys_list)
+        enable_audio_cache = True
+        enable_fuzzy_cache = True
+        try:
+            if isinstance(unconditional_keys_list, str) and unconditional_keys_list:
+                tokens = {t.strip().lower() for t in unconditional_keys_list.split(',') if t and isinstance(t, str)}
+                if 'skip_audio' in tokens:
+                    enable_audio_cache = False
+                if 'skip_fuzzy' in tokens:
+                    enable_fuzzy_cache = False
+            elif unconditional_keys_list == "skip_caches":
+                # Backward compatibility with previous single toggle
+                enable_audio_cache = False
+                enable_fuzzy_cache = False
+        except Exception:
+            pass
+
         context = _create_generation_context(
             text=text,
             audio_prompt_path=speaker_audio,  # UI-provided audio
             cache_uuid=uuid_seed,
-            exaggeration=quadratic_exagg or 0.5,
-            temperature=linear_temp or 0.8,
+            exaggeration=quadratic_exagg,
+            temperature=linear_temp,
             cfgw=cfg_scale,
             min_p=min_p_param,
             top_p=top_p_param,
-            repetition_penalty=confidence_rep or 1.2,
+            repetition_penalty=confidence_rep,
             language_id=language,
             seed_num=cpp_uuid_to_seed(uuid_seed) if randomize_seed_toggle else None,
+            enable_audio_cache=enable_audio_cache,
+            enable_fuzzy_cache=enable_fuzzy_cache,
             model=model,  # FIXED: Pass the loaded model
             config=config,  # FIXED: Pass the loaded config
             cache_manager=cache_manager  # FIXED: Pass the cache_manager
@@ -186,8 +205,8 @@ def _create_generation_context(
     repetition_penalty: float,
     language_id: str,
     seed_num: int,
-    enable_memory_cache: bool = True,
-    enable_disk_cache: bool = True,
+    enable_audio_cache: bool = True,
+    enable_fuzzy_cache: bool = True,
     model: Optional[Any] = None,
     config: Optional["AppConfig"] = None,
     cache_manager: Optional["CacheManager"] = None
@@ -216,20 +235,28 @@ def _create_generation_context(
     seed = cpp_uuid_to_seed(cache_uuid) if seed_num is None else seed_num
 
     # Create and initialize context
+    # Merge precedence: UI params (if not None) should override voice-specific config WHEN coming from UI.
+    # Hidden API passes None so voice_params win. If both None, use safe model defaults.
+    def _merge_param(ui_val, vp_key, default_val=None):
+        if ui_val is not None:
+            return ui_val
+        vp_val = voice_params.get(vp_key) if isinstance(voice_params, dict) else None
+        return vp_val if vp_val is not None else default_val
+
     context = AudioGenerationContext(
         text=text,
         audio_prompt_path=audio_prompt_path,
         cache_uuid=cache_uuid,
-        exaggeration=exaggeration or voice_params.get('exaggeration'),  # From merged (or None -> model default)
-        temperature=temperature or voice_params.get('temperature'),    # From merged (or None -> model default)
-        cfgw=cfgw or voice_params.get('cfg_weight', 0.45),
-        min_p=min_p or voice_params.get('min_p', 0.05),
-        top_p=top_p or voice_params.get('top_p', 1.0),
-        repetition_penalty=repetition_penalty or voice_params.get('repetition_penalty', 1.2),
+        exaggeration=_merge_param(exaggeration, 'exaggeration', 0.5),
+        temperature=_merge_param(temperature, 'temperature', 0.8),
+        cfgw=_merge_param(cfgw, 'cfg_weight', 0.3),
+        min_p=_merge_param(min_p, 'min_p', 0.5),
+        top_p=_merge_param(top_p, 'top_p', 1.0),
+        repetition_penalty=_merge_param(repetition_penalty, 'repetition_penalty', 1.2),
         language_id=language_id,
         seed=seed,
-        enable_memory_cache=enable_memory_cache,
-        enable_disk_cache=enable_disk_cache,
+        enable_audio_cache=enable_audio_cache,
+        enable_fuzzy_cache=enable_fuzzy_cache,
         voice_stem=voice_stem or "default",
         voice_params=voice_params,  # Now from get_voice_params (merged + cached)
         t3_params={
@@ -295,10 +322,10 @@ def setup_bridge_api(demo, audio_output, api_status_md, config=None):
     speaking_rate_param = gr.Number(visible=False, value=None, label="Speaking Rate")
     dnsmos_ovrl = gr.Number(visible=False, value=None, label="DNSMOS Ovrl")
     speaker_noised = gr.Checkbox(visible=False, value=False, label="Speaker Noised")
-    cfg_scale = gr.Number(visible=False, value=0.3, label="CFG Scale")
-    top_p_param = gr.Number(visible=False, value=1.0, label="Top P")
+    cfg_scale = gr.Number(visible=False, value=None, label="CFG Scale")
+    top_p_param = gr.Number(visible=False, value=None, label="Top P")
     top_k = gr.Number(visible=False, value=None, label="Top K")
-    min_p_param = gr.Number(visible=False, value=0.5, label="Min P")
+    min_p_param = gr.Number(visible=False, value=None, label="Min P")
     linear_temp = gr.Number(visible=False, value=None, label="Linear (Temp)")
     confidence_rep = gr.Number(visible=False, value=None, label="Confidence (Rep)")
     quadratic_exagg = gr.Number(visible=False, value=None, label="Quadratic (Exagg)")

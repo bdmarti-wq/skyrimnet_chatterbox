@@ -6,7 +6,6 @@ from pathlib import Path
 
 # CONFIG singleton
 from src.config import get_config, get_config_value
-from src.generate_tab import create_generate_tab
 from src.tts_model import get_model, ModelManager
 
 # Path helpers
@@ -16,6 +15,10 @@ from src.ui_helpers import (
 
 # Hidden API supports communication with SkyrimNet via a Zonos bridge
 from src.generate.ui_interface import generate_audio_ui, setup_bridge_api
+from src.normalize_stem import normalize_stem
+import shutil
+import json
+from datetime import datetime
 
 # Warnings cleanup
 import warnings
@@ -30,130 +33,193 @@ def create_ui(
     pipeline=None,
     config: AppConfig = None
 ):
-    """State-free UI: Tabs with lazy load (user clicks 'Load/Refresh' for CONFIG values). Generate default."""
+    """Unified Generate/Test tab: upload/select voice, set params, generate audio, and optionally persist per-voice overrides.
+    Note: generate_audio_ui signature/behavior remains untouched (bridge-compatible)."""
     # Ensure config is available
     config = config or get_config()
 
+    def list_voice_wavs() -> list:
+        """Collect available voice reference wavs.
+        Looks in voices_cache_dir and its 'resampled' subfolder.
+        """
+        try:
+            voices_dir = config.app_config.globals.voices_cache_dir
+            if not voices_dir:
+                return []
+            paths = []
+            vdir = Path(voices_dir)
+            # Top-level wavs
+            for p in vdir.glob('*.wav'):
+                try:
+                    paths.append(str(p))
+                except Exception:
+                    continue
+            # Resampled subfolder wavs
+            resampled_dir = vdir / 'resampled'
+            if resampled_dir.exists():
+                for p in resampled_dir.glob('*.wav'):
+                    try:
+                        paths.append(str(p))
+                    except Exception:
+                        continue
+            return sorted(paths)
+        except Exception as e:
+            logger.warning(f"Failed listing voice wavs: {e}")
+            return []
+
+    def get_default_params():
+        # UI defaults should mirror a normal generate_audio_ui call defaults
+        # irrespective of any per-voice overrides. Hidden API will use config overrides.
+        return {
+            'temperature': 0.8,
+            'exaggeration': 0.5,
+            'cfg_weight': 0.3,
+            'min_p': 0.5,
+            'top_p': 1.0,
+            'repetition_penalty': 1.2,
+            'language_id': get_config_value('globals.language_id', 'en')
+        }
+
     with gr.Blocks(title="SkyrimNet Chatterbox", theme=gr.themes.Soft()) as demo:
-        # Global Status (top-level, updated via btns)
         api_status_md = gr.Markdown(value=update_api_status())
+        gr.Markdown("# SkyrimNet Chatterbox TTS UI\nUnified generation and testing.", elem_id="title-md")
 
-        gr.Markdown("# SkyrimNet Chatterbox TTS UI\nSimplified tabbed interface for generation, testing, and config editing.", elem_id="title-md")
+        defaults = get_default_params()
 
-        # Generate Tab - Create it first so we can get its outputs for bridge API
-        audio_output, generate_status = create_generate_tab()
-        logger.debug("Generate Audio tab initialized")
+        with gr.Row():
+            with gr.Column(scale=1):
+                text_input = gr.Textbox(label="Input Text", placeholder="Enter text to generate speech...", lines=3)
 
-        # Tabs container
-        with gr.Tabs(selected="generate") as tabs:
-            # Voice Test Tab (separate from Generate)
-            with gr.TabItem("🔊 Voice Test", id="test", elem_id="tab-test"):
-                gr.Markdown("### 🔬 Test Voice Parameters (Click Load to sync from CONFIG)")
-                load_test_btn = gr.Button("Load/Refresh Values", variant="secondary")
+                with gr.Group():
+                    gr.Markdown("### Voice Reference")
+                    ref_upload = gr.Audio(label="Upload .wav", sources="upload", type="filepath", format="wav")
+                    voice_choices = gr.Dropdown(label="Or select from voices directory", choices=list_voice_wavs(), value=None, allow_custom_value=False)
+                    refresh_btn = gr.Button("Refresh Voices List", variant="secondary")
+
+                with gr.Group():
+                    gr.Markdown("### TTS Parameters")
+                    seed = gr.Number(value=42, label="Seed", precision=0)
+                    temperature = gr.Slider(0.1, 1.5, defaults['temperature'], step=0.01, label="Temperature")
+                    cfg_scale = gr.Slider(0.0, 2.0, defaults['cfg_weight'], step=0.01, label="CFG Scale")
+                    min_p = gr.Slider(0.0, 1.0, defaults['min_p'], step=0.01, label="Min P")
+                    top_p = gr.Slider(0.0, 1.0, defaults['top_p'], step=0.01, label="Top P")
+                    repetition_penalty = gr.Slider(0.5, 3.0, defaults['repetition_penalty'], step=0.01, label="Repetition Penalty")
+                    exaggeration = gr.Slider(0.0, 2.0, defaults['exaggeration'], step=0.01, label="Exaggeration")
+                    language = gr.Textbox(value=defaults['language_id'], label="Language (id)")
+                    use_audio_cache = gr.Checkbox(value=True, label="Use audio cache (exact)")
+                    use_fuzzy_cache = gr.Checkbox(value=True, label="Use fuzzy cache")
 
                 with gr.Row():
-                    with gr.Column(scale=1):
-                        # Dropdown (static; updated on load btn)
-                        test_voice_dropdown = gr.Dropdown(
-                            label="Test Voice", choices=['default'], value='default', allow_custom_value=False
-                        )
-                        test_text = gr.Textbox(value="Testing shared config voice parameters.", label="Test Text", lines=3)
-                        test_seed = gr.Number(value=42, label="Test Seed", minimum=0, maximum=99999)
-                        with gr.Group():
-                            gr.Markdown("### Voice Processing Parameters")
-                            test_rate = gr.Slider(0.5, 2.0, 1.0, step=0.05, label="🗣️ Speaking Rate")
-                            test_eq = gr.Slider(-20.0, 0.0, -8.0, step=0.5, label="🎛️ EQ Gain (dB)")
-                            test_gain = gr.Slider(1.0, 5.0, 2.0, step=0.1, label="📈 Max Gain")
-                            test_target = gr.Slider(0.0, 1.0, 0.6, step=0.05, label="🎯 Target Max")
-                            test_noise = gr.Slider(-60.0, -20.0, -30.0, step=1.0, label="🔇 Noise Floor")
-                            test_trim = gr.Slider(-40.0, -20.0, -28.0, step=1.0, label="✂️ Trim Threshold")
-                            with gr.Row():
-                                test_notch = gr.Checkbox(value=True, label="🛡️ Notch Filter")
-                                test_hp = gr.Checkbox(value=True, label="🔊 High-Pass")
-                        test_btn = gr.Button("🎵 Test Generation", variant="primary")
+                    generate_btn = gr.Button("Generate Audio", variant="primary")
+                    save_overrides_btn = gr.Button("Save Voice Overrides", variant="secondary")
+                    persist_note = gr.Markdown("Will save per-voice overrides only and make a timestamped backup of config.json", elem_id="persist-note")
 
-                    with gr.Column(scale=2):
-                        test_audio = gr.Audio(label="Test Audio Output")
-                        test_status = gr.Markdown(value="Click Load/Refresh then Test")
-                        test_params = gr.JSON(value={}, label="Parameters Applied")
+            with gr.Column(scale=1):
+                audio_output = gr.Audio(label="Generated Speech", type="filepath")
+                generate_status = gr.Textbox(label="Status", interactive=False, value="Ready")
 
-                # Load btn (lazy: populates from CONFIG)
-                load_test_btn.click(
-                    fn=lambda: load_test_tab(config),
-                    inputs=[],  # No inputs
-                    outputs=[test_voice_dropdown, test_text, test_seed, test_rate, test_eq, test_gain, test_target, test_noise, test_trim, test_notch, test_hp, test_params, test_status],
-                    js="", show_progress=False
+        # Handlers
+        def on_refresh():
+            return gr.update(choices=list_voice_wavs())
+
+        refresh_btn.click(fn=on_refresh, inputs=[], outputs=[voice_choices])
+
+        def resolve_audio_choice(upload_path: str, selected_path: str) -> str:
+            return upload_path or selected_path or ""
+
+        async def do_generate(text, upload_path, selected_path, seed_val, temp, cfg, minpv, toppv, rep, exagg, lang, use_audio_flag, use_fuzzy_flag):
+            try:
+                audio_path = resolve_audio_choice(upload_path, selected_path)
+                if not audio_path:
+                    return None, "Please upload or select a .wav reference first."
+
+                # Map to generate_audio_ui parameters without changing its signature
+                # Pass a sentinel in unconditional_keys_list to control cache usage without changing signature
+                # Supported tokens: "skip_audio" and/or "skip_fuzzy" (default: use both caches)
+                sentinel_tokens = []
+                if use_audio_flag is False:
+                    sentinel_tokens.append("skip_audio")
+                if use_fuzzy_flag is False:
+                    sentinel_tokens.append("skip_fuzzy")
+                cache_sentinel = ",".join(sentinel_tokens) if sentinel_tokens else None
+                out_path, status = await generate_audio_ui(
+                    model_choice=None,
+                    text=text or "",
+                    language=lang or "en",
+                    speaker_audio=audio_path,
+                    prefix_audio=None,
+                    e1=None, e2=None, e3=None, e4=None, e5=None, e6=None, e7=None, e8=None,
+                    vq_single=None, fmax=None, pitch_std=None, speaking_rate=None, dnsmos_ovrl=None, speaker_noised=None,
+                    cfg_scale=cfg,
+                    top_p_param=toppv,
+                    top_k=None,
+                    min_p_param=minpv,
+                    linear_temp=temp,
+                    confidence_rep=rep,
+                    quadratic_exagg=exagg,
+                    uuid_seed=int(seed_val) if seed_val is not None else -1,
+                    randomize_seed_toggle=False,
+                    unconditional_keys_list=cache_sentinel
                 )
+                return out_path, status
+            except Exception as e:
+                logger.exception("Generation failed")
+                return None, f"Error: {e}"
 
-                # Test btn (UI-only)
-                test_btn.click(
-                    fn=lambda *args: test_voice_generation(config, *args),
-                    inputs=[test_voice_dropdown, test_text, test_seed],
-                    outputs=[test_audio, test_status, test_params],
-                    js="", show_progress=True, concurrency_limit=1
-                )
+        generate_btn.click(
+            fn=do_generate,
+            inputs=[text_input, ref_upload, voice_choices, seed, temperature, cfg_scale, min_p, top_p, repetition_penalty, exaggeration, language, use_audio_cache, use_fuzzy_cache],
+            outputs=[audio_output, generate_status],
+            show_progress=True,
+            concurrency_limit=1
+        )
 
-                # Voice change handler
-                test_voice_dropdown.change(
-                    fn=lambda voice: update_test_voice_choices(config, voice),
-                    inputs=[test_voice_dropdown],
-                    outputs=[test_voice_dropdown],
-                    js="", show_progress=False
-                )
+        def do_save_overrides(upload_path, selected_path, temp, cfg, minpv, toppv, rep, exagg, lang):
+            try:
+                audio_path = resolve_audio_choice(upload_path, selected_path)
+                if not audio_path:
+                    return "Cannot save: select or upload a voice .wav to derive voice name."
+                voice_name = normalize_stem(audio_path) or 'default'
 
-            # Voice Editor Tab (minimal implementation for now)
-            with gr.TabItem("🎤 Voice Editor", id="editor", elem_id="tab-editor"):
-                gr.Markdown("### Edit Per-Voice Params (Simple implementation for testing)")
-                voice_dropdown = gr.Dropdown(
-                    label="Select Voice",
-                    choices=['default'] + config.get_all_voices(),
-                    value='default',
-                    allow_custom_value=False
-                )
-                load_btn = gr.Button("Load Voice Parameters")
-                save_btn = gr.Button("Save Voice Parameters", variant="primary")
+                # Write only per-voice overrides
+                to_set = {
+                    'temperature': temp,
+                    'cfg_weight': cfg,
+                    'min_p': minpv,
+                    'top_p': toppv,
+                    'repetition_penalty': rep,
+                    'exaggeration': exagg,
+                }
+                for k, v in to_set.items():
+                    config.set_value(k, v, voice=voice_name)
 
-                # Editor fields
-                voice_rate = gr.Slider(0.5, 2.0, 1.0, label="Speaking Rate")
-                voice_temp = gr.Slider(0.1, 1.5, 0.8, label="Temperature")
-                voice_exagg = gr.Slider(0.1, 2.0, 0.75, label="Exaggeration")
+                # Also allow language override if provided
+                if lang:
+                    config.set_value('language_id', lang, voice=voice_name)
 
-                voice_status = gr.Markdown("Load a voice to edit parameters")
+                # Timestamped backup then save
+                cfg_path = Path('config.json')
+                backups_dir = Path('config_backups')
+                backups_dir.mkdir(parents=True, exist_ok=True)
+                ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+                if cfg_path.exists():
+                    shutil.copy2(cfg_path, backups_dir / f"config_{ts}.json")
+                config.save_config(create_backup=False, filename=str(cfg_path))
+                return f"Saved overrides for voice '{voice_name}'. Backup created at config_backups/config_{ts}.json"
+            except Exception as e:
+                logger.exception("Save overrides failed")
+                return f"Save failed: {e}"
 
-                # Load voice params when dropdown changes
-                def load_voice_params(voice_name):
-                    voice_name = voice_name or 'default'
-                    voice = config.get_voice_params(voice_name)
-                    return [
-                        voice.get('speaking_rate', 1.0),
-                        voice.get('temperature', 0.8),
-                        voice.get('exaggeration', 0.75)
-                    ]
+        save_overrides_btn.click(
+            fn=do_save_overrides,
+            inputs=[ref_upload, voice_choices, temperature, cfg_scale, min_p, top_p, repetition_penalty, exaggeration, language],
+            outputs=[generate_status]
+        )
 
-                voice_dropdown.change(
-                    fn=load_voice_params,
-                    inputs=[voice_dropdown],
-                    outputs=[voice_rate, voice_temp, voice_exagg]
-                )
-
-                # Save params to config
-                def save_voice_params(voice_name, rate, temp, exagg):
-                    voice_name = voice_name
-                    config.update_voice_parameter(voice_name, 'speaking_rate', rate)
-                    config.update_voice_parameter(voice_name, 'temperature', temp)
-                    config.update_voice_parameter(voice_name, 'exaggeration', exagg)
-                    return f"Saved voice parameters for {voice_name}"
-
-                save_btn.click(
-                    fn=save_voice_params,
-                    inputs=[voice_dropdown, voice_rate, voice_temp, voice_exagg],
-                    outputs=[voice_status]
-                )
-
-        # Attach Hidden API to generate tab outputs - critical for remote connection
+        # Attach Hidden API for bridge (use our generated components)
         setup_bridge_api(demo, audio_output, generate_status, config=config)
 
-        logger.info("Initialize state-free Tab UI successfully. Bridge API connected.")
+        logger.info("Unified tab UI initialized. Bridge API connected.")
         return demo
 
 # Tab Load Functions - simplified to match new UI structure
