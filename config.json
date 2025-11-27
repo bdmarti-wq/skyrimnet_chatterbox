@@ -11,6 +11,7 @@
       "min_new_tokens": 224,
       "max_cache_len": 4096,
       "stride_length": 8,
+      "compile_t3": true,
       "generate_token_backend": "cudagraphs-manual",
       "warmup_t3": true,
       "re_optimize_on_reload": false
@@ -53,12 +54,14 @@
       "ebu_true_peak": 0.0,
       "max_short_word_len": 5,
       "max_cache_entries": 1000,
-      "max_cache_size_mb": 1024
+      "max_cache_size_mb": 1024,
+      "short_padding_threshold": 5,
+      "short_padding_token": "help.  "
     },
     "fuzzy": {
       "enable_fuzzy_cache": true,
-      "fuzzy_threshold": 0.70,
-      "fuzzy_boost_amount": 0.10,
+      "fuzzy_threshold": 0.7,
+      "fuzzy_boost_amount": 0.1,
       "fuzzy_boost_words": [
         "ahh",
         "mmm",
@@ -77,59 +80,58 @@
     "device": "cuda",
     "multilingual": false,
     "sr": 24000,
-    "model": null
+    "root": "C:\\Users\\bdmar\\skyrimnet_chatterbox",
+    "cache_dir": "C:\\Users\\bdmar\\skyrimnet_chatterbox\\cache",
+    "audio_cache_dir": "C:\\Users\\bdmar\\skyrimnet_chatterbox\\cache\\audio",
+    "voices_cache_dir": "C:\\Users\\bdmar\\skyrimnet_chatterbox\\cache\\audio\\voices",
+    "output_cache_dir": "C:\\Users\\bdmar\\skyrimnet_chatterbox\\cache\\audio\\output",
+    "conditionals_cache_dir": "C:\\Users\\bdmar\\skyrimnet_chatterbox\\cache\\conditionals",
+    "fallbacks_dir": "C:\\Users\\bdmar\\skyrimnet_chatterbox\\cache\\fallbacks"
   },
   "voices": {
-    "serena": {
+    "femaleuniquelydia": {
       "temperature": 0.9,
-      "speaking_rate": 1.1,
-      "fuzzy_enable": false
+      "speaking_rate": 1.0,
+      "enable_fuzzy_cache": true,
+      "short_padding_threshold": 10,
+      "short_padding_token": "help.  "
     },
     "femaleneivavoice": {
-      "enable_light_post": true,
-      "enable_heavy_post": true,
-      "min_post_duration_sec": 1.0,
-      "trailing_silence_db": -55.0,
-      "fade_ms": 45,
-      "speaking_rate": 1.1,
-      "gain_max_limit": 0.95,
-      "normalize_method": "rms",
-      "tail_threshold_db": -40.0,
-      "gate_threshold": 0.025,
-      "tail_suppress_low_hz": 2000,
-      "tail_suppress_high_hz": 6500,
-      "tail_suppress_strength": 0.55,
-      "tail_suppress_sec": 0.35,
-      "tail_onset_threshold": 0.3,
-      "notch_low_hz": 7200,
-      "notch_high_hz": 10500,
-      "notch_gain_db": -14.0,
       "eq_gain_db": 1.6,
-      "eq_cutoff_hz": 2600,
-      "ebu_post_gain_db": -17.5
+      "eq_cutoff_hz": 2600.0,
+      "notch_gain_db": -14.0,
+      "notch_low_hz": 7200.0,
+      "notch_high_hz": 10500.0,
+      "fade_ms": 45.0,
+      "speaking_rate": 1.1,
+      "normalize_method": "rms",
+      "gain_max_limit": 0.95,
+      "trailing_silence_db": -55.0,
+      "ebu_post_gain_db": -17.5,
+      "enable_fuzzy_cache": true
     },
     "nwsjennavoice": {
-      "enable_light_post": true,
-      "enable_heavy_post": false,
-      "min_post_duration_sec": 1.0,
-      "trailing_silence_db": -47.25,
+      "eq_gain_db": 0.2,
+      "eq_cutoff_hz": 3000.0,
+      "notch_gain_db": 0.0,
+      "notch_low_hz": 8000.0,
+      "notch_high_hz": 11000.0,
       "fade_ms": 21.0,
       "speaking_rate": 1.0,
-      "gain_max_limit": 1.0,
       "normalize_method": "peak",
-      "tail_threshold_db": -36.75,
-      "gate_threshold": 0.0475,
-      "tail_suppress_low_hz": 2000,
-      "tail_suppress_high_hz": 4000,
-      "tail_suppress_strength": 0.6,
-      "tail_suppress_sec": 0.21,
-      "tail_onset_threshold": 0.315,
-      "notch_low_hz": 8000,
-      "notch_high_hz": 11000,
-      "notch_gain_db": 0,
-      "eq_gain_db": 0.2,
-      "eq_cutoff_hz": 3000,
-      "ebu_post_gain_db": -18.0
+      "gain_max_limit": 1.0,
+      "trailing_silence_db": -47.25,
+      "ebu_post_gain_db": -18.0,
+      "enable_fuzzy_cache": true
+    },
+    "femaleuniquelydia_24000Hz": {
+      "temperature": 0.8,
+      "min_p": 0.07,
+      "top_p": 1,
+      "repetition_penalty": 1.2,
+      "cfg_weight": 0.3,
+      "exaggeration": 0.5,
+      "enable_fuzzy_cache": true
     }
   }
 }

@@ -15,6 +15,262 @@ from src.generate.pipeline.phases.base import BaseGenerationPhase
 from src.generate.pipeline.context import AudioGenerationContext
 
 
+def _short_padding_trim_head(y: np.ndarray, sr: int, params: Dict[str, Any]) -> np.ndarray:
+    """When short-padding is active, remove the leading padding up to the first voiced island.
+    Uses silence-based segmentation; keeps a small configurable pre-roll before the first speech
+    and an optional tail pad. Safe and optional.
+    """
+    if y is None or not isinstance(y, np.ndarray) or y.size == 0:
+        return y
+
+    try:
+        head_ms = float(params.get('short_padding_head_sil_ms', 60.0) or 60.0)
+        tail_ms = float(params.get('short_padding_tail_sil_ms', 60.0) or 60.0)
+        top_db = float(params.get('short_padding_split_db', 40.0) or 40.0)
+        hop = int(params.get('short_padding_hop_length', 256) or 256)
+        frame = int(params.get('short_padding_frame_length', 1024) or 1024)
+    except Exception:
+        head_ms, tail_ms, top_db, hop, frame = 60.0, 60.0, 40.0, 256, 1024
+
+    try:
+        intervals = librosa.effects.split(y, top_db=top_db, frame_length=frame, hop_length=hop)
+        if intervals is None or len(intervals) == 0:
+            return y
+
+        # Prefer cutting AFTER the first token when a near-silence gap occurs, keeping the rest.
+        head_pad = int(sr * (head_ms / 1000.0))
+        tail_pad = int(sr * (tail_ms / 1000.0))
+
+        # Compute a near-silence mask using frame-wise RMS with a slightly higher threshold than strict silence
+        near_db_offset = 6.0
+        try:
+            near_db_offset = float(params.get('short_trim_near_db_offset', 6.0) or 6.0)
+        except Exception:
+            pass
+        base_sil_val = params.get('short_trim_silence_db', params.get('short_repeat_silence_db', -45.0))
+        try:
+            base_sil_db = float(base_sil_val if base_sil_val is not None else -45.0)
+        except Exception:
+            base_sil_db = -45.0
+        near_db = base_sil_db + near_db_offset
+        near_thr = 10 ** (near_db / 20.0)
+        win = max(64, int(sr * 0.010))
+        hop_near = max(32, int(sr * 0.005))
+        if len(y) > win:
+            num_frames = 1 + (len(y) - win) // hop_near
+            starts = np.arange(num_frames, dtype=np.int64) * hop_near
+            rms = np.empty(num_frames, dtype=np.float32)
+            for i in range(num_frames):
+                seg = y[starts[i]:starts[i] + win]
+                rms[i] = float(np.sqrt(np.mean(seg * seg)) + 1e-12)
+            near_silent = rms < near_thr
+
+            # Determine region after the first voiced island
+            if len(intervals) >= 1:
+                first_end = int(intervals[0][1])
+                # Convert first_end to frame index
+                first_end_frame = min(num_frames - 1, max(0, first_end // hop_near))
+                # Find first extended near-silence run after first_end_frame
+                try:
+                    min_near_ms = float(params.get('short_trim_min_near_silence_ms', 40.0) or 40.0)
+                except Exception:
+                    min_near_ms = 40.0
+                min_near_frames = max(1, int((min_near_ms / 1000.0) * sr / hop_near))
+
+                j = first_end_frame
+                cut_frame_after_near = None
+                while j < num_frames:
+                    if near_silent[j]:
+                        k = j
+                        while k < num_frames and near_silent[k]:
+                            k += 1
+                        run_len = k - j
+                        if run_len >= min_near_frames:
+                            cut_frame_after_near = k  # first non-near-silent frame after the run
+                            break
+                        j = k
+                    else:
+                        j += 1
+
+                if cut_frame_after_near is not None:
+                    start = max(0, int(starts[min(cut_frame_after_near, len(starts) - 1)]) - head_pad)
+                    end = min(len(y), int(intervals[-1][1]) + tail_pad)
+                    logger.debug(
+                        f"short_padding_trim_head: near-silence cut start={start/sr:.3f}s (near_db={near_db}dB, min_run={min_near_ms}ms) end={end/sr:.3f}s"
+                    )
+                    return y[start:end]
+
+        # Fallback: work backwards – cut after the largest internal silence gap
+        if len(intervals) >= 2:
+            best_gap = -1
+            best_after_idx = None
+            for i in range(len(intervals) - 1):
+                g = int(intervals[i + 1][0]) - int(intervals[i][1])
+                if g > best_gap:
+                    best_gap = g
+                    best_after_idx = i + 1
+            if best_after_idx is not None and best_gap >= int(sr * 0.02):  # ~20ms minimum
+                start = max(0, int(intervals[best_after_idx][0]) - head_pad)
+                end = min(len(y), int(intervals[-1][1]) + tail_pad)
+                logger.debug(
+                    f"short_padding_trim_head: largest-gap cut start={start/sr:.3f}s (gap={best_gap/sr:.3f}s) end={end/sr:.3f}s"
+                )
+                return y[start:end]
+
+        # Last resort: keep from first non-silent region with head preroll (original behavior)
+        first_start, last_end = int(intervals[0][0]), int(intervals[-1][1])
+        start = max(0, first_start - head_pad)
+        end = min(len(y), last_end + tail_pad)
+        logger.debug(
+            f"short_padding_trim_head: fallback first-region start={start/sr:.3f}s end={end/sr:.3f}s"
+        )
+        return y[start:end]
+    except Exception:
+        return y
+
+
+def _short_trim_padding(y: np.ndarray, sr: int, params: Dict[str, Any]) -> np.ndarray:
+    """Aggressively trim off short-padding by working backwards from the end.
+
+    Strategy (requested):
+    - Ignore any trailing silence at the very end (do not cut there).
+    - From the end, once a SOUND is encountered, search BACKWARDS for the first SILENCE
+      run and cut at the end of that silence (i.e., keep only the final phrase).
+    - Be aggressive: even ~20 ms of silence should trigger a cut (configurable).
+
+    Tunables (all optional, with safe defaults):
+    - short_repeat_head_sil_ms / short_repeat_tail_sil_ms: preroll/keep pads around kept audio.
+    - short_repeat_silence_db or short_trim_silence_db: silence threshold in dBFS (default -45).
+    - short_repeat_min_gap_ms or short_trim_min_silence_ms: minimum silence to qualify (default 20 ms).
+
+    Returns original on failure.
+    """
+    if y is None or not isinstance(y, np.ndarray) or y.size == 0:
+        return y
+
+    try:
+        # Pads (retain a tiny preroll, optional tail pad kept as-is)
+        try:
+            head_ms = float(params.get('short_repeat_head_sil_ms', 120.0) or 120.0)
+            tail_ms = float(params.get('short_repeat_tail_sil_ms', 120.0) or 120.0)
+        except Exception:
+            head_ms, tail_ms = 120.0, 120.0
+        head_pad = int(sr * (head_ms / 1000.0))
+        tail_pad = int(sr * (tail_ms / 1000.0))
+
+        # Silence definition (aggressive)
+        sil_db = None
+        for k in ('short_trim_silence_db', 'short_repeat_silence_db'):
+            if isinstance(params.get(k, None), (int, float)):
+                sil_db = float(params.get(k))
+                break
+        if sil_db is None:
+            sil_db = -60.0
+        sil_thr = 10 ** (sil_db / 20.0)
+
+        # Near-silence threshold: slightly higher than strict silence to tolerate tiny sounds
+        try:
+            near_db_offset = float(params.get('short_trim_near_db_offset', 18.0) or 5.0)
+        except Exception:
+            near_db_offset = 6.0
+        near_thr = 10 ** ((sil_db + near_db_offset) / 20.0)
+
+        # Minimum silence chunk to qualify (default ~20ms)
+        min_sil_ms = None
+        for k in ('short_trim_min_silence_ms', 'short_repeat_min_gap_ms'):
+            if isinstance(params.get(k, None), (int, float)):
+                min_sil_ms = float(params.get(k))
+                break
+        if min_sil_ms is None:
+            min_sil_ms = 5.0
+        # Minimum near-silence run to qualify (default: max(40ms, min_sil_ms))
+        try:
+            min_near_ms = float(params.get('short_trim_min_near_silence_ms', max(5.0, min_sil_ms)))
+        except Exception:
+            min_near_ms = max(30.0, min_sil_ms)
+
+        # Frame analysis (~10ms window, 5ms hop)
+        win = max(64, int(sr * 0.010))
+        hop = max(32, int(sr * 0.005))
+        if hop <= 0:
+            hop = 32
+        n = len(y)
+        if n < win:
+            return y
+        # Compute RMS per frame
+        num_frames = 1 + (n - win) // hop
+        rms = np.empty(num_frames, dtype=np.float32)
+        starts = np.arange(num_frames, dtype=np.int64) * hop
+        for i in range(num_frames):
+            seg = y[starts[i]:starts[i] + win]
+            rms[i] = float(np.sqrt(np.mean(seg * seg)) + 1e-12)
+        silent = rms < sil_thr
+        near_silent = rms < near_thr
+
+        # 1) Skip trailing silence entirely
+        last_idx = num_frames - 1
+        while last_idx >= 0 and silent[last_idx]:
+            last_idx -= 1
+        if last_idx < 0:
+            logger.debug("short_trim_padding: all-silent; returning original")
+            return y
+
+        # 2) From the first SOUND encountered (from end), search backwards for the
+        #    first NEAR-SILENCE run of sufficient length, and cut at the end of that run.
+        min_sil_frames = max(1, int((min_sil_ms / 1000.0) * sr / hop))
+        min_near_frames = max(1, int((min_near_ms / 1000.0) * sr / hop))
+        j = last_idx
+        cut_frame = None
+        while j >= 0:
+            if near_silent[j]:
+                # Count backward run
+                k = j
+                while k >= 0 and near_silent[k]:
+                    k -= 1
+                run_len = j - k
+                if run_len >= min_near_frames:
+                    # Cut at the first non-silent frame after this silence when moving forward
+                    cut_frame = j + 1
+                    break
+                j = k
+            else:
+                j -= 1
+
+        if cut_frame is None:
+            # Fallback: find the largest near-silence valley before the last_idx
+            # Identify all near-silent runs and pick the longest before last_idx
+            best_len = 0
+            best_after = None
+            j = min(last_idx, num_frames - 1)
+            while j >= 0:
+                if near_silent[j]:
+                    k = j
+                    while k >= 0 and near_silent[k]:
+                        k -= 1
+                    run_len = j - k
+                    if run_len > best_len:
+                        best_len = run_len
+                        best_after = j + 1
+                    j = k
+                else:
+                    j -= 1
+            cut_frame = best_after if best_after is not None else 0
+
+        # Convert frame index to sample index
+        start_idx = int(starts[min(cut_frame, len(starts) - 1)])
+        # Apply preroll head pad (keep a bit before start)
+        start_idx = max(0, start_idx - head_pad)
+        end_idx = len(y)  # Keep full tail; optional tail_pad keeps extra naturally
+        kept = y[start_idx:end_idx]
+        logger.debug(
+            f"short_trim_padding: last_idx_frame={last_idx}, cut_frame={cut_frame}, start={start_idx/sr:.3f}s, kept={len(kept)/sr:.3f}s (sil_db={sil_db}dB, near_off={near_db_offset}dB, min_sil={min_sil_ms}ms, min_near={min_near_ms}ms)"
+        )
+        return kept
+    except Exception as e:
+        logger.debug(f"short_trim_padding: failed with {e}; returning original")
+        return y
+
+
 def trim_trailing_artifacts(audio: np.ndarray, sr: int, tail_threshold_db: float = -45.0, tail_fraction: float = 0.2) -> np.ndarray:
     """Trim trailing low-energy (aggressive for phantoms)."""
     if tail_threshold_db is None or tail_threshold_db > -20:
@@ -344,6 +600,27 @@ class PostProcessingPhase(BaseGenerationPhase):
             wav_np = wav.detach().cpu().float().numpy()
             text = getattr(context, 'text', '') or ''
             voice_params = voice_params or {}
+
+            # If short-padding active: trim off the head padding up to first voiced island
+            meta = getattr(context, 'meta', {})
+            if isinstance(meta, dict) and meta.get('short_padding_active'):
+                before_len = len(wav_np)
+                wav_np = _short_padding_trim_head(wav_np, context.sr, voice_params)
+                after_len = len(wav_np)
+                if after_len != before_len:
+                    logger.debug(f"Short-padding head trim applied: {before_len/context.sr:.2f}s → {after_len/context.sr:.2f}s")
+
+            # Optional short-repeat trimming: if earlier phase marked it active, cut to last instance now
+            try:
+                threshold_cfg = int(voice_params.get('short_repeat_threshold', 0) or 0)
+            except Exception:
+                threshold_cfg = 0
+            if isinstance(meta, dict) and meta.get('short_repeat_active') and threshold_cfg > 0:
+                before = len(wav_np)
+                wav_np = _short_trim_padding(wav_np, context.sr, voice_params)
+                after = len(wav_np)
+                if after != before:
+                    logger.debug(f"Short-repeat trim_to_last applied: {before/context.sr:.2f}s → {after/context.sr:.2f}s")
 
             # Auto-detect artifacts using audio_utils.is_artifact_laden (expects a file path)
             effective_params = dict(voice_params) if isinstance(voice_params, dict) else {}

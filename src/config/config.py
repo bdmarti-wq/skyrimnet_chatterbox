@@ -179,7 +179,9 @@ class Config:
                 logger.error("Cannot save: app_config is None (load first via load_config)")
                 return False
 
-            config_dict = self.app_config.model_dump(exclude={'globals': {'model'}})
+            # Dump model to plain dict, excluding non-serializable fields and omitting None values
+            # exclude_none=True ensures we don't persist nulls (especially under voices overrides)
+            config_dict = self.app_config.model_dump(exclude={'globals': {'model'}}, exclude_none=True)
             if 'model' in config_dict.get('globals', {}):
                 del config_dict['globals']['model']
 

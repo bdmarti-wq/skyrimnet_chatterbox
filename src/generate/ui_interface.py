@@ -165,7 +165,8 @@ async def generate_audio_ui(
             enable_fuzzy_cache=enable_fuzzy_cache,
             model=model,  # FIXED: Pass the loaded model
             config=config,  # FIXED: Pass the loaded config
-            cache_manager=cache_manager  # FIXED: Pass the cache_manager
+            cache_manager=cache_manager,  # FIXED: Pass the cache_manager
+            extra_ui_voice_params=e1 if isinstance(e1, dict) else None  # NEW: merge UI overrides
         )
 
 
@@ -209,7 +210,8 @@ def _create_generation_context(
     enable_fuzzy_cache: bool = True,
     model: Optional[Any] = None,
     config: Optional["AppConfig"] = None,
-    cache_manager: Optional["CacheManager"] = None
+    cache_manager: Optional["CacheManager"] = None,
+    extra_ui_voice_params: Optional[Dict[str, Any]] = None
 ) -> AudioGenerationContext:
     """Creates context object with UI-provided parameters + injected loaders."""
     if config is None:
@@ -230,6 +232,13 @@ def _create_generation_context(
 
     # FIXED: Use get_voice_params (sole merger; replaces deprecated)
     voice_params = config.get_voice_params(voice_name=voice_stem) if voice_stem else {}
+    # Merge in-memory UI overrides (take precedence for this run only)
+    if isinstance(extra_ui_voice_params, dict) and extra_ui_voice_params:
+        try:
+            # UI overrides should win over persisted values for this session
+            voice_params = {**voice_params, **extra_ui_voice_params}
+        except Exception:
+            pass
 
     # Coerce seeds
     seed = cpp_uuid_to_seed(cache_uuid) if seed_num is None else seed_num

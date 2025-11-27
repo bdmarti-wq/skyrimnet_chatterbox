@@ -26,6 +26,14 @@ class GenerationPhase(BaseGenerationPhase):
             context.generated_wav = torch.zeros(0, dtype=torch.float32, device=context.device)  # Empty trigger
             return context
 
+        # Log the exact text used for generation (helps debug padding/repeat logic)
+        safe_text = context.text or ""
+        try:
+            preview = (safe_text[:120] + '...') if len(safe_text) > 120 else safe_text
+            logger.info(f"Generating audio for text (len={len(safe_text)}): '{preview}'")
+        except Exception:
+            logger.info("Generating audio for text (len=?): <unprintable>")
+
         # Build gen_args using helper (proper structure, no 'conditionals'/'seed' kwargs)
         gen_args = self._build_generate_args(context)
 

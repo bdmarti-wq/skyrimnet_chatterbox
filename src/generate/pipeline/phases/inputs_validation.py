@@ -18,19 +18,56 @@ class InputsValidationPhase(BaseGenerationPhase):
         # Text
         self.validate_text(context)
         # After self.validate_text(context):
-        text = context.text  # Get current validated text
-        voice_params = context.config.get_voice_params(context.voice_stem) if hasattr(context.config,
-                                                                                      'get_voice_params') else {}
-        padding_params = {
-            'enable_text_padding': voice_params.get('enable_text_padding', True),  # Configurable per voice
-            'text_ellipses_count': voice_params.get('text_ellipses_count', 2),
-            'max_short_word_len': voice_params.get('max_short_word_len', 3),
-            'vocalise_patterns': voice_params.get('vocalise_patterns', ['ah', 'oh', 'aah', 'mmm', 'uh', 'mmh'])
-            # Extend as needed
-        }
-        padded_text = pad_short_text(text, padding_params)
-        context.text = padded_text  # Set padded text for downstream (cache keys, TTS)
-        logger.debug(f"Applied text padding: '{text}' → '{padded_text}' (params={padding_params})")
+        text = context.text  # Get current validated text (unmodified yet)
+        # Use context.voice_params so UI in-memory overrides (e1) take effect immediately
+        voice_params = getattr(context, 'voice_params', {}) or {}
+
+        # NEW: Optional short-padding – prepend a configurable token followed by a single ellipsis
+        try:
+            sp_threshold = int(voice_params.get('short_padding_threshold', None)
+                               if 'short_padding_threshold' in voice_params else None)
+        except Exception:
+            sp_threshold = None
+
+        short_padding_applied = False
+        if sp_threshold and sp_threshold > 0:
+            base_stripped = (text or '').strip()
+            if 0 < len(base_stripped) < sp_threshold:
+                # Get padding token (can be any string). Fallbacks: explicit short_padding_token,
+                # else legacy short_repeat_separator, else empty string.
+                token = voice_params.get('short_padding_token', None)
+                if not isinstance(token, str):
+                    token = None
+
+                # Build: <token> + '...' + <original text>
+                ellipsis = '...'
+                new_text = f"{token} {base_stripped}"
+
+                # Persist metadata for post-generation trimming
+                setattr(context, 'meta', getattr(context, 'meta', {}))
+                context.meta['short_padding_active'] = True
+                context.meta['short_padding_token'] = token
+                context.meta['short_padding_ellipsis'] = ellipsis
+
+                # Replace context.text BEFORE cache checks (affects cache keys)
+                logger.info(
+                    f"Short-padding active for voice '{context.voice_stem}': base_len={len(base_stripped)} < {sp_threshold}; token_len={len(token or '')} text= {new_text}"
+                )
+                context.text = new_text
+                short_padding_applied = True
+
+        # If short-padding did not apply, fall back to universal padding (legacy behavior)
+        if not short_padding_applied:
+            padding_params = {
+                'enable_text_padding': voice_params.get('enable_text_padding', True),  # Configurable per voice
+                'text_ellipses_count': voice_params.get('text_ellipses_count', 2),
+                'max_short_word_len': voice_params.get('max_short_word_len', 3),
+                'vocalise_patterns': voice_params.get('vocalise_patterns', ['ah', 'oh', 'aah', 'mmm', 'uh', 'mmh'])
+                # Extend as needed
+            }
+            padded_text = pad_short_text(text, padding_params)
+            context.text = padded_text  # Set padded text for downstream (cache keys, TTS)
+            logger.debug(f"Applied text padding: '{text}' → '{padded_text}' (params={padding_params})")
 
         # Voice stem
         self.derive_stem(context)

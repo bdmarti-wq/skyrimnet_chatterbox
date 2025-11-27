@@ -73,7 +73,7 @@ def create_ui(
             'temperature': 0.8,
             'exaggeration': 0.5,
             'cfg_weight': 0.3,
-            'min_p': 0.5,
+            'min_p': 0.07,
             'top_p': 1.0,
             'repetition_penalty': 1.2,
             'language_id': get_config_value('globals.language_id', 'en')
@@ -119,6 +119,14 @@ def create_ui(
                 audio_output = gr.Audio(label="Generated Speech", type="filepath")
                 generate_status = gr.Textbox(label="Status", interactive=False, value="Ready")
 
+                # Pre-processing parameters (voice-specific) – below audio, above post-processing
+                with gr.Accordion("Pre-processing (voice-specific)", open=False):
+                    enable_text_padding = gr.Checkbox(value=True, label="Enable text padding")
+                    with gr.Row():
+                        text_ellipses_count = gr.Slider(0, 5, 2, step=1, label="Ellipses blocks around short text")
+                        short_padding_threshold = gr.Number(value=0, label="Short padding threshold (chars; 0=off)", precision=0)
+                    short_padding_token = gr.Textbox(value="", label="Short padding token (prepended before '...')", placeholder="e.g., hmm ")
+
                 # Post-processing parameters (voice-specific) – moved here per request, below buttons and audio
                 with gr.Accordion("Post-processing (voice-specific)", open=False):
                     pp_enable = gr.Checkbox(value=False, label="Enable post-processing")
@@ -157,7 +165,8 @@ def create_ui(
 
         async def do_generate(text, upload_path, selected_path, seed_val, temp, cfg, minpv, toppv, rep, exagg, lang, use_audio_flag, use_fuzzy_flag,
                               pp_enable_v, trailing_db_v, gate_thr_v, tail_frac_v, tail_strength_v, tail_low_v, tail_high_v, onset_thr_v,
-                              min_post_sec_v, notch_gain_v, notch_low_v, notch_high_v, eq_gain_v, eq_cutoff_v, speak_rate_v, fade_ms_v, gain_limit_v):
+                              min_post_sec_v, notch_gain_v, notch_low_v, notch_high_v, eq_gain_v, eq_cutoff_v, speak_rate_v, fade_ms_v, gain_limit_v,
+                              text_pad_enable_v, text_ellipses_cnt_v, short_padding_thresh_v, short_padding_token_v):
             try:
                 audio_path = resolve_audio_choice(upload_path, selected_path)
                 if not audio_path:
@@ -193,6 +202,17 @@ def create_ui(
                     'gain_max_limit': float(gain_limit_v) if gain_limit_v is not None else 0.0,
                 }
 
+                # Build pre-processing overrides (voice-specific) to be applied in-memory for this run
+                pre_overrides = {
+                    'enable_text_padding': bool(text_pad_enable_v),
+                    'text_ellipses_count': int(text_ellipses_cnt_v),
+                    'short_padding_threshold': int(short_padding_thresh_v or 0),
+                    'short_padding_token': str(short_padding_token_v or ""),
+                }
+
+                # Merge pre + post for this request; UI overrides should take precedence for current run
+                vp_overrides = {**pre_overrides, **pp_overrides}
+
 
                 out_path, status = await generate_audio_ui(
                     model_choice=None,
@@ -200,7 +220,7 @@ def create_ui(
                     language=lang or "en",
                     speaker_audio=audio_path,
                     prefix_audio=None,
-                    e1=pp_overrides, e2=None, e3=None, e4=None, e5=None, e6=None, e7=None, e8=None,
+                    e1=vp_overrides, e2=None, e3=None, e4=None, e5=None, e6=None, e7=None, e8=None,
                     vq_single=None, fmax=None, pitch_std=None, speaking_rate=None, dnsmos_ovrl=None, speaker_noised=None,
                     cfg_scale=cfg,
                     top_p_param=toppv,
@@ -222,7 +242,8 @@ def create_ui(
             fn=do_generate,
             inputs=[text_input, ref_upload, voice_choices, seed, temperature, cfg_scale, min_p, top_p, repetition_penalty, exaggeration, language, use_audio_cache, use_fuzzy_cache,
                     pp_enable, trailing_silence_db, gate_threshold, tail_suppress_sec, tail_suppress_strength, tail_suppress_low_hz, tail_suppress_high_hz, tail_onset_threshold,
-                    min_post_duration_sec, notch_gain_db, notch_low_hz, notch_high_hz, eq_gain_db, eq_cutoff_hz, speaking_rate, fade_ms, gain_max_limit],
+                    min_post_duration_sec, notch_gain_db, notch_low_hz, notch_high_hz, eq_gain_db, eq_cutoff_hz, speaking_rate, fade_ms, gain_max_limit,
+                    enable_text_padding, text_ellipses_count, short_padding_threshold, short_padding_token],
             outputs=[audio_output, generate_status],
             show_progress=True,
             concurrency_limit=1
@@ -230,7 +251,8 @@ def create_ui(
 
         def do_save_overrides(upload_path, selected_path, temp, cfg, minpv, toppv, rep, exagg, lang,
                               pp_enable_v, trailing_db_v, gate_thr_v, tail_frac_v, tail_strength_v, tail_low_v, tail_high_v, onset_thr_v,
-                              min_post_sec_v, notch_gain_v, notch_low_v, notch_high_v, eq_gain_v, eq_cutoff_v, speak_rate_v, fade_ms_v, gain_limit_v):
+                              min_post_sec_v, notch_gain_v, notch_low_v, notch_high_v, eq_gain_v, eq_cutoff_v, speak_rate_v, fade_ms_v, gain_limit_v,
+                              text_pad_enable_v, text_ellipses_cnt_v, short_padding_thresh_v, short_padding_token_v):
             try:
                 audio_path = resolve_audio_choice(upload_path, selected_path)
                 if not audio_path:
@@ -297,6 +319,23 @@ def create_ui(
                     if pp_defaults.get(k) != v:
                         config.set_value(k, v, voice=voice_name)
 
+                # Pre-processing (text) defaults and persistence (only if different)
+                pre_defaults = {
+                    'enable_text_padding': True,
+                    'text_ellipses_count': 2,
+                    'short_padding_threshold': 0,
+                    'short_padding_token': "",
+                }
+                pre_current = {
+                    'enable_text_padding': bool(text_pad_enable_v),
+                    'text_ellipses_count': int(text_ellipses_cnt_v),
+                    'short_padding_threshold': int(short_padding_thresh_v or 0),
+                    'short_padding_token': str(short_padding_token_v or ""),
+                }
+                for k, v in pre_current.items():
+                    if pre_defaults.get(k) != v:
+                        config.set_value(k, v, voice=voice_name)
+
                 # Timestamped backup then save
                 cfg_path = Path('config.json')
                 backups_dir = Path('config_backups')
@@ -314,7 +353,8 @@ def create_ui(
             fn=do_save_overrides,
             inputs=[ref_upload, voice_choices, temperature, cfg_scale, min_p, top_p, repetition_penalty, exaggeration, language,
                     pp_enable, trailing_silence_db, gate_threshold, tail_suppress_sec, tail_suppress_strength, tail_suppress_low_hz, tail_suppress_high_hz, tail_onset_threshold,
-                    min_post_duration_sec, notch_gain_db, notch_low_hz, notch_high_hz, eq_gain_db, eq_cutoff_hz, speaking_rate, fade_ms, gain_max_limit],
+                    min_post_duration_sec, notch_gain_db, notch_low_hz, notch_high_hz, eq_gain_db, eq_cutoff_hz, speaking_rate, fade_ms, gain_max_limit,
+                    enable_text_padding, text_ellipses_count, short_padding_threshold, short_padding_token],
             outputs=[generate_status]
         )
 
