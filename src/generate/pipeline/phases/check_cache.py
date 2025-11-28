@@ -122,8 +122,28 @@ class CacheCheckPhase(BaseGenerationPhase):
                     self.cache_manager.set_audio_cache(cache_key, None)  # Purge invalid
                     logger.warning(f"Exact path invalid {exact_path} – purged & check fuzzy")
 
-        # 2. Fuzzy match (if exact miss) if enabled
-        if fuzzy_cache_enabled:
+        # Optional: force-skip fuzzy cache if text contains any configured skip words
+        effective_fuzzy_enabled = fuzzy_cache_enabled
+        try:
+            skip_words = []
+            if getattr(context, 'config', None) is not None and \
+               hasattr(context.config, 'app_config') and \
+               hasattr(context.config.app_config, 'globals') and \
+               hasattr(context.config.app_config.globals, 'fuzzy'):
+                skip_words = getattr(context.config.app_config.globals.fuzzy, 'fuzzy_force_skip_words', []) or []
+
+            if skip_words:
+                lt = (text or "").lower()
+                # simple substring match (case-insensitive)
+                if any(sw for sw in skip_words if sw and sw in lt):
+                    effective_fuzzy_enabled = False
+                    logger.info(f"Fuzzy cache skip forced by skip words: {skip_words}")
+        except Exception as _e:
+            # Be conservative: do not disable fuzzy on errors
+            logger.debug(f"Skip-words check failed: {_e}")
+
+        # 2. Fuzzy match (if exact miss) if enabled (and not force-skipped)
+        if effective_fuzzy_enabled:
             fuzzy_path = self.cache_manager.get_fuzzy_audio_cache(audio_prompt, text, voice_stem, threshold=0.70)
             if fuzzy_path and os.path.exists(fuzzy_path):
                 if self._validate_cached_audio(fuzzy_path, voice_stem):

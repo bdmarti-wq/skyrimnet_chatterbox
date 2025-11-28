@@ -223,6 +223,8 @@ class FuzzyConfig(BaseModel):
     fuzzy_boost_words: List[str] = Field(default_factory=lambda: CAPS['FUZZY_BOOST_WORDS'])  # List from CAPS
     fuzzy_index_size: int = Field(default=1000, ge=CAPS['FUZZY_CACHE_LIMIT_MIN'], le=CAPS['FUZZY_CACHE_LIMIT_MAX'])
     fuzzy_artifact_threshold_hz: float = Field(default=12000.0, ge=CAPS['FUZZY_ARTIFACT_THRESHOLD_HZ_MIN'], le=CAPS['FUZZY_ARTIFACT_THRESHOLD_HZ_MAX'])
+    # New: words that force skipping fuzzy cache when present in the text
+    fuzzy_force_skip_words: List[str] = Field(default_factory=list)
 
     # Validator for input parsing (str/list → normalized list[str])
     @field_validator('fuzzy_boost_words', mode='before')
@@ -234,6 +236,19 @@ class FuzzyConfig(BaseModel):
             return [str(w).strip().lower() for w in v]
         logger.warning(f"Invalid fuzzy_boost_words {v}; using default from CAPS")
         return CAPS['FUZZY_BOOST_WORDS']
+
+    # Normalize skip words as well (string or list)
+    @field_validator('fuzzy_force_skip_words', mode='before')
+    @classmethod
+    def validate_fuzzy_force_skip_words(cls, v: Any) -> List[str]:
+        if isinstance(v, str):
+            return [w.strip().lower() for w in v.split(',') if w.strip()]
+        if isinstance(v, list):
+            return [str(w).strip().lower() for w in v if str(w).strip()]
+        if v is None:
+            return []
+        logger.warning(f"Invalid fuzzy_force_skip_words {v}; using empty list")
+        return []
 
     def get_field_bounds(self, field_name: str) -> Optional[Dict[str, Any]]:
         """UI helper: Return min/max for field from CAPS."""

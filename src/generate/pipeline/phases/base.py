@@ -94,7 +94,17 @@ class BaseGenerationPhase:
     @classmethod
     def create_silence(cls, sr: int, duration: float = 2.0, device: torch.device = torch.device('cpu'), dtype: torch.dtype = torch.float32) -> torch.Tensor:
         samples = int(sr * duration)
-        return torch.zeros((1, samples), dtype=dtype, device=device)
+        # Attempt to allocate silence on the requested device/dtype first.
+        try:
+            return torch.zeros((1, samples), dtype=dtype, device=device)
+        except Exception as e:
+            # If the CUDA context is lost or dtype/device is invalid, fall back to safe CPU/FP32.
+            try:
+                logger.warning(f"create_silence failed on device={device}, dtype={dtype}: {e} — falling back to CPU/float32")
+            except Exception:
+                # Logging should not block the fallback
+                pass
+            return torch.zeros((1, samples), dtype=torch.float32, device='cpu')
 
     @classmethod
     def validate_path(cls, path: str, min_dur: float = 3.0) -> bool:

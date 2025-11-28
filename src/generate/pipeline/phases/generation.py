@@ -187,7 +187,10 @@ class GenerationPhase(BaseGenerationPhase):
             logger.debug("Output has NaN/Inf")
             return False
         samples = output.shape[-1]
-        min_samples = max(sr * 0.5, text_len * 80)  # ~0.5s min + ~80 samples/token estimate
+        if text_len <= 2:
+            min_samples = max(int(sr * 0.20), text_len * 80)  # 0.20s floor for very short texts
+        else:
+            min_samples = max(int(sr * 0.50), text_len * 80)
         if samples < min_samples:
             logger.debug(
                 f"Output too short: samples={samples}, min={min_samples} (text_len={text_len}, shape={output.shape})")
