@@ -3,6 +3,7 @@
 import os
 import sys
 from argparse import ArgumentParser
+from pathlib import Path
 
 import torch
 from loguru import logger
@@ -201,18 +202,42 @@ def main():
     if args.share:
         logger.info("⚠️ Public sharing enabled - your UI will be accessible to anyone with the link")
 
+    # Resolve favicon path safely (avoid ASGI FileNotFoundError)
+    def _resolve_favicon() -> str | None:
+        try:
+            # Prefer assets/skyrim_icon.ico relative to project root
+            proj_root =  Path(__file__).resolve().parent
+            candidates = [
+                proj_root / "assets" / "skyrim_icon.ico",
+                proj_root / "skyrim_icon.ico",
+            ]
+            for p in candidates:
+                if p.exists() and p.is_file():
+                    logger.info(f"Using favicon: {p}")
+                    return str(p)
+            logger.warning("Favicon 'skyrim_icon.ico' not found; proceeding without it.")
+            return None
+        except Exception as e:
+            logger.warning(f"Favicon resolution failed: {e}")
+            return None
+
+    favicon = _resolve_favicon()
+
     try:
-        demo.queue(
-            max_size=12,
-            default_concurrency_limit=4,
-        ).launch(
+        launch_kwargs = dict(
             share=args.share,
             server_name=args.server,
             server_port=args.port,
             root_path=args.root_path,
             inbrowser=args.inbrowser,
-            favicon_path="skyrim_icon.ico"
         )
+        if favicon:
+            launch_kwargs["favicon_path"] = favicon
+
+        demo.queue(
+            max_size=12,
+            default_concurrency_limit=4,
+        ).launch(**launch_kwargs)
     except Exception as launch_error:
         logger.critical(f"Server launch failed: {str(launch_error)}")
         logger.exception("Full traceback:")
