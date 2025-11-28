@@ -23,13 +23,13 @@ from src.generate.pipeline.context import AudioGenerationContext
 class GenerationCoordinator:
     """Manages the full generation pipeline with phases and caching. FIXED: Bypass on audio HIT."""
 
-    def __init__(self, config=None):
-        """Assume valid config (raise if None); inject cache_manager once."""
+    def __init__(self, config=None, cache_manager=None, model=None):
+        """Allow explicit dependency injection for config/cache_manager/model."""
         self.config = config or get_config()
         if self.config is None or not hasattr(self.config, 'app_config'):
             raise ValueError("Invalid config – cannot initialize coordinator")
 
-        self.cache_manager = get_cache_manager(self.config)
+        self.cache_manager = cache_manager or get_cache_manager(self.config)
 
         # Phases (inject cache_manager where needed)
         self.phases = [
@@ -40,8 +40,8 @@ class GenerationCoordinator:
             PostProcessingPhase(),
             OutputPhase(self.cache_manager)
         ]
-        self.model = get_model()  # From singleton
-        logger.info("Coordinator initialized")
+        self.model = model or get_model()  # From singleton
+        logger.info("[PIPE] Coordinator initialized")
 
     def run(self, context: AudioGenerationContext) -> AudioGenerationContext:
         """Inject once; check skip_pipeline after CacheCheck (bypass Voice/Gen/Post on audio HIT)."""
@@ -71,7 +71,7 @@ class GenerationCoordinator:
 
         total_time = time.perf_counter() - start_total
         self._log_pipeline_results(total_time, phase_times, context)
-        logger.info(f"Pipeline complete: {total_time:.2f}s | Generated audio")
+        logger.info(f"[PIPE] Pipeline complete: {total_time:.2f}s | Generated audio")
         return context
 
     def validate(self, context: AudioGenerationContext):
@@ -80,7 +80,7 @@ class GenerationCoordinator:
 
     def _fallback_context(self, context: AudioGenerationContext, error: Exception) -> AudioGenerationContext:
         """Use shared base _fallback_silence. Remove dupes."""
-        logger.warning(f"Coordinator fallback due to {error}")
+        logger.warning(f"[PIPE] Coordinator fallback due to {error}")
         # Fallback to first phase's handle_error or implement shared
         from src.generate.pipeline.phases.base import BaseGenerationPhase
         return BaseGenerationPhase()._fallback_silence(context, str(error))  # Static call
@@ -107,4 +107,4 @@ class GenerationCoordinator:
             hits = stats.get('disk_hits', 0) + stats.get('memory_hits', 0)
             log_msg += f" | conds cache: hits={hits}, misses={stats.get('misses', 0)}"
 
-        logger.info(log_msg)
+        logger.info(f"[PIPE] {log_msg}")

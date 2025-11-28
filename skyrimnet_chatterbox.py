@@ -9,7 +9,7 @@ import torch
 from loguru import logger
 
 # Core application imports (danger: circular risk; we'll be careful)
-from src.config import get_config, get_config_value
+from src.config import get_config
 from src.audio_utils import set_torchaudio_backend
 from src.generate.pipeline import AudioGenerationContext
 from src.tts_model import ModelManager, GEN_ACTIVE_LOCK
@@ -139,9 +139,9 @@ def main():
 
     logger.info(f"✓ Model loaded : {model.__class__.__name__} ({model_type}) on {config.app_config.globals.device} (dtype={config.app_config.globals.dtype})")
 
-    # Initialize pipeline coordinator
-    logger.info("Initializing audio generation pipeline coordinator...")
-    pipeline = GenerationCoordinator()
+    # Initialize pipeline coordinator with explicit dependencies
+    logger.info("[PIPE] Initializing audio generation pipeline coordinator…")
+    pipeline = GenerationCoordinator(config=config, cache_manager=cache_manager, model=model)
 
     # Validate that the pipeline is fully operational
     logger.info("Validating pipeline components...")

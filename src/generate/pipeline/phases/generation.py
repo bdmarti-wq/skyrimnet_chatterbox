@@ -7,7 +7,7 @@ from typing import Dict, Optional, Any
 from loguru import logger
 from .base import BaseGenerationPhase
 from ...pipeline.context import AudioGenerationContext
-from src.tts_model import GEN_ACTIVE_LOCK, create_dummy_conds  # Minimal imports
+# Note: GEN_ACTIVE_LOCK and create_dummy_conds are not used directly in this phase.
 
 
 class GenerationPhase(BaseGenerationPhase):
@@ -20,8 +20,12 @@ class GenerationPhase(BaseGenerationPhase):
         else:
             # Fallback stub if no conds (e.g., error)
             logger.warning("No conds in context; skipping gen (empty WAV)")
-            context.processed_wav = torch.zeros((1, context.sr * 2), dtype=torch.float32,
-                                                device=context.device)  # 2s silence
+            # Use shared silence helper for consistency
+            globals_dict = context.get_globals()
+            sr = globals_dict['sr']
+            device = torch.device(globals_dict['device'])
+            dtype = globals_dict['dtype']
+            context.processed_wav = self.create_silence(sr, 2.0, device, dtype)
             # For fallback, set generated_wav as empty too for post-consistency
             context.generated_wav = torch.zeros(0, dtype=torch.float32, device=context.device)  # Empty trigger
             return context

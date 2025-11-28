@@ -1,5 +1,4 @@
 import os
-import torch
 from .base import BaseGenerationPhase
 from ...pipeline.context import AudioGenerationContext
 from loguru import logger
@@ -45,29 +44,6 @@ class VoiceProcessingPhase(BaseGenerationPhase):
             f"Conds unavailable for '{voice_stem}'; proceeding without conds (silence fallback will be used)."
         )
         return context
-
-    def _prepare_conditionals(self, context, processed_path, exag):
-        """Prepare conditionals from processed voice audio. Assumes this sets model.conds internally."""
-        # Original implementation: e.g., model.prepare_conditionals(processed_path, exag), then conds = model.conds.to(dtype)
-        # Note: Called internally by _get_or_prepare if MISS.
-        raise NotImplementedError("Implement _prepare_conditionals based on original logic (e.g., model.prepare_conditionals + .to(dtype))")
-
-    def _create_dummy_conds(self, model, device, dtype):
-        """Create a dummy Conditionals object for fallback (zero embeddings)."""
-        # Original implementation: e.g., dummy = type(model.conds)(); dummy.t3 = ... (empty tensors on device/dtype)
-        # Returns a valid structure but empty (numel=0 or small zero tensor).
-        # Deprecated: creating partial/dummy Conditionals caused constructor errors downstream.
-        # Return None and let the pipeline use a robust silence fallback instead.
-        return None
-
-    def _is_nonempty_conds(self, conds):
-        """Check if conds is valid/non-empty (optional, now handled by cache)."""
-        # Original implementation: e.g., return hasattr(conds, 't3') and len(conds.t3.speaker_emb) > 0
-        if conds is None:
-            return False
-        # Assuming conds is object; check key attrs
-        return hasattr(conds, 'speaker_emb') and conds.speaker_emb.numel() > 0
-
     def handle_error(self, context: AudioGenerationContext, error: Exception) -> AudioGenerationContext:
         context.voice_params = {'exaggeration': 1.0}
         context.conditionals_key = f"error_{context.voice_stem or 'default'}"

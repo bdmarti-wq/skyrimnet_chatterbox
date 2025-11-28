@@ -298,13 +298,17 @@ def _create_generation_context(
         vp_val = voice_params.get(vp_key) if isinstance(voice_params, dict) else None
         return vp_val if vp_val is not None else default_val
 
+    # Standardize CFG naming: map incoming cfg_scale/cfgw to internal cfg_weight consistently
+    actual_cfg_weight = _merge_param(cfgw, 'cfg_weight', 0.3)
+
     context = AudioGenerationContext(
         text=text,
         audio_prompt_path=audio_prompt_path,
         cache_uuid=cache_uuid,
         exaggeration=_merge_param(exaggeration, 'exaggeration', 0.5),
         temperature=_merge_param(temperature, 'temperature', 0.8),
-        cfgw=_merge_param(cfgw, 'cfg_weight', 0.3),
+        cfg_weight=actual_cfg_weight,
+        cfgw=actual_cfg_weight,
         min_p=_merge_param(min_p, 'min_p', 0.5),
         top_p=_merge_param(top_p, 'top_p', 1.0),
         repetition_penalty=_merge_param(repetition_penalty, 'repetition_penalty', 1.2),

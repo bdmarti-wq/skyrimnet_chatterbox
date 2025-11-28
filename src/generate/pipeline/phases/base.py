@@ -3,10 +3,10 @@ import time
 from typing import Optional, Dict, Any
 from loguru import logger
 from src.generate.pipeline.context import AudioGenerationContext
-from src.audio_utils import get_silence
 import torch
 from pathlib import Path
 import torchaudio
+from src.gradio_patch import _is_dirlike_path
 
 class BaseGenerationPhase:
     """Base class for all audio generation pipeline phases. FIXED: _is_nonempty_conds allows dummy (structure OK)."""
@@ -47,26 +47,26 @@ class BaseGenerationPhase:
 
         error = self._validate(context)
         if error:
-            logger.warning(f"{phase_name} validation failed: {error}")
+            logger.warning(f"[PHASE:{phase_name}] validation failed: {error}")
             return self.handle_error(context, ValueError(error))
 
-        logger.debug(f"Starting phase: {phase_name}")
+        logger.debug(f"[PHASE:{phase_name}] starting")
         try:
             context = self._execute_core(context)
         except Exception as phase_e:
-            logger.error(f"Phase {phase_name} failed: {str(phase_e)}")
+            logger.error(f"[PHASE:{phase_name}] failed: {str(phase_e)}")
             context = self.handle_error(context, phase_e)
 
         elapsed = time.perf_counter() - start_time
         context.step_times[phase_name] = elapsed
-        logger.debug(f"{phase_name}: {elapsed:.3f}s")
+        logger.debug(f"[PHASE:{phase_name}] done in {elapsed:.3f}s")
         return context
 
     def _execute_core(self, context: AudioGenerationContext) -> AudioGenerationContext:
         raise NotImplementedError("Subclasses must implement _execute_core()")
 
     def handle_error(self, context: AudioGenerationContext, error: Exception) -> AudioGenerationContext:
-        logger.error(f"Base error in {self.__class__.__name__}: {str(error)} – silence fallback")
+        logger.error(f"[PHASE:{self.__class__.__name__}] error: {str(error)} – silence fallback")
         return self._fallback_silence(context, str(error))
 
     def _fallback_silence(self, context: AudioGenerationContext, error_msg: str) -> AudioGenerationContext:
@@ -88,7 +88,7 @@ class BaseGenerationPhase:
         if hasattr(context, 'conditionals_key') and not context.conditionals_key:
             context.conditionals_key = "silence_fallback"
         context.ensure_attrs()
-        logger.warning(f"Shared silence fallback ({silence.shape} @ {sr}Hz) due to: {error_msg}")
+        logger.warning(f"[PHASE:{self.__class__.__name__}] shared silence fallback ({silence.shape} @ {sr}Hz) due to: {error_msg}")
         return context
 
     @classmethod
@@ -100,6 +100,13 @@ class BaseGenerationPhase:
     def validate_path(cls, path: str, min_dur: float = 3.0) -> bool:
         if not path or not os.path.exists(path):
             return False
+        # Reject directories early (prevents noisy preprocess errors)
+        try:
+            if _is_dirlike_path(path):
+                return False
+        except Exception:
+            # Be conservative on diagnostics errors
+            pass
         try:
             info = torchaudio.info(path)
             if info.num_frames / info.sample_rate < min_dur:
@@ -125,52 +132,4 @@ class BaseGenerationPhase:
             return any(v is not None for v in conds.values())
         return True
 
-    # _prepare_conditionals, _create_dummy_conds unchanged (as in previous)
-
-    def _prepare_conditionals(self, context: AudioGenerationContext, prep_path: str, exag: float) -> Optional[Any]:
-        """REFACTORED: Shared conds prep (fresh or eager). Use in voice/generation. Reduces bloat by ~50 lines each."""
-        if not self.validate_path(prep_path):
-            logger.warning(f"Invalid prep_path: {prep_path}")
-            return None
-
-        globals_dict = context.get_globals()
-        device = torch.device(globals_dict['device'])
-        dtype = globals_dict['dtype']
-
-        # REFACTORED: Temp eager guard (shared)
-        model = context.model
-        original_params = None
-        if hasattr(model.t3, 'params') and isinstance(model.t3.params, dict):
-            original_params = model.t3.params.copy()
-            model.t3.params['generate_token_backend'] = 'eager'
-
-        try:
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
-            model.prepare_conditionals(prep_path, exaggeration=exag)
-            if hasattr(model.conds, 't3'):
-                model.conds.t3.to(device=device, dtype=dtype)
-            from src.tts_model import chatterbox_tts_to
-            chatterbox_tts_to(model, device, dtype)
-            conds = model.conds
-            if self._is_nonempty_conds(conds):
-                logger.debug(f"Prepared conds: emb non-empty")
-                return conds
-            else:
-                logger.warning("Prepared empty conds – dummy")
-                return self._create_dummy_conds(model, device, dtype)
-        except Exception as prep_e:
-            logger.error(f"Prep failed: {prep_e}")
-            return self._create_dummy_conds(model, device, dtype)
-        finally:
-            # Restore
-            if original_params is not None:
-                model.t3.params = original_params
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
-
-    def _create_dummy_conds(self, model: Any, device: torch.device, dtype: torch.dtype) -> Any:
-        """REFACTORED: Shared dummy creator (from tts_model)."""
-        from src.tts_model import create_dummy_conds
-        create_dummy_conds(model, device, dtype, "dummy_fallback")
-        return model.conds
+    # Removed unused conditionals preparation helpers; conds are handled via caches/voice phase.
