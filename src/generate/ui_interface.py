@@ -17,6 +17,11 @@ import tempfile
 import time
 
 import gradio as gr
+# Ensure Gradio preprocessing patch is installed even if this module is used standalone
+try:
+    import src.gradio_patch  # side-effect import installs patch
+except Exception:
+    pass
 import torch
 from loguru import logger
 
@@ -30,6 +35,40 @@ from src.seeding import cpp_uuid_to_seed
 PIPELINE_CACHE = None
 CONFIG_CACHE = None
 CACHE_MANAGER_CACHE = None
+
+def _sanitize_audio_path(p: Optional[str]) -> Optional[str]:
+    """Return a safe audio file path or None.
+
+    - Treat None/empty as None
+    - Drop our placeholder .noop files produced by the Gradio patch
+    - Drop non-existent paths, directories, or zero-byte files
+    """
+    try:
+        if not p:
+            return None
+        s = str(p).strip()
+        if not s:
+            return None
+        # Our gradio patch substitutes temp files with .noop suffix for directories
+        if s.lower().endswith('.noop'):
+            logger.debug("[UI.DIAG] Sanitizer: ignoring placeholder path (noop): {}", s)
+            return None
+        path = Path(s)
+        if not path.exists():
+            logger.debug("[UI.DIAG] Sanitizer: ignoring non-existent path: {}", s)
+            return None
+        if path.is_dir():
+            logger.debug("[UI.DIAG] Sanitizer: ignoring directory path: {}", s)
+            return None
+        try:
+            if path.stat().st_size == 0:
+                logger.debug("[UI.DIAG] Sanitizer: ignoring zero-byte file: {}", s)
+                return None
+        except Exception:
+            return None
+        return s
+    except Exception:
+        return None
 
 def _ensure_valid_return(result: Any, error_msg: Optional[str] = None) -> list:
     """Ensure return value matches Gradio's expected output structure."""
@@ -125,6 +164,13 @@ async def generate_audio_ui(
         if model is None:
             error_msg = "No TTS model available"
             return _ensure_valid_return(None, error_msg)
+
+        # Sanitize incoming audio paths coming from the UI/bridge. This ensures that
+        # placeholder .noop temp files (inserted by our Gradio patch when a directory
+        # sneaks in) do not propagate into the pipeline and trigger repeated validation
+        # errors across phases.
+        speaker_audio = _sanitize_audio_path(speaker_audio)
+        prefix_audio = _sanitize_audio_path(prefix_audio)
 
         # Initialize cache_manager (lazy load)
         if CACHE_MANAGER_CACHE is None:
