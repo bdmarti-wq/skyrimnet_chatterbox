@@ -702,14 +702,14 @@ class PostProcessingPhase(BaseGenerationPhase):
 
     @staticmethod
     def create_silence_tensor(sr: int, duration_s: float = 2.0, device: str = 'cpu') -> torch.Tensor:
-        """Sample silence (1D fp32 mono; [samples])."""
+        """Create silence as a 2D tensor [1, samples] to satisfy downstream expectations."""
         if device == 'cuda' and torch.cuda.is_available():
             device = 'cuda:0'
         else:
             device = 'cpu'  # Safe for save
         dev = torch.device(device)
         samples = int(sr * duration_s)
-        return torch.zeros(samples, dtype=torch.float32, device=dev)
+        return torch.zeros((1, samples), dtype=torch.float32, device=dev)
 
     # UTILITY: Inline simple norm (fallback)
     def _inline_simple_norm(self, wav: torch.Tensor, voice_params: Dict[str, Any]) -> torch.Tensor:

@@ -35,12 +35,15 @@ class VoiceProcessingPhase(BaseGenerationPhase):
             else:
                 logger.warning(f"Conds processing failed for {voice_stem} ({conds_key[:20]}...) – fallback to dummy")
 
+        # Fallback: do NOT fabricate partial Conditionals – leave None so later phases can silence-fallback safely
         globals_dict = context.get_globals()
-        dummy = self._create_dummy_conds(context.model, torch.device(globals_dict['device']), globals_dict['dtype'])
-        context.model.conds = dummy
-        context.conds = dummy
+        context.model.conds = None
+        context.conds = None
         context.conds_key = f"dummy_{voice_stem}"
-        logger.debug(f"Dummy conds for {voice_stem} (structure valid)")
+        context.conds_from_cache = False
+        logger.warning(
+            f"Conds unavailable for '{voice_stem}'; proceeding without conds (silence fallback will be used)."
+        )
         return context
 
     def _prepare_conditionals(self, context, processed_path, exag):
@@ -53,10 +56,9 @@ class VoiceProcessingPhase(BaseGenerationPhase):
         """Create a dummy Conditionals object for fallback (zero embeddings)."""
         # Original implementation: e.g., dummy = type(model.conds)(); dummy.t3 = ... (empty tensors on device/dtype)
         # Returns a valid structure but empty (numel=0 or small zero tensor).
-        dummy = model.conds.__class__()  # Assuming model.conds is a dataclass or similar
-        dummy.speaker_emb = torch.zeros(1, dtype=dtype, device=device)
-        # Add other attrs as per Conditionals structure (e.g., t3, etc.)
-        return dummy
+        # Deprecated: creating partial/dummy Conditionals caused constructor errors downstream.
+        # Return None and let the pipeline use a robust silence fallback instead.
+        return None
 
     def _is_nonempty_conds(self, conds):
         """Check if conds is valid/non-empty (optional, now handled by cache)."""
