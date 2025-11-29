@@ -17,11 +17,6 @@ import tempfile
 import time
 
 import gradio as gr
-# Ensure Gradio preprocessing patch is installed even if this module is used standalone
-try:
-    import src.gradio_patch  # side-effect import installs patch
-except Exception:
-    pass
 import torch
 from loguru import logger
 
@@ -29,7 +24,9 @@ from src.config import get_config
 from src.tts_model import ModelManager, GEN_ACTIVE_LOCK
 from src.generate.pipeline.context import AudioGenerationContext
 from src.generate.cache.cache_manager import CacheManager, get_cache_manager
-from src.seeding import cpp_uuid_to_seed
+from src.seeding import cpp_uuid_to_seed, resolve_seed
+from src.audio_paths import sanitize_input_path
+from src.audio_fallbacks import get_fallback_wav
 
 # Cache for hot reloads (loaded model/config)
 PIPELINE_CACHE = None
@@ -37,38 +34,8 @@ CONFIG_CACHE = None
 CACHE_MANAGER_CACHE = None
 
 def _sanitize_audio_path(p: Optional[str]) -> Optional[str]:
-    """Return a safe audio file path or None.
-
-    - Treat None/empty as None
-    - Drop our placeholder .noop files produced by the Gradio patch
-    - Drop non-existent paths, directories, or zero-byte files
-    """
-    try:
-        if not p:
-            return None
-        s = str(p).strip()
-        if not s:
-            return None
-        # Our gradio patch substitutes temp files with .noop suffix for directories
-        if s.lower().endswith('.noop'):
-            logger.debug("[UI.DIAG] Sanitizer: ignoring placeholder path (noop): {}", s)
-            return None
-        path = Path(s)
-        if not path.exists():
-            logger.debug("[UI.DIAG] Sanitizer: ignoring non-existent path: {}", s)
-            return None
-        if path.is_dir():
-            logger.debug("[UI.DIAG] Sanitizer: ignoring directory path: {}", s)
-            return None
-        try:
-            if path.stat().st_size == 0:
-                logger.debug("[UI.DIAG] Sanitizer: ignoring zero-byte file: {}", s)
-                return None
-        except Exception:
-            return None
-        return s
-    except Exception:
-        return None
+    """Compatibility shim: delegate to shared sanitizer."""
+    return sanitize_input_path(p)
 
 def _ensure_valid_return(result: Any, error_msg: Optional[str] = None) -> list:
     """Ensure return value matches Gradio's expected output structure."""
@@ -80,38 +47,18 @@ def _ensure_valid_return(result: Any, error_msg: Optional[str] = None) -> list:
     elif isinstance(result, str) and Path(result).exists():
         return [result, status_text]
 
-    # Try fallbacks in order of reliability
+    # Fallback: use shared util for a reusable silence wav
     try:
-        sr = get_config().app_config.globals.sr  # Fixed: Use config.globals.sr
-        fallback_path = _create_raw_silence_fallback(0, sr)
+        sr = get_config().app_config.globals.sr  # Prefer config SR
+    except Exception:
+        sr = 24000
+    try:
+        fallback_path = get_fallback_wav(sr)
         return [fallback_path, status_text]
-    except:
-        try:
-            fallback_path = _create_raw_silence_fallback(0, 24000)
-            return [fallback_path, status_text]
-        except:
-            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-                return [tmp.name, f"Critical fallback: {error_msg}" if error_msg else "Status"]
-
-def _create_raw_silence_fallback(uuid: int, sr: int = 24000) -> str:
-    """Create static silence fallback WAV file once for reuse."""
-    import numpy as np
-    from scipy.io import wavfile
-
-    temp_dir = Path(tempfile.gettempdir())
-    temp_dir.mkdir(parents=True, exist_ok=True)  # Use system temp as fallback
-
-    # Use predictable name for reuse across requests
-    silence_path = temp_dir / f"silence_{sr}.wav"
-
-    if not silence_path.exists():
-        duration = 0.5  # seconds
-        t = np.linspace(0, duration, int(sr * duration))
-        silence = np.zeros_like(t, dtype=np.float32)
-        wavfile.write(str(silence_path), sr, silence)
-        logger.debug(f"Created silence fallback: {silence_path}")
-
-    return str(silence_path)
+    except Exception:
+        # Absolute last resort temporary file
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+            return [tmp.name, f"Critical fallback: {error_msg}" if error_msg else "Status"]
 
 async def generate_audio_ui(
     model_choice=None,
@@ -201,12 +148,13 @@ async def generate_audio_ui(
             cache_uuid=uuid_seed,
             exaggeration=quadratic_exagg,
             temperature=linear_temp,
-            cfgw=cfg_scale,
+            cfg_weight_ui=cfg_scale,
             min_p=min_p_param,
             top_p=top_p_param,
             repetition_penalty=confidence_rep,
             language_id=language,
-            seed_num=cpp_uuid_to_seed(uuid_seed) if randomize_seed_toggle else None,
+            provided_seed=None,
+            randomize_seed=randomize_seed_toggle,
             enable_audio_cache=enable_audio_cache,
             enable_fuzzy_cache=enable_fuzzy_cache,
             model=model,  # FIXED: Pass the loaded model
@@ -246,12 +194,13 @@ def _create_generation_context(
     cache_uuid: int,
     exaggeration: Optional[float],  # UI param (or None)
     temperature: Optional[float],  # UI param (or None)
-    cfgw: float,
+    cfg_weight_ui: Optional[float],
     min_p: float,
     top_p: float,
     repetition_penalty: float,
     language_id: str,
-    seed_num: int,
+    provided_seed: Optional[int],
+    randomize_seed: bool = False,
     enable_audio_cache: bool = True,
     enable_fuzzy_cache: bool = True,
     model: Optional[Any] = None,
@@ -286,8 +235,8 @@ def _create_generation_context(
         except Exception:
             pass
 
-    # Coerce seeds
-    seed = cpp_uuid_to_seed(cache_uuid) if seed_num is None else seed_num
+    # Resolve seed once (shared util)
+    seed = resolve_seed(cache_uuid, provided_seed, randomize=randomize_seed)
 
     # Create and initialize context
     # Merge precedence: UI params (if not None) should override voice-specific config WHEN coming from UI.
@@ -298,8 +247,8 @@ def _create_generation_context(
         vp_val = voice_params.get(vp_key) if isinstance(voice_params, dict) else None
         return vp_val if vp_val is not None else default_val
 
-    # Standardize CFG naming: map incoming cfg_scale/cfgw to internal cfg_weight consistently
-    actual_cfg_weight = _merge_param(cfgw, 'cfg_weight', 0.3)
+    # Standardize CFG naming: map incoming cfg_scale to internal cfg_weight consistently
+    actual_cfg_weight = _merge_param(cfg_weight_ui, 'cfg_weight', 0.3)
 
     context = AudioGenerationContext(
         text=text,
@@ -308,7 +257,6 @@ def _create_generation_context(
         exaggeration=_merge_param(exaggeration, 'exaggeration', 0.5),
         temperature=_merge_param(temperature, 'temperature', 0.8),
         cfg_weight=actual_cfg_weight,
-        cfgw=actual_cfg_weight,
         min_p=_merge_param(min_p, 'min_p', 0.5),
         top_p=_merge_param(top_p, 'top_p', 1.0),
         repetition_penalty=_merge_param(repetition_penalty, 'repetition_penalty', 1.2),
