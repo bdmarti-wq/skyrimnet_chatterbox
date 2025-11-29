@@ -68,7 +68,7 @@
         "ooh",
         "gasp"
       ],
-      "fuzzy_force_skip_words": ["Kelsa", "Lydia", "Jenna", "Misty", "Anja", "Katana", "Sofia", "Frea", "Feris", "Laci", "Lyris"],
+      "fuzzy_force_skip_words": ["Odin","Kelsa", "Lydia", "Jenna", "Misty", "Anja", "Katana", "Sofia", "Frea", "Feris", "Laci", "Lyris"],
       "fuzzy_index_size": 5000,
       "fuzzy_artifact_threshold_hz": 12000.0
     },
@@ -123,15 +123,6 @@
       "gain_max_limit": 1.0,
       "trailing_silence_db": -47.25,
       "ebu_post_gain_db": -18.0,
-      "enable_fuzzy_cache": true
-    },
-    "femaleuniquelydia_24000Hz": {
-      "temperature": 0.8,
-      "min_p": 0.07,
-      "top_p": 1,
-      "repetition_penalty": 1.2,
-      "cfg_weight": 0.3,
-      "exaggeration": 0.5,
       "enable_fuzzy_cache": true
     }
   }

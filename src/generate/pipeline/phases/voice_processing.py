@@ -29,7 +29,7 @@ class VoiceProcessingPhase(BaseGenerationPhase):
                 context.conds = conds
                 context.conds_key = conds_key
                 context.conds_from_cache = True
-                logger.info(f"Conds processed/restored for {voice_stem} via {conds_key[:20]}... (cache HIT or fresh compute)")
+                logger.debug(f"Conds processed/restored for {voice_stem} via {conds_key[:20]}... (cache HIT or fresh compute)")
                 return context
             else:
                 logger.warning(f"Conds processing failed for {voice_stem} ({conds_key[:20]}...) – fallback to dummy")

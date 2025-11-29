@@ -104,34 +104,44 @@ class VoiceReferenceCache:
 
         logger.trace(f"Applied voice params to context: exagg={exaggeration}, temp={temperature}, cfg={cfg_weight}, rep_pen={repetition_penalty}")
 
-    def _get_voice_params(self, voice_stem: str) -> Dict[str, Any]:
-        """CACHED: Get voice params using central get_voice_params (memoized per stem). PATCHED: Apply defaults for key params including repetition_penalty."""
+    def _get_voice_params(self, voice_stem: str, overrides: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """CACHED: Get voice params using central get_voice_params (memoized per stem),
+        then apply optional overrides (e.g., bridge-injected UI overrides) with final precedence.
+
+        The internal memoization is per-stem for the base values; overrides are applied on top
+        per call to avoid polluting the cache with UI-specific ephemeral values.
+        """
         with self._cache_lock:
             if voice_stem in self._voice_params_cache:
                 logger.trace(f"Cached voice_params for {voice_stem}")
-                return self._voice_params_cache[voice_stem].copy()  # Copy to avoid mutation
+                base = self._voice_params_cache[voice_stem].copy()
+            else:
+                params = get_config().get_voice_params(voice_stem) or {}
 
-            params = get_config().get_voice_params(voice_stem) or {}
+                # FIXED: Ensure key TTS params have defaults if None (avoids validation errors)
+                if params.get('exaggeration') is None:
+                    params['exaggeration'] = 0.75
+                if params.get('temperature') is None:
+                    params['temperature'] = 0.75
+                if params.get('cfg_weight') is None:
+                    params['cfg_weight'] = 0.43
+                if params.get('min_p') is None:
+                    params['min_p'] = 0.05
+                if params.get('top_p') is None:
+                    params['top_p'] = 1.0
+                # PATCHED: Add default for repetition_penalty (avoids TTS validation error)
+                if params.get('repetition_penalty') is None:
+                    params['repetition_penalty'] = 1.2
+                # Add other defaults as needed based on TTS usage
 
-            # FIXED: Ensure key TTS params have defaults if None (avoids validation errors)
-            if params.get('exaggeration') is None:
-                params['exaggeration'] = 0.75
-            if params.get('temperature') is None:
-                params['temperature'] = 0.75
-            if params.get('cfg_weight') is None:
-                params['cfg_weight'] = 0.43
-            if params.get('min_p') is None:
-                params['min_p'] = 0.05
-            if params.get('top_p') is None:
-                params['top_p'] = 1.0
-            # PATCHED: Add default for repetition_penalty (avoids TTS validation error)
-            if params.get('repetition_penalty') is None:
-                params['repetition_penalty'] = 1.2
-            # Add other defaults as needed based on TTS usage
-
-            self._voice_params_cache[voice_stem] = params  # Cache
-            logger.trace(f"Fetched voice_params for {voice_stem} (defaults applied)")
-            return params.copy()  # Copy to avoid mutation
+                self._voice_params_cache[voice_stem] = params  # Cache
+                logger.trace(f"Fetched voice_params for {voice_stem} (defaults applied)")
+                base = params.copy()
+        # Apply overrides last (do not store in cache)
+        if isinstance(overrides, dict) and overrides:
+            merged = {**base, **overrides}
+            return merged
+        return base
 
     def _clear_voice_cache(self, stem: str):
         """Clear cached voice_params for a stem (on update)."""
@@ -416,8 +426,9 @@ class VoiceReferenceCache:
         if is_upload:
             logger.debug(f"Upload: {original_filename} → norm_stem '{norm_stem}'")
 
-        # FIXED: Fetch voice_params once if voice_stem is set (for the entire pipeline)
-        voice_config = self._get_voice_params(norm_stem)
+        # FIXED: Fetch voice_params once; apply any bridge-injected overrides for this request (do not cache overrides)
+        injected_overrides = getattr(context, 'voice_params', None) if context is not None else None
+        voice_config = self._get_voice_params(norm_stem, overrides=injected_overrides)
 
         # Probe by norm_stem for stable HIT (ignores legacy non-norm keys)
         hit_entry = None
@@ -425,7 +436,7 @@ class VoiceReferenceCache:
             entry = self.voice_cache[norm_stem]
             # Lightning quick match
             if self.quick_metadata_match(new_path, entry):
-                logger.info(f"LIGHTNING HIT for {norm_stem} (quick match; reuse stable)")
+                logger.debug(f"LIGHTNING HIT for {norm_stem} (quick match; reuse stable)")
                 resampled_path = entry.resampled_path
                 if resampled_path and os.path.exists(resampled_path):
                     cond_key = entry.conditionals_key
@@ -439,7 +450,7 @@ class VoiceReferenceCache:
             if not should_update and entry_from_tiers:
                 resampled_path = entry_from_tiers.resampled_path
                 if resampled_path and os.path.exists(resampled_path):
-                    logger.info(f"HIT for {norm_stem}: Reuse resampled/conds (stable hash {entry_from_tiers.content_hash[:12]})")
+                    logger.debug(f"HIT for {norm_stem}: Reuse resampled/conds (stable hash {entry_from_tiers.content_hash[:12]})")
                     cond_key = entry_from_tiers.conditionals_key
                     hit_entry = entry_from_tiers
                     # FIXED: Apply cached params to context on tier hit
@@ -449,7 +460,7 @@ class VoiceReferenceCache:
         # FIXED: Store under norm_stem always (stable; overrides legacy if norm matches old unique)
         voice_stem = norm_stem
         if is_upload and norm_stem not in self.voice_cache:
-            logger.info(f"New upload under stable '{voice_stem}' (no temp _upload)")
+            logger.debug(f"New upload under stable '{voice_stem}' (no temp _upload)")
 
         # Validation
         is_valid, msg = self.validate_voice_prompt(new_path, voice_stem)
@@ -463,7 +474,7 @@ class VoiceReferenceCache:
             entry = self.voice_cache[voice_stem]
             resampled_path = entry.resampled_path
             if resampled_path and os.path.exists(resampled_path):
-                logger.info(f"HIT for {voice_stem}: Reuse (stable norm)")
+                logger.debug(f"HIT for {voice_stem}: Reuse (stable norm)")
                 cond_key = entry.conditionals_key
                 hit_entry = entry
                 # FIXED: Apply cached params to context on update
@@ -473,7 +484,7 @@ class VoiceReferenceCache:
         # Force for uploads
         if is_upload:
             should_update = True
-            logger.info(f"Force update for upload {voice_stem}")
+            logger.debug(f"Force update for upload {voice_stem}")
 
         config = get_config()
         if hasattr(config, 'app_config') and hasattr(config.app_config, 'globals'):
@@ -484,14 +495,14 @@ class VoiceReferenceCache:
             device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
             dtype = torch.float32
             sr = 24000
-        voice_params = self._get_voice_params(voice_stem)  # TODO check vs older code?
+        voice_params = self._get_voice_params(voice_stem, overrides=injected_overrides)  # Align with unified source
 
         # Config path?
         config_path = voice_params.get("reference_path")
         if config_path and os.path.exists(config_path) and not is_upload:
             final_path = config_path
             use_config_path = True
-            logger.info(f"Config path for {voice_stem}: {config_path}")
+            logger.debug(f"Config path for {voice_stem}: {config_path}")
         else:
             final_path = new_path
             use_config_path = False
@@ -504,7 +515,7 @@ class VoiceReferenceCache:
                     return True, final_path, current_entry.conditionals_key, voice_params, current_entry
 
                 if current_entry.content_hash == self.calculate_content_hash(final_path, full=True):
-                    logger.info(f"No change for {voice_stem}; reuse")
+                    logger.debug(f"No change for {voice_stem}; reuse")
                     hit_entry = current_entry
                     return True, final_path, current_entry.conditionals_key, voice_params, hit_entry
 

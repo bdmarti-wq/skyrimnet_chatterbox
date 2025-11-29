@@ -225,15 +225,43 @@ def _create_generation_context(
         from src.normalize_stem import normalize_stem
         voice_stem = normalize_stem(audio_path=audio_prompt_path)
 
-    # FIXED: Use get_voice_params (sole merger; replaces deprecated)
+    # FIXED: Use config.get_voice_params which delegates to canonical merger (single source of truth)
     voice_params = config.get_voice_params(voice_name=voice_stem) if voice_stem else {}
-    # Merge in-memory UI overrides (take precedence for this run only)
+
+    # Diagnostic: log short‑padding related fields before overrides
+    try:
+        logger.debug(
+            "Resolved voice_params pre-override for stem={} :: short_padding_threshold={}, token='{}', enable_text_padding={}, text_ellipses_count={}",
+            voice_stem,
+            voice_params.get('short_padding_threshold', None),
+            (voice_params.get('short_padding_token', '') or ''),
+            voice_params.get('enable_text_padding', None),
+            voice_params.get('text_ellipses_count', None)
+        )
+    except Exception:
+        pass
+
+    # Merge in-memory UI overrides (take precedence for this run only), but do not clobber with None
     if isinstance(extra_ui_voice_params, dict) and extra_ui_voice_params:
         try:
-            # UI overrides should win over persisted values for this session
-            voice_params = {**voice_params, **extra_ui_voice_params}
+            non_none_overrides = {k: v for k, v in extra_ui_voice_params.items() if v is not None}
+            if non_none_overrides:
+                voice_params = {**voice_params, **non_none_overrides}
         except Exception:
             pass
+
+    # Diagnostic: post-override snapshot
+    try:
+        logger.debug(
+            "Resolved voice_params POST-override for stem={} :: short_padding_threshold={}, token='{}', enable_text_padding={}, text_ellipses_count={}",
+            voice_stem,
+            voice_params.get('short_padding_threshold', None),
+            (voice_params.get('short_padding_token', '') or ''),
+            voice_params.get('enable_text_padding', None),
+            voice_params.get('text_ellipses_count', None)
+        )
+    except Exception:
+        pass
 
     # Resolve seed once (shared util)
     seed = resolve_seed(cache_uuid, provided_seed, randomize=randomize_seed)

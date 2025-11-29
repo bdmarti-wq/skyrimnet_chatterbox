@@ -149,7 +149,9 @@ class CacheManager:
 
         if not audio_path or not os.path.exists(audio_path):
             logger.warning(f"Invalid voice path from context: {audio_path}")
-            voice_params = self.config.get_voice_params(voice_stem, {'exaggeration': 1.0})
+            # Prefer bridge-injected params if available; else use config shim
+            injected = getattr(context, 'voice_params', None)
+            voice_params = injected if isinstance(injected, dict) and injected else self.config.get_voice_params(voice_stem, {'exaggeration': 1.0})
             context.audio_prompt_path = ""  # Reset in context
             return False, "", 'fallback_key', voice_params, None
 
@@ -166,7 +168,8 @@ class CacheManager:
             duration = info.num_frames / info.sample_rate
             if duration < min_duration:
                 logger.warning(f"Short {voice_stem}: {duration:.2f}s")
-                voice_params = self.config.get_voice_params(voice_stem, {})
+                injected = getattr(context, 'voice_params', None)
+                voice_params = injected if isinstance(injected, dict) and injected else self.config.get_voice_params(voice_stem, {})
                 return False, "", 'short_fallback_key', voice_params, None
 
             if get_config_value('globals.check_artifacts', True):
@@ -177,13 +180,20 @@ class CacheManager:
                         self.voice_reference.voice_cache.pop(voice_stem, None)
         except Exception as v_e:
             logger.warning(f"Validation fail for {voice_stem}: {v_e}")
-            voice_params = self.config.get_voice_params(voice_stem, {})
+            injected = getattr(context, 'voice_params', None)
+            voice_params = injected if isinstance(injected, dict) and injected else self.config.get_voice_params(voice_stem, {})
             return False, "", 'invalid_fallback_key', voice_params, None
 
         # FIXED: Pass context to process_new_reference
         success, processed_path, conds_key, voice_params, hit_entry = self.voice_reference.process_new_reference(
             voice_stem, audio_path, force_update=force, context=context
         )
+
+        # Ensure the voice_params we return are consistent with the bridge-injected dict if available
+        if isinstance(getattr(context, 'voice_params', None), dict) and context.voice_params:
+            # Context overrides are authoritative for this request
+            voice_params = {**voice_params, **context.voice_params}
+            context.voice_params = voice_params
 
         if not success:
             logger.error(f"Process fail {voice_stem}; purge")
@@ -194,9 +204,9 @@ class CacheManager:
             return False, "", f'{voice_stem}_fail_key', voice_params, None
 
         if hit_entry:
-            logger.info(f"Voice HIT/reuse {voice_stem} (stable norm)")
+            logger.debug(f"Voice HIT/reuse {voice_stem} (stable norm)")
         else:
-            logger.info(f"Voice MISS/process {voice_stem} (new stable norm)")
+            logger.debug(f"Voice MISS/process {voice_stem} (new stable norm)")
 
         if not success or not processed_path:
             processed_path = audio_path if os.path.exists(audio_path) else ''

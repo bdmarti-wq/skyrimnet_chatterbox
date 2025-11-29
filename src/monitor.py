@@ -64,7 +64,7 @@ def monitor_resources(enable: bool = True, log_level: str = "INFO"):
     return decorator
 
 
-# Usage: In generate_audio.py
+# Usage:
 # @monitor_resources(enable=True, log_level="INFO")
 # async def generate_audio(...):  # Your fn
 #    # Unchanged body

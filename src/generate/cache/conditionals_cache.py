@@ -340,9 +340,9 @@ class ConditionalsCache:
                 file_path.unlink()
                 logger.debug(f"Deleted conds file: {file_path}")
 
-            # FIXED: Increment miss (for stats)
+            # FIXED: Increment miss (for stats) and log at debug to reduce noise
             self.stats["misses"] += 1
-            logger.info(f"Purged conds key: {key[:12]}...")
+            logger.debug(f"Purged conds key: {key[:12]}...")
         except Exception as del_e:
             logger.warning(f"Delete failed for {key}: {del_e};")
 

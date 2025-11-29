@@ -29,6 +29,9 @@ class InputsValidationPhase(BaseGenerationPhase):
         except Exception:
             sp_threshold = None
 
+        logger.info(
+            f"voice '{context.voice_stem}' voice params'{context.voice_params}'" )
+
         short_padding_applied = False
         if sp_threshold and sp_threshold > 0:
             base_stripped = (text or '').strip()
@@ -75,7 +78,7 @@ class InputsValidationPhase(BaseGenerationPhase):
         # Seed
         self.default_seed(context)
 
-        # FIXED: Validate/default all audio params with single voice_params fetch
+        # Validate/default all audio params using the already-injected context.voice_params
         self.validate_audio_params(context)
 
         # Delegate to base for conds/paths (already in _validate)
@@ -99,34 +102,43 @@ class InputsValidationPhase(BaseGenerationPhase):
 
     @staticmethod
     def default_seed(context: AudioGenerationContext):
-        """REFACTORED: Shared seed default (importable)."""
-        seed = context.seed or context.seed_num or 42
-        if seed <= 0:
-            from src.seeding import cpp_uuid_to_seed
-            seed = cpp_uuid_to_seed(context.cache_uuid) or 42
-        object.__setattr__(context, 'seed', seed)
-        logger.debug(f"Seed set: {seed}")
+        """Resolve seed only if the bridge did not set it.
+
+        Bridge is authoritative; only compute a deterministic fallback when missing.
+        """
+        try:
+            seed = getattr(context, 'seed', None)
+            if isinstance(seed, int) and seed > 0:
+                logger.debug(f"Seed preserved from bridge: {seed}")
+                return
+            # Fallback: derive deterministically from cache_uuid
+            from src.seeding import resolve_seed
+            final_seed = resolve_seed(getattr(context, 'cache_uuid', 0), provided_seed=None, randomize=False)
+            object.__setattr__(context, 'seed', final_seed)
+            logger.debug(f"Seed set (fallback): {final_seed}")
+        except Exception:
+            # Absolute fallback to constant if something goes wrong
+            object.__setattr__(context, 'seed', 42)
+            logger.debug("Seed set to constant fallback: 42")
 
     @staticmethod
     def validate_audio_params(context: AudioGenerationContext):
-        """OPTIMIZED: Ensure all audio params have sane non-None defaults (single get_voice_params call).
-        Fetches voice_params once, then uses the dict for all params (no repetition). Adds t3_params validation."""
-        config = get_config() if context.config is None else context.config
+        """Ensure all audio params have sane non-None defaults using context.voice_params.
 
-        # FIXED: Fetch voice_params once if voice_stem is set (for the entire pipeline)
-        voice_params = {}
-        if hasattr(config, 'get_voice_params') and context.voice_stem != "default":
-            voice_params = config.get_voice_params(context.voice_stem) or {}  # Single call!
+        Assumes the bridge injected merged `voice_params` into the context.
+        We do not re-fetch from config here to avoid divergence and extra I/O.
+        """
+        voice_params = getattr(context, 'voice_params', {}) or {}
 
-        # Helper: Get from voice_params, fall back to context, then hardcoded
+        # Helper: Get from context (if explicitly set), then voice_params, else fall back to safe literals
         def sane_default(key: str, fallback_default: float) -> float:
             context_val = getattr(context, key, None)
-            if context_val is not None and isinstance(context_val, (int, float)) and 0 <= context_val <= 2.0:
-                return context_val  # Use context if sane
+            if isinstance(context_val, (int, float)):
+                return float(context_val)
             voice_val = voice_params.get(key, None)
-            if voice_val is not None and isinstance(voice_val, (int, float)) and 0 <= voice_val <= 2.0:
-                return voice_val  # Use voice override
-            return fallback_default  # Hardcoded fallback
+            if isinstance(voice_val, (int, float)):
+                return float(voice_val)
+            return float(fallback_default)
 
         # Set each param with sane_default
         context.exaggeration = sane_default('exaggeration', 0.5)
@@ -136,7 +148,7 @@ class InputsValidationPhase(BaseGenerationPhase):
         context.top_p = sane_default('top_p', 1.0)
         context.repetition_penalty = sane_default('repetition_penalty', 1.2)
 
-        # Also ensure t3_params is present (fallback dict if None)
+        # Ensure t3_params present (fallback dict if None)
         if context.t3_params is None:
             context.t3_params = {
                 "generate_token_backend": "cudagraphs-manual",
@@ -145,7 +157,9 @@ class InputsValidationPhase(BaseGenerationPhase):
             }
             logger.debug("Set default t3_params (was None)")
 
-        logger.trace(f"Audio params validated: exagg={context.exaggeration}, temp={context.temperature}, cfg={context.cfg_weight} (from single voice_params fetch)")
+        logger.debug(
+            f"Audio params validated: exagg={context.exaggeration}, temp={context.temperature}, cfg={context.cfg_weight}"
+        )
 
     def handle_error(self, context: AudioGenerationContext, error: Exception) -> AudioGenerationContext:
         """REFACTORED: Delegate to base (silence)."""

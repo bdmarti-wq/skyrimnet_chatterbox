@@ -54,6 +54,11 @@ def _defaults_from_models() -> Dict[str, Any]:
             'trailing_silence_db': aud.trailing_silence_db,
             'max_short_word_len': aud.max_short_word_len,
             'enable_post_processing': aud.enable_post_processing,
+            # Pre-text padding defaults
+            'short_padding_threshold': aud.short_padding_threshold,
+            'short_padding_token': aud.short_padding_token,
+            'enable_text_padding': aud.enable_text_padding,
+            'text_ellipses_count': aud.text_ellipses_count,
         }
         return base
     except Exception as e:  # pragma: no cover - defensive
@@ -111,6 +116,11 @@ def get_voice_params(config: 'AppConfig', voice_name: Optional[str] = None, over
                 'trailing_silence_db': gaud.trailing_silence_db,
                 'max_short_word_len': gaud.max_short_word_len,
                 'enable_post_processing': gaud.enable_post_processing,
+                # Pre-text padding from globals.audio
+                'short_padding_threshold': gaud.short_padding_threshold,
+                'short_padding_token': gaud.short_padding_token,
+                'enable_text_padding': gaud.enable_text_padding,
+                'text_ellipses_count': gaud.text_ellipses_count,
             })
     except Exception as e:  # pragma: no cover
         logger.warning(f"voice_params: failed to apply global config values: {e}")

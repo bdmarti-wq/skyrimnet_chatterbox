@@ -198,6 +198,12 @@ class AudioConfig(BaseModel):
     ebu_post_gain_db: float = Field(default=0.0, ge=CAPS['EBU_POST_GAIN_DB_MIN'], le=CAPS['EBU_POST_GAIN_DB_MAX'])
     ebu_true_peak: float = Field(default=0.0, ge=CAPS['EBU_TRUE_PEAK_MIN'], le=CAPS['EBU_TRUE_PEAK_MAX'])
     max_short_word_len: int = Field(default=3, ge=CAPS['SHORT_WORD_LEN_MIN'], le=CAPS['SHORT_WORD_LEN_MAX'])
+    # Pre-text padding controls (used by InputsValidationPhase)
+    short_padding_threshold: int = Field(default=0)
+    short_padding_token: str = Field(default="")
+    # Optional global toggles for legacy universal padding behavior
+    enable_text_padding: bool = Field(default=True)
+    text_ellipses_count: int = Field(default=2)
 
     # Validator fallback for any missed clamps (e.g., complex logic)
     @model_validator(mode='after')
@@ -458,6 +464,12 @@ class VoiceConfig(BaseModel):
     fuzzy_boost_amount: Optional[float] = Field(default=None, ge=CAPS['FUZZY_BOOST_AMOUNT_MIN'], le=CAPS['FUZZY_BOOST_AMOUNT_MAX'])
     fuzzy_index_size: Optional[int] = Field(default=None, ge=CAPS['FUZZY_CACHE_LIMIT_MIN'], le=CAPS['FUZZY_CACHE_LIMIT_MAX'])
     fuzzy_artifact_threshold_hz: Optional[float] = Field(default=None, ge=CAPS['FUZZY_ARTIFACT_THRESHOLD_HZ_MIN'], le=CAPS['FUZZY_ARTIFACT_THRESHOLD_HZ_MAX'])
+
+    # Pre-text padding (optional; inherit from globals.audio)
+    short_padding_threshold: Optional[int] = None
+    short_padding_token: Optional[str] = None
+    enable_text_padding: Optional[bool] = None
+    text_ellipses_count: Optional[int] = None
 
     # Validators (fallback; only validate if not None, since Optional)
     @model_validator(mode='after')

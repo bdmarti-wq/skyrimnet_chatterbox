@@ -97,19 +97,14 @@ class CacheCheckPhase(BaseGenerationPhase):
             exact_path = self.cache_manager.get_audio_cache(cache_key)
             if exact_path and os.path.exists(exact_path):
                 if self._validate_cached_audio(exact_path, voice_stem):
+                    # Optimization: avoid full waveform load on exact HIT
                     try:
-                        # FIXED: Load WAV tensor on exact HIT to enable .shape access (use context.sr if avail)
-                        wav_tensor, _ = torchaudio.load(exact_path)  # Load audio (handle multi-channel by mean)
-                        context.processed_wav = wav_tensor.mean(dim=0, keepdim=True).to(context.device,
-                                                                                        context.dtype)  # Average channels, to device/dtype
-                        sr = getattr(context, 'sr', 24000)  # Fallback if sr not set
-                        context.audio_duration = context.processed_wav.shape[1] / sr  # Compute from tensor
-                        logger.info(
-                            f"AUDIO EXACT HIT: {cache_key} → {exact_path} (loaded tensor, duration: {context.audio_duration:.2f}s; bypass gen/conds/post; RTF ∞)")
-                    except Exception as load_e:
-                        logger.warning(
-                            f"Failed to load tensor from exact {exact_path}: {load_e}; use path for play (duration=0.0)")
-                        context.audio_duration = 0.0  # Fallback for play
+                        info = torchaudio.info(exact_path)
+                        context.audio_duration = float(info.num_frames) / float(info.sample_rate)
+                    except Exception as meta_e:
+                        logger.debug(f"Failed to read audio metadata for {exact_path}: {meta_e}")
+                        context.audio_duration = 0.0
+                    logger.info(f"AUDIO EXACT HIT: {cache_key[:12]}… → {exact_path}")
                     context.cached_path = exact_path
                     context.is_cached = True
                     context.cache_hit_type = 'audio_exact'
@@ -147,19 +142,14 @@ class CacheCheckPhase(BaseGenerationPhase):
             fuzzy_path = self.cache_manager.get_fuzzy_audio_cache(audio_prompt, text, voice_stem, threshold=0.70)
             if fuzzy_path and os.path.exists(fuzzy_path):
                 if self._validate_cached_audio(fuzzy_path, voice_stem):
+                    # Optimization: avoid full waveform load on fuzzy HIT
                     try:
-                        # FIXED: Load WAV tensor on fuzzy HIT to enable .shape access (use context.sr if avail)
-                        wav_tensor, _ = torchaudio.load(fuzzy_path)  # Load audio (handle multi-channel by mean)
-                        context.processed_wav = wav_tensor.mean(dim=0, keepdim=True).to(context.device,
-                                                                                        context.dtype)  # Average channels, to device/dtype
-                        sr = getattr(context, 'sr', 24000)  # Fallback if sr not set
-                        context.audio_duration = context.processed_wav.shape[1] / sr  # Compute from tensor
-                        logger.info(
-                            f"AUDIO FUZZY HIT (sim≥0.70): '{text[:30]}...' → {fuzzy_path} (loaded tensor, duration: {context.audio_duration:.2f}s; bypass gen/conds/post; RTF ∞)")
-                    except Exception as load_e:
-                        logger.warning(
-                            f"Failed to load tensor from fuzzy {fuzzy_path}: {load_e}; use path for play (duration=0.0)")
-                        context.audio_duration = 0.0  # Fallback for play
+                        info = torchaudio.info(fuzzy_path)
+                        context.audio_duration = float(info.num_frames) / float(info.sample_rate)
+                    except Exception as meta_e:
+                        logger.debug(f"Failed to read audio metadata for {fuzzy_path}: {meta_e}")
+                        context.audio_duration = 0.0
+                    logger.info(f"AUDIO FUZZY HIT≥0.70: '{(text or '')[:30]}…' → {fuzzy_path}")
                     context.cached_path = fuzzy_path
                     context.is_cached = True
                     context.cache_hit_type = 'audio_fuzzy'

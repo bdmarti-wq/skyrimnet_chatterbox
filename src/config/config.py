@@ -331,65 +331,87 @@ class Config:
         'enable_fuzzy_cache': bool, 'fuzzy_threshold': float, 'fuzzy_boost_amount': float,
         'fuzzy_index_size': int, 'fuzzy_artifact_threshold_hz': float,
         # Core globals
-        'sr': int, 'language_id': str, 'voice_name': str
+        'sr': int, 'language_id': str, 'voice_name': str,
+        # Pre-text padding controls (Audio/Voice)
+        'short_padding_threshold': int, 'short_padding_token': str,
+        'enable_text_padding': bool, 'text_ellipses_count': int
     }
 
-    # REFACROED: Sole merger (enhanced from previous: caching, overrides, PARAM_SPECS loop for safety)
+    # REFACTORED: Delegate to canonical merger in src.voice_params
     def get_voice_params(self, voice_name: Optional[str] = None, overrides: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        """Get voice params (globals + overrides). Sole consolidated method: Merges globals with voice overrides;
-        supports LRU caching, type coercion, and clamps (relies on models.py)."""
+        """Return merged voice parameters using the canonical merger (single source of truth).
+
+        Precedence is handled in `src.voice_params.get_voice_params`:
+        models defaults < globals (tts/audio) < voice overrides < explicit overrides
+
+        This method adds a light LRU cache keyed by globals/voice hashes and overrides signature.
+        """
         # Safety check
         if not hasattr(self, '_is_initialized') or not self._is_initialized or self.app_config is None:
             logger.warning("Config not initialized – creating pure models.py defaults")
             app_config = AppConfig()  # Triggers Field defaults
-            return app_config.globals.model_dump()  # Flat dict from globals (includes sub-models)
+            # Use canonical merger directly to obtain sane defaults
+            try:
+                from src.voice_params import get_voice_params as _merge_voice_params
+                return _merge_voice_params(app_config, voice_name or 'default', overrides)
+            except Exception:
+                return app_config.globals.model_dump()
 
         voice_name = voice_name or 'default'
 
-        # LRU caching (efficient hash on globals + voice)
+        # LRU caching (efficient hash on globals + voice + overrides)
         globals_dump = self.app_config.globals.model_dump()
         global_hash = hashlib.md5(str(sorted(globals_dump.items())).encode()).hexdigest()
         voice = self.app_config.voices.get(voice_name, VoiceConfig())  # Default if missing
         voice_dump = voice.model_dump()
         voice_key = hashlib.md5(str(sorted(voice_dump.items())).encode()).hexdigest()
-        cache_key = (voice_name, global_hash, voice_key)
+        # Include overrides signature (order-insensitive) in the cache key
+        overrides_sig = None
+        if overrides:
+            try:
+                overrides_sig = hashlib.md5(str(sorted(overrides.items())).encode()).hexdigest()
+            except Exception:
+                overrides_sig = str(len(overrides))
+        # Bumpable schema version to invalidate cache when merger logic changes
+        schema_version = 'v3'
+        cache_key = (voice_name, global_hash, voice_key, overrides_sig, schema_version)
 
         if cache_key in self._merged_cache:
             logger.debug(f"LRU cache hit for {voice_name}")
             return self._merged_cache[cache_key]
 
-        # Build from globals (Pydantic models provide defaults; loop over PARAM_SPECS for type safety)
-        params = {}
-        for param, param_type in self.PARAM_SPECS.items():
-            params[param] = self._get_nested_value(self.app_config.globals, param, param_type)
-
-        # Voice override (non-None only)
-        if voice_name != 'default' and voice_name in self.app_config.voices:
-            voice = self.app_config.voices[voice_name]
-            voice_dict = voice.model_dump()
+        # Delegate to canonical merger
+        try:
+            from src.voice_params import get_voice_params as _merge_voice_params
+            params = _merge_voice_params(self.app_config, voice_name, overrides)
+        except Exception as e:
+            logger.warning(f"Delegation to voice_params merger failed: {e}; falling back to internal resolution")
+            # Fallback to internal flat resolution if import fails
+            params = {}
             for param, param_type in self.PARAM_SPECS.items():
-                value = self._get_nested_value(voice, param, param_type)
-                if value is not None:  # Only override if set in voice
-                    params[param] = value
-
-        params['voice_name'] = voice_name
-
-        # Overrides (safe, with type coercion)
-        if overrides:
-            for param, value in overrides.items():
-                if param in self.PARAM_SPECS:
-                    param_type = self.PARAM_SPECS[param]
-                    try:
-                        if param_type == bool:
-                            params[param] = bool(value)
-                        elif param_type == int:
-                            params[param] = int(float(value))
-                        elif param_type == float:
-                            params[param] = float(value)
-                        else:
-                            params[param] = str(value)
-                    except:
-                        logger.warning(f"Invalid override {param}={value}; keeping {params[param]}")
+                params[param] = self._get_nested_value(self.app_config.globals, param, param_type)
+            if voice_name != 'default' and voice_name in self.app_config.voices:
+                voice = self.app_config.voices[voice_name]
+                for param, param_type in self.PARAM_SPECS.items():
+                    value = self._get_nested_value(voice, param, param_type)
+                    if value is not None:
+                        params[param] = value
+            params['voice_name'] = voice_name
+            if overrides:
+                for param, value in overrides.items():
+                    if param in self.PARAM_SPECS:
+                        param_type = self.PARAM_SPECS[param]
+                        try:
+                            if param_type == bool:
+                                params[param] = bool(value)
+                            elif param_type == int:
+                                params[param] = int(float(value))
+                            elif param_type == float:
+                                params[param] = float(value)
+                            else:
+                                params[param] = str(value)
+                        except Exception:
+                            pass
 
         # FIXED: Cache the result
         self._merged_cache[cache_key] = params
@@ -399,7 +421,13 @@ class Config:
         return params
 
     def _get_nested_value(self, obj: Any, param: str, param_type: type, default: Any = None) -> Any:
-        """Helper: Get nested value via chained getattr (for params; type coercion)."""
+        """Helper: Get nested value via chained getattr (for params; type coercion).
+
+        Enhanced: If the immediate attribute is not present on a Globals object,
+        look inside known sub-models (tts, audio, fuzzy) for a field with the same name.
+        This allows flat PARAM_SPECS keys to resolve nested config fields without
+        forcing dotted names.
+        """
         val = obj
         # Handle nested params (e.g., 'fuzzy.threshold' – split if needed, but PARAM_SPECS are flat)
         parts = [param]  # Most are flat; if nested, split (e.g., for 'tts.temperature')
@@ -422,6 +450,22 @@ class Config:
             if val is None:
                 return default
         else:
+            # Enhanced: If we're at a Globals object, search within tts/audio/fuzzy sub-models
+            try:
+                # Only attempt if obj looks like a Globals model (has these attributes)
+                sub_candidates = []
+                for sub_name in ('tts', 'audio', 'fuzzy'):
+                    if hasattr(obj, sub_name):
+                        sub_candidates.append(getattr(obj, sub_name))
+                for sub in sub_candidates:
+                    if hasattr(sub, param):
+                        sub_val = getattr(sub, param)
+                        return default if sub_val is None else sub_val
+                    elif isinstance(sub, dict) and param in sub:
+                        sub_val = sub.get(param)
+                        return default if sub_val is None else sub_val
+            except Exception:
+                pass
             return default
 
         try:
