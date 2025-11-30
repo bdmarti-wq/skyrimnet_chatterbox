@@ -227,3 +227,39 @@ If you find this model useful, please consider citing.
 ```
 # Disclaimer
 Don't use this model to do bad things. Prompts are sourced from freely available data on the internet.
+
+---
+
+## Developer notes: single-source modules and refactors
+
+This project now centralizes several cross-cutting concerns into small focused utilities to keep the code DRY, easier to test, and consistent across layers (UI/bridge/pipeline/caches):
+
+- Voice parameter merging: `src/voice_params.py::get_voice_params`
+  - Precedence: models defaults < globals (tts/audio) < per-voice overrides < per-request overrides.
+  - `config.get_voice_params(...)` delegates to this canonical merger with LRU caching.
+
+- Audio path validation: `src/audio/paths.py`
+  - `sanitize_input_path(path)` for lightweight UI/bridge sanity.
+  - `validate_user_audio(path, min_dur)` as the single authority for file existence/duration/waveform checks.
+  - Used by pipeline phases and caches for consistent behavior.
+
+- Cache key generation: `src/cache_keys.py::generate_audio_cache_key`
+  - Single source of truth for audio/fuzzy cache keys and context-generated keys.
+
+- Conditionals validity: `src/generate/cache/conditionals_utils.py`
+  - `is_valid_conditionals(obj)` and `is_mock_conditionals(obj)` shared by caches and phases.
+
+- Output formatting for UI/API: `src/output_utils.py::format_output`
+  - Standardizes return shape and provides a reusable silence WAV fallback (via `src/audio_fallbacks.py`).
+
+- Config persistence service: `src/config/service.py::save_voice_overrides`
+  - Diffs overrides against the effective baseline and writes only changes; creates timestamped backups.
+
+- Post-processing modularization: `src/audio/`
+  - Stateless numpy-based transforms in `transforms.py` (trim, gate, filters, rate, fade).
+  - Pipeline phase delegates to these helpers to stay thin and testable.
+
+Other notable changes:
+- Removed legacy `cfgw` field; canonical internal name is `cfg_weight`.
+- Fuzzy indexing happens after successful generation in the Output phase; a simple in-process idempotency guard avoids duplicate indexing of the same key.
+- Conditionals cache now tracks `purges` separately from `misses` for accurate metrics.

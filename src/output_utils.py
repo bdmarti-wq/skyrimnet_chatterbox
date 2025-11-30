@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, Optional, List
 import tempfile
 
-from src.audio_fallbacks import get_fallback_wav
+from src.audio.fallbacks import get_fallback_wav
 from src.config import get_config
 
 

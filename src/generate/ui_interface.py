@@ -25,7 +25,7 @@ from src.tts_model import ModelManager, GEN_ACTIVE_LOCK
 from src.generate.pipeline.context import AudioGenerationContext
 from src.generate.cache.cache_manager import CacheManager, get_cache_manager
 from src.seeding import cpp_uuid_to_seed, resolve_seed
-from src.audio_paths import sanitize_input_path
+from src.audio import sanitize_input_path
 from src.output_utils import format_output
 
 # Cache for hot reloads (loaded model/config)

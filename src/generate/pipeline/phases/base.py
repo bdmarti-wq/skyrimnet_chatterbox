@@ -6,7 +6,7 @@ from src.generate.pipeline.context import AudioGenerationContext
 import torch
 from pathlib import Path
 import torchaudio
-from src.audio_paths import validate_user_audio
+from src.audio import validate_user_audio
 from src.generate.cache.conditionals_utils import is_valid_conditionals
 
 class BaseGenerationPhase:

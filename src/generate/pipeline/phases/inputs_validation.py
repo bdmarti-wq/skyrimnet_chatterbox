@@ -2,7 +2,7 @@ from pathlib import Path
 from typing import Optional
 import torch
 
-from src.audio_utils import pad_short_text
+from src.audio import pad_short_text
 from .base import BaseGenerationPhase
 from ...pipeline.context import AudioGenerationContext
 from loguru import logger

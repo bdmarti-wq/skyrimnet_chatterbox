@@ -11,7 +11,7 @@ from .base import BaseGenerationPhase
 from ...pipeline.context import AudioGenerationContext
 from ...cache.voice_reference import VoiceReferenceCache  # For process_voice_reference call
 from loguru import logger
-from src.audio_utils import is_artifact_laden  # For validate_cached_audio
+from src.audio import is_artifact_laden  # For validate_cached_audio
 
 
 class CacheCheckPhase(BaseGenerationPhase):

@@ -14,7 +14,7 @@ from loguru import logger
 # Imports for safe config access (matches audio_cache)
 from src.config import get_config, get_config_value
 
-from src.audio_utils import is_artifact_laden
+from src.audio import is_artifact_laden
 from src.normalize_stem import normalize_stem
 
 class FuzzyAudioCache:

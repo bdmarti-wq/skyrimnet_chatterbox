@@ -16,8 +16,8 @@ from .conditionals_cache import ConditionalsCache
 from .fuzzy_cache import FuzzyAudioCache
 from .voice_reference import VoiceReferenceCache, VoiceReferenceEntry
 from ..pipeline import AudioGenerationContext
-from ...audio_utils import is_artifact_laden
-from ...audio_paths import validate_user_audio
+from src.audio import is_artifact_laden
+from src.audio import validate_user_audio
 from ...normalize_stem import normalize_stem
 
 

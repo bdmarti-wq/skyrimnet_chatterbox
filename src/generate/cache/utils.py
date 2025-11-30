@@ -39,7 +39,7 @@ import threading  # Ensure imported (likely already is)
 
 
 from src.config import get_config, get_config_value, find_project_root
-from src.audio_utils import is_artifact_laden  # Import for artifact check
+from src.audio import is_artifact_laden  # Import for artifact check
 import hashlib
 from threading import Thread
 from pathlib import Path

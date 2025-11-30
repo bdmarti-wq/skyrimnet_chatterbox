@@ -34,7 +34,6 @@ class AudioGenerationContext:
     exaggeration: float = field(default=0.5, init=True, repr=True)
     temperature: float = field(default=0.7, init=True, repr=True)
     cfg_weight: float = field(default=0.45, init=True, repr=True)
-    cfgw: float = field(default=0.45, init=True, repr=False)  # Legacy
     min_p: float = field(default=0.05, init=True, repr=True)
     top_p: float = field(default=1.0, init=True, repr=True)
     repetition_penalty: float = field(default=1.2, init=True, repr=True)
@@ -174,8 +173,6 @@ class AudioGenerationContext:
         # Legacy compatibility
         if self.seed is None and self.seed_num != 42:
             object.__setattr__(self, 'seed', self.seed_num)
-        if self.cfgw != 0.45 and self.cfg_weight == 0.45:
-            object.__setattr__(self, 'cfg_weight', self.cfgw)
 
         # REFACTORED: Override defaults with config if provided (lazy; use get_globals below)
         if self.config is not None:

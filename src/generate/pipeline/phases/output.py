@@ -8,7 +8,7 @@ from loguru import logger
 
 from src.config import get_config
 from src.generate.cache import CacheManager  # For fuzzy/exact
-from src.audio_utils import get_silence  # For silence fallback
+from src.audio import get_silence  # For silence fallback
 from .base import BaseGenerationPhase
 from ...cache.cache_manager import get_cache_manager
 from ...pipeline.context import AudioGenerationContext
@@ -18,6 +18,8 @@ class OutputPhase(BaseGenerationPhase):
     """Saves generated audio to file and caches for reuse. FIXED: Direct set_audio_cache after save (sync, log)."""
 
     process_after_cache = True  # Always run (verify even on HIT)
+    # In-process idempotency guard to avoid duplicate fuzzy indexing for the same cache_key
+    _recent_indexed_keys: set[str] = set()
 
     def __init__(self, cache_manager=None):
         self.cache_manager = cache_manager or get_cache_manager(get_config())  # Fallback
@@ -100,13 +102,18 @@ class OutputPhase(BaseGenerationPhase):
                 # FIXED: Always index for fuzzy (post-save, after exact set) – moved here from UI
                 if hasattr(self.cache_manager, 'index_audio_for_fuzzy'):
                     try:
-                        self.cache_manager.index_audio_for_fuzzy(
-                            text=context.text or "",
-                            audio_path=str(output_path),
-                            voice_stem=voice_stem
-                        )
-                        logger.debug(
-                            f"Indexed audio for fuzzy: '{context.text[:30]}...' → {output_path.name} (stem={voice_stem})")
+                        # Idempotency guard: avoid re-indexing the same cache key repeatedly in one process
+                        if cache_key not in self._recent_indexed_keys:
+                            self.cache_manager.index_audio_for_fuzzy(
+                                text=context.text or "",
+                                audio_path=str(output_path),
+                                voice_stem=voice_stem
+                            )
+                            self._recent_indexed_keys.add(cache_key)
+                            logger.debug(
+                                f"Indexed audio for fuzzy: '{context.text[:30]}...' → {output_path.name} (stem={voice_stem})")
+                        else:
+                            logger.debug(f"Skip duplicate fuzzy index for {cache_key[:20]}... (already indexed)")
                     except Exception as fuzzy_e:
                         logger.warning(f"Failed to index for fuzzy: {fuzzy_e}")
                     # Legacy async postgen queue (if needed, but direct set/index preferred)
@@ -143,7 +150,7 @@ class OutputPhase(BaseGenerationPhase):
         if hasattr(self, 'context') and hasattr(self.context, 'processed_wav') and self.context.processed_wav is not None:
             wav_to_save = self.context.processed_wav.cpu().float()
         else:
-            from src.audio_utils import get_silence
+            from src.audio import get_silence
             wav_to_save = get_silence(duration=2.0, sr=sr_final, dtype=torch.float32, device=torch.device('cpu'))
 
         if wav_to_save is None or wav_to_save.numel() == 0:
@@ -169,7 +176,7 @@ class OutputPhase(BaseGenerationPhase):
         sr_final = int(sr)
 
         duration = 2.0
-        from src.audio_utils import get_silence
+        from src.audio import get_silence
         silence = get_silence(duration=duration, sr=sr_final, dtype=torch.float32, device=torch.device('cpu'))
         if silence is None or silence.numel() == 0:
             logger.error("Temp silence creation failed")

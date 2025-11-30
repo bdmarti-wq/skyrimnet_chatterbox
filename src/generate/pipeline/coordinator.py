@@ -105,6 +105,7 @@ class GenerationCoordinator:
         if context.cache_manager and hasattr(context.cache_manager.conditionals_cache, 'get_stats'):
             stats = context.cache_manager.conditionals_cache.get_stats().get('stats', {})
             hits = stats.get('disk_hits', 0) + stats.get('memory_hits', 0)
-            log_msg += f" | conds cache: hits={hits}, misses={stats.get('misses', 0)}"
+            purges = stats.get('purges', 0)
+            log_msg += f" | conds cache: hits={hits}, misses={stats.get('misses', 0)}, purges={purges}"
 
         logger.info(f"[PIPE] {log_msg}")

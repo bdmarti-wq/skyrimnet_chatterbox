@@ -10,9 +10,14 @@ import torchaudio
 from scipy.signal import sosfilt, butter
 from loguru import logger
 
-from src.audio_utils import is_artifact_laden
+from src.audio import is_artifact_laden
 from src.generate.pipeline.phases.base import BaseGenerationPhase
 from src.generate.pipeline.context import AudioGenerationContext
+from src.audio import (
+    apply_post_processing as _np_apply_post,
+    short_padding_trim_head as _ap_short_head,
+    short_trim_padding as _ap_short_trim,
+)
 
 
 def _short_padding_trim_head(y: np.ndarray, sr: int, params: Dict[str, Any]) -> np.ndarray:
@@ -605,7 +610,7 @@ class PostProcessingPhase(BaseGenerationPhase):
             meta = getattr(context, 'meta', {})
             if isinstance(meta, dict) and meta.get('short_padding_active'):
                 before_len = len(wav_np)
-                wav_np = _short_padding_trim_head(wav_np, context.sr, voice_params)
+                wav_np = _ap_short_head(wav_np, context.sr, voice_params)
                 after_len = len(wav_np)
                 if after_len != before_len:
                     logger.debug(f"Short-padding head trim applied: {before_len/context.sr:.2f}s → {after_len/context.sr:.2f}s")
@@ -617,7 +622,7 @@ class PostProcessingPhase(BaseGenerationPhase):
                 threshold_cfg = 0
             if isinstance(meta, dict) and meta.get('short_repeat_active') and threshold_cfg > 0:
                 before = len(wav_np)
-                wav_np = _short_trim_padding(wav_np, context.sr, voice_params)
+                wav_np = _ap_short_trim(wav_np, context.sr, voice_params)
                 after = len(wav_np)
                 if after != before:
                     logger.debug(f"Short-repeat trim_to_last applied: {before/context.sr:.2f}s → {after/context.sr:.2f}s")
@@ -673,7 +678,7 @@ class PostProcessingPhase(BaseGenerationPhase):
                 logger.info("Artifact-laden audio detected – auto-enabling post-processing with safe defaults")
 
             # Hook: apply numpy-based post processing with enabled defaults if artifacts detected
-            processed_np = apply_post_processing(wav_np, context.sr, effective_params, text)
+            processed_np = _np_apply_post(wav_np, context.sr, effective_params, text)
             if processed_np is not None and isinstance(processed_np, np.ndarray) and processed_np.size > 0:
                 wav = torch.from_numpy(processed_np).to(device=device, dtype=dtype)
             else:

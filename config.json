@@ -17,7 +17,7 @@
       "re_optimize_on_reload": false
     },
     "audio": {
-      "enable_post_processing": true,
+      "enable_post_processing": false,
       "enable_post_resample": false,
       "enable_post_jit_gain": true,
       "enable_post_voice_processing": true,

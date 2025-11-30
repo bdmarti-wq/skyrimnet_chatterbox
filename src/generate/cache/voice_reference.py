@@ -9,8 +9,8 @@ from typing import Dict, Any, Optional, Tuple, NamedTuple
 from loguru import logger
 
 from src.config import get_config, get_config_value  # For defaults from config
-from src.audio_paths import validate_user_audio
-from src.audio_utils import is_artifact_laden  # Assume exists; warn if missing
+from src.audio import validate_user_audio
+from src.audio import is_artifact_laden  # re-exported from src.audio.utils
 import torchaudio
 import torch
 
