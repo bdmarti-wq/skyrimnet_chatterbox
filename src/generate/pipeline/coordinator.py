@@ -92,7 +92,10 @@ class GenerationCoordinator:
         audio_dur = context.audio_duration
         rtf_total = audio_dur / total_time if total_time > 0 else float('inf')
         cache_type = getattr(context, 'cache_hit_type', 'miss')
-        core_gen_time = phase_times.get('TTSGenerationPhase', 0)
+        # Phase timing keys use the concrete class name. The generation phase class is named
+        # 'GenerationPhase' (imported as TTSGenerationPhase). Previously this looked up
+        # 'TTSGenerationPhase', which returned 0 and caused an infinite RTF. Check both to be safe.
+        core_gen_time = phase_times.get('GenerationPhase', phase_times.get('TTSGenerationPhase', 0.0))
         core_rtf = audio_dur / core_gen_time if core_gen_time > 0 else float('inf')
 
         log_msg = f"{cache_type.upper()} cycle: {total_time:.2f}s total | {sr//1000}kHz {audio_dur:.2f}s | RTF total: {rtf_total:.2f}x | core gen RTF: {core_rtf:.2f}x"

@@ -162,8 +162,18 @@ def is_artifact_laden(path: str, threshold_hz: float = 12000.0, ratio_threshold:
         high_energy = np.sum(S[high_mask] ** 2)
         total_energy = np.sum(S ** 2) + 1e-12
         ratio = float(high_energy / total_energy)
-        logger.debug(f"artifact ratio={ratio:.3f} (thr={ratio_threshold:.2f}) for {Path(path).name}")
-        return ratio >= float(ratio_threshold)
+        flagged = ratio >= float(ratio_threshold)
+        if flagged:
+            # Surface only true positives at INFO level
+            logger.info(
+                f"artifact ratio={ratio:.3f} (thr={ratio_threshold:.2f}) for {Path(path).name}"
+            )
+        else:
+            # Downgrade routine measurement logs to TRACE to avoid log spam
+            logger.trace(
+                f"artifact ratio={ratio:.3f} (thr={ratio_threshold:.2f}) for {Path(path).name}"
+            )
+        return flagged
     except Exception as e:
         logger.debug(f"Artifact detect failed for {path}: {e}")
         return False
