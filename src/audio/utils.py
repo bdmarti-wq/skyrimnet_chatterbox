@@ -140,40 +140,42 @@ def _rms(audio: np.ndarray) -> float:
     return float(np.sqrt(np.mean(audio ** 2) + 1e-12))
 
 
-def is_artifact_laden(path: str, threshold_hz: float = 12000.0, ratio_threshold: float = 0.5) -> bool:
-    """Heuristic: detect high-frequency artifacts by measuring energy ratio above a threshold.
+def is_artifact_laden_array(y: np.ndarray, sr: int, threshold_hz: float = 12000.0, ratio_threshold: float = 0.5,
+                            n_fft: int = 1024, hop_length: int = 256) -> bool:
+    """Heuristic detector on in-memory array. Returns True if high-band energy ratio is large.
 
-    Args:
-        path: WAV file path
-        threshold_hz: frequency above which to consider energy as artifact
-        ratio_threshold: fraction of total energy considered high-frequency to flag as artifact
+    Uses a smaller FFT by default for performance. Caller provides y (mono float) and sr.
     """
     try:
-        y, sr = librosa.load(path, sr=None, mono=True)
-        if y.size == 0 or sr <= 0:
+        if y is None or y.size == 0 or sr <= 0:
             return False
-        # STFT
-        S = np.abs(librosa.stft(y, n_fft=2048, hop_length=512))
-        freqs = librosa.fft_frequencies(sr=sr, n_fft=2048)
-        # Split bands
+        y = y.astype(np.float32, copy=False)
+        S = np.abs(librosa.stft(y, n_fft=int(n_fft), hop_length=int(hop_length)))
+        freqs = librosa.fft_frequencies(sr=sr, n_fft=int(n_fft))
         high_mask = freqs >= float(threshold_hz)
         if not np.any(high_mask):
             return False
-        high_energy = np.sum(S[high_mask] ** 2)
-        total_energy = np.sum(S ** 2) + 1e-12
-        ratio = float(high_energy / total_energy)
+        # Sum power in high band vs total
+        high_energy = float(np.sum(S[high_mask] ** 2))
+        total_energy = float(np.sum(S ** 2) + 1e-12)
+        ratio = high_energy / total_energy
         flagged = ratio >= float(ratio_threshold)
+        # Log sparingly
         if flagged:
-            # Surface only true positives at INFO level
-            logger.info(
-                f"artifact ratio={ratio:.3f} (thr={ratio_threshold:.2f}) for {Path(path).name}"
-            )
+            logger.info(f"artifact ratio={ratio:.3f} (thr={ratio_threshold:.2f}) in-memory")
         else:
-            # Downgrade routine measurement logs to TRACE to avoid log spam
-            logger.trace(
-                f"artifact ratio={ratio:.3f} (thr={ratio_threshold:.2f}) for {Path(path).name}"
-            )
+            logger.trace(f"artifact ratio={ratio:.3f} (thr={ratio_threshold:.2f}) in-memory")
         return flagged
+    except Exception as e:
+        logger.debug(f"Artifact detect (array) failed: {e}")
+        return False
+
+
+def is_artifact_laden(path: str, threshold_hz: float = 12000.0, ratio_threshold: float = 0.5) -> bool:
+    """File-path wrapper for artifact detection, delegates to array-based detector."""
+    try:
+        y, sr = librosa.load(path, sr=None, mono=True)
+        return is_artifact_laden_array(y, sr, threshold_hz=threshold_hz, ratio_threshold=ratio_threshold)
     except Exception as e:
         logger.debug(f"Artifact detect failed for {path}: {e}")
         return False

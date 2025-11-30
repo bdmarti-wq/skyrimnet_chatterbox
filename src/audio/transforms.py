@@ -8,11 +8,15 @@ Moved from src/audio_post/transforms.py to src/audio/transforms.py
 """
 from __future__ import annotations
 
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 import numpy as np
-from scipy.signal import sosfilt, butter
+from scipy.signal import sosfilt, butter, sosfiltfilt
 from loguru import logger
 import librosa
+import torch
+import torchaudio
+
+from .post_config import PostParams, normalize_post_params
 
 
 def short_padding_trim_head(y: np.ndarray, sr: int, params: Dict[str, Any]) -> np.ndarray:
@@ -106,48 +110,87 @@ def short_trim_padding(y: np.ndarray, sr: int, params: Dict[str, Any]) -> np.nda
         return y
 
 
-def trim_trailing_artifacts(audio: np.ndarray, sr: int, tail_threshold_db: float = -45.0, tail_fraction: float = 0.2) -> np.ndarray:
-    if audio.size == 0:
+def trim_trailing_artifacts(audio: np.ndarray, sr: int,
+                            tail_threshold_db: Optional[float] = None,
+                            tail_fraction: Optional[float] = None) -> np.ndarray:
+    """Trim low-level tail based on global RMS and dB threshold.
+
+    None parameters mean skip (no-op).
+    """
+    if audio.size == 0 or tail_threshold_db is None or tail_fraction is None:
         return audio
     try:
-        rms = np.sqrt(np.mean(audio ** 2) + 1e-12)
-        thr = 10 ** (tail_threshold_db / 20.0)
-        min_len = max(1, int(len(audio) * (1.0 - tail_fraction)))
+        rms = float(np.sqrt(np.mean(audio ** 2) + 1e-12))
+        thr = 10 ** (float(tail_threshold_db) / 20.0)
+        tf = max(0.0, min(1.0, float(tail_fraction)))
+        min_len = max(1, int(len(audio) * (1.0 - tf)))
         last_idx = len(audio) - 1
-        for i in range(len(audio) - 1, min_len, -1):
-            if abs(audio[i]) > thr * rms:
-                last_idx = i
-                break
+        # Vectorized search from the end: find last index above threshold
+        segment = audio[min_len:]
+        idx = np.where(np.abs(segment) > thr * rms)[0]
+        if idx.size > 0:
+            last_idx = min_len + int(idx[-1])
+        else:
+            last_idx = min_len
         return audio[:last_idx + 1]
     except Exception:
         return audio
 
 
-def gate_trailing_phantoms(audio: np.ndarray, sr: int, gate_threshold: float = 0.05, tail_fraction: float = 0.3) -> np.ndarray:
-    if audio.size == 0:
+def gate_trailing_phantoms(audio: np.ndarray, sr: int,
+                           gate_threshold: Optional[float] = None,
+                           tail_fraction: Optional[float] = None,
+                           smooth_ms: float = 10.0) -> np.ndarray:
+    """Soft-gate the tail below threshold with a short smoothing envelope.
+
+    None parameters mean skip. Uses a raised-cosine fade to reduce clicks.
+    """
+    if audio.size == 0 or gate_threshold is None or tail_fraction is None:
         return audio
     try:
         gate_thr = max(0.0, float(gate_threshold))
+        tf = max(0.0, min(1.0, float(tail_fraction)))
+        end = len(audio)
+        start = int(end * (1.0 - tf))
+        tail = audio[start:end]
+        mask = (np.abs(tail) < gate_thr).astype(np.float32)
+        if mask.size == 0:
+            return audio
+        # Smooth mask with a short fade on both sides
+        smooth = max(1, int(sr * (smooth_ms / 1000.0)))
+        if 2 * smooth < mask.size:
+            window = np.ones_like(mask)
+            ramp = 0.5 - 0.5 * np.cos(np.linspace(0, np.pi, smooth))
+            window[:smooth] = ramp
+            window[-smooth:] = ramp[::-1]
+            mask = mask * window
+        # Apply gating by blending towards zero
+        audio[start:end] = tail * (1.0 - mask)  # where mask==1 → zero
+        return audio
     except Exception:
-        gate_thr = 0.05
-    end = len(audio)
-    start = int(end * (1.0 - tail_fraction))
-    audio[start:end] = np.where(np.abs(audio[start:end]) < gate_thr, 0.0, audio[start:end])
-    return audio
+        return audio
 
 
-def suppress_tail_artifacts(audio: np.ndarray, sr: int, tail_fraction: float = 0.25, low_hz: float = 2000.0, high_hz: float = 4000.0, strength: float = 0.6) -> np.ndarray:
-    if audio.size == 0:
+def suppress_tail_artifacts(audio: np.ndarray, sr: int,
+                            tail_fraction: Optional[float] = None,
+                            low_hz: Optional[float] = None,
+                            high_hz: Optional[float] = None,
+                            strength: Optional[float] = None) -> np.ndarray:
+    if audio.size == 0 or tail_fraction is None or low_hz is None or high_hz is None or strength is None:
         return audio
     try:
         low = float(low_hz) / (sr / 2.0)
         high = float(high_hz) / (sr / 2.0)
-        sos = butter(2, [low, high], btype='band', output='sos')
-        tail_len = int(len(audio) * float(tail_fraction))
+        sos = butter(4, [low, high], btype='band', output='sos')
+        tail_len = int(len(audio) * float(max(0.0, min(1.0, tail_fraction))))
         if tail_len <= 0:
             return audio
         tail = audio[-tail_len:]
-        filtered = sosfilt(sos, tail)
+        # zero-phase filtering to avoid phase lag
+        try:
+            filtered = sosfiltfilt(sos, tail)
+        except Exception:
+            filtered = sosfilt(sos, tail)
         alpha = max(0.0, min(1.0, float(strength)))
         audio[-tail_len:] = (1.0 - alpha) * tail + alpha * (tail - filtered)
         return audio
@@ -156,47 +199,71 @@ def suppress_tail_artifacts(audio: np.ndarray, sr: int, tail_fraction: float = 0
         return audio
 
 
-def reverse_tail_suppress(audio: np.ndarray, sr: int, tail_sec: float = 0.2, onset_threshold: float = 0.3) -> np.ndarray:
-    if audio.size == 0:
+def reverse_tail_suppress(audio: np.ndarray, sr: int,
+                          tail_sec: Optional[float] = None,
+                          onset_threshold: Optional[float] = None,
+                          fade_ms: float = 10.0) -> np.ndarray:
+    if audio.size == 0 or tail_sec is None or onset_threshold is None:
         return audio
     try:
-        n = int(sr * float(tail_sec))
+        n = int(sr * float(max(0.0, tail_sec)))
         n = min(n, len(audio))
+        if n <= 0:
+            return audio
         tail = audio[-n:]
         rev = tail[::-1].copy()
         thr = float(onset_threshold)
-        idx = np.argmax(np.abs(rev) > thr)
-        if idx > 0:
+        over = np.where(np.abs(rev) > thr)[0]
+        if over.size > 0:
+            idx = int(over[0])
             cut = len(audio) - idx
-            return audio[:cut]
+            out = audio[:cut].copy()
+            # apply short fade-out at the end to avoid click
+            fm = int(sr * (fade_ms / 1000.0))
+            fm = min(fm, out.size)
+            if fm > 1:
+                fade = np.linspace(1.0, 0.0, fm)
+                out[-fm:] *= fade
+            return out
         return audio
     except Exception as e:
         logger.debug(f"reverse_tail_suppress failed: {e}")
         return audio
 
 
-def apply_notch(audio: np.ndarray, sr: int, low_hz: float = 8000.0, high_hz: float = 11000.0, gain_db: float = -12.0) -> np.ndarray:
-    if audio.size == 0:
+def apply_notch(audio: np.ndarray, sr: int,
+                low_hz: Optional[float] = None,
+                high_hz: Optional[float] = None,
+                gain_db: Optional[float] = None) -> np.ndarray:
+    if audio.size == 0 or gain_db is None or gain_db >= 0 or low_hz is None or high_hz is None:
         return audio
     try:
         w1 = float(low_hz) / (sr / 2.0)
         w2 = float(high_hz) / (sr / 2.0)
-        sos = butter(2, [w1, w2], btype='band', output='sos')
-        out = sosfilt(sos, audio)
-        g = 10 ** (float(gain_db) / 20.0)
+        sos = butter(4, [w1, w2], btype='band', output='sos')
+        try:
+            out = sosfiltfilt(sos, audio)
+        except Exception:
+            out = sosfilt(sos, audio)
+        g = 10 ** (float(abs(gain_db)) / 20.0)
         return audio - g * out
     except Exception as e:
         logger.debug(f"apply_notch failed: {e}")
         return audio
 
 
-def apply_eq(audio: np.ndarray, sr: int, gain_db: float = 0.0, cutoff_hz: float = 3000.0) -> np.ndarray:
-    if audio.size == 0 or gain_db == 0.0:
+def apply_eq(audio: np.ndarray, sr: int,
+             gain_db: Optional[float] = None,
+             cutoff_hz: Optional[float] = None) -> np.ndarray:
+    if audio.size == 0 or gain_db is None or gain_db == 0 or cutoff_hz is None:
         return audio
     try:
         w = float(cutoff_hz) / (sr / 2.0)
-        sos = butter(2, w, btype='low', output='sos') if gain_db > 0 else butter(2, w, btype='high', output='sos')
-        out = sosfilt(sos, audio)
+        sos = butter(4, w, btype='low', output='sos') if gain_db > 0 else butter(4, w, btype='high', output='sos')
+        try:
+            out = sosfiltfilt(sos, audio)
+        except Exception:
+            out = sosfilt(sos, audio)
         g = 10 ** (abs(float(gain_db)) / 20.0)
         if gain_db > 0:
             return audio + g * out
@@ -207,20 +274,39 @@ def apply_eq(audio: np.ndarray, sr: int, gain_db: float = 0.0, cutoff_hz: float 
         return audio
 
 
-def adjust_speaking_rate(audio: np.ndarray, rate: float = 1.0) -> np.ndarray:
-    if audio.size == 0 or rate == 1.0:
+def adjust_speaking_rate(audio: np.ndarray, rate: Optional[float] = None) -> np.ndarray:
+    """Time-stretch using torchaudio TimeStretch (phase vocoder). None/≈1.0 → no-op.
+
+    Fallback to librosa for robustness if torchaudio path fails.
+    """
+    if audio.size == 0 or rate is None or abs(float(rate) - 1.0) < 1e-3:
         return audio
     try:
-        rate = max(0.5, min(1.5, float(rate)))
-        out = librosa.effects.time_stretch(audio.astype(np.float32), rate=rate)
-        return out.astype(np.float32)
+        rate_f = float(rate)
+        rate_f = max(0.5, min(1.5, rate_f))
+        # Torch STFT
+        n_fft = 1024
+        hop = 256
+        win = torch.hann_window(n_fft)
+        x = torch.from_numpy(audio.astype(np.float32))
+        X = torch.stft(x, n_fft=n_fft, hop_length=hop, window=win, return_complex=True)
+        # torchaudio TimeStretch expects complex with shape (..., freq, time)
+        ts = torchaudio.transforms.TimeStretch(hop_length=hop, n_freq=X.size(0))
+        Y = ts(X.unsqueeze(0), rate_f).squeeze(0)
+        y = torch.istft(Y, n_fft=n_fft, hop_length=hop, window=win, length=audio.size)
+        return y.numpy().astype(np.float32)
     except Exception as e:
-        logger.debug(f"adjust_speaking_rate failed: {e}")
-        return audio
+        logger.debug(f"adjust_speaking_rate (torchaudio) failed: {e}; falling back to librosa")
+        try:
+            out = librosa.effects.time_stretch(audio.astype(np.float32), rate=float(rate))
+            return out.astype(np.float32)
+        except Exception as ee:
+            logger.debug(f"adjust_speaking_rate (librosa) failed: {ee}")
+            return audio
 
 
 def apply_fade(audio: np.ndarray, sr: int, fade_ms: float | None = 20.0) -> np.ndarray:
-    if audio.size == 0 or fade_ms is None:
+    if audio.size == 0 or fade_ms is None or float(fade_ms) <= 0:
         return audio
     try:
         fade_samples = int(sr * (float(fade_ms) / 1000.0))
@@ -237,83 +323,73 @@ def apply_fade(audio: np.ndarray, sr: int, fade_ms: float | None = 20.0) -> np.n
     return audio
 
 
-def apply_post_processing(wav_np: np.ndarray, sr: int, params: dict | None = None, text: str = '') -> np.ndarray:
-    """Top-level helper that composes the above transforms using params dict."""
-    if params is None:
-        logger.debug("Post params missing/empty – no-op")
-        return wav_np
-    enable_post = params.get('enable_post_processing', False)
-    if not enable_post:
-        logger.debug("Post disabled or not enabled – no-op")
+def apply_post_processing(wav_np: np.ndarray, sr: int, params: dict | PostParams | None = None, text: str = '') -> np.ndarray:
+    """Compose transforms using None-as-noop semantics via PostParams.
+
+    - If params is None or enable flag is False → passthrough.
+    - Only transforms with non-None controller params are applied.
+    """
+    pp = normalize_post_params(params)
+    if not pp.enable_post_processing:
+        logger.debug("Post disabled – no-op passthrough")
         return wav_np
 
-    voice_name = params.get('voice_name', 'unknown')
-    non_none_params = {k: v for k, v in params.items() if v is not None}
-    logger.debug(f"Post params for {voice_name}: {non_none_params}")
+    voice_name = pp.voice_name or 'unknown'
+    logger.debug(f"Post params for {voice_name} (None=skip)")
 
+    if wav_np.size == 0:
+        min_sec = pp.min_post_duration_sec if pp.min_post_duration_sec is not None else 0.5
+        min_samples = int(sr * float(min_sec))
+        return np.zeros(min_samples, dtype=np.float32)
+
+    # Light tail fixes for short vocalizes
     text = text or ''
     is_vocalize = len(text.strip()) <= 3 and text.lower() in ['ah', 'oh', 'aah', 'mmm', 'uh', 'mmh', 'eh']
     light_mode = is_vocalize or len(text) < 10
-    if light_mode:
-        logger.debug(f"Vocalize/short '{text}' – applying light tail fixes PLUS full heavy post")
+    if light_mode and pp.trailing_silence_db is not None:
+        # derive tail_fraction preference if provided via pp.tail_fraction
+        tf = pp.tail_fraction
+        if tf is None and pp.tail_suppress_sec is not None:
+            dur = max(1, wav_np.size)
+            tf = min(0.9, max(0.0, (pp.tail_suppress_sec * sr) / dur))
+        wav_np = trim_trailing_artifacts(wav_np, sr, pp.trailing_silence_db, tf if tf is not None else 0.2)
 
-    if wav_np.size == 0:
-        min_dur_sec = params.get('min_post_duration_sec', 0.5)
-        min_samples = int(sr * min_dur_sec)
-        silence = np.zeros(min_samples, dtype=np.float32)
-        logger.warning("Empty input – raw fallback")
-        return silence
+    # Heavy transforms (apply only when their params are provided)
+    if pp.gate_threshold is not None:
+        tf = pp.tail_fraction
+        if tf is None and pp.tail_suppress_sec is not None:
+            dur = max(1, wav_np.size)
+            tf = min(0.9, max(0.0, (pp.tail_suppress_sec * sr) / dur))
+        wav_np = gate_trailing_phantoms(wav_np, sr, pp.gate_threshold, tf if tf is not None else 0.3)
 
-    # Light tail-focused fixes
-    tail_threshold_db = params.get('trailing_silence_db', -45.0)
-    if light_mode:
-        wav_np = trim_trailing_artifacts(wav_np, sr, tail_threshold_db)
-        logger.debug("Light post: Tail fixes for phantoms")
+    wav_np = suppress_tail_artifacts(wav_np, sr,
+                                     tail_fraction=pp.tail_fraction if pp.tail_fraction is not None else (
+                                         min(0.9, max(0.0, (pp.tail_suppress_sec * sr) / max(1, wav_np.size)))
+                                         if pp.tail_suppress_sec is not None else None
+                                     ),
+                                     low_hz=pp.tail_suppress_low_hz,
+                                     high_hz=pp.tail_suppress_high_hz,
+                                     strength=pp.tail_suppress_strength)
 
-    # Heavy transforms
-    gate_threshold = params.get('gate_threshold', 0.05)
-    wav_np = gate_trailing_phantoms(wav_np, sr, gate_threshold)
-    tail_fraction_val = params.get('tail_suppress_sec', 0.2)
+    wav_np = reverse_tail_suppress(wav_np, sr, tail_sec=pp.tail_suppress_sec, onset_threshold=pp.tail_onset_threshold)
+
+    wav_np = apply_notch(wav_np, sr, pp.notch_low_hz, pp.notch_high_hz, pp.notch_gain_db)
+    wav_np = apply_eq(wav_np, sr, pp.eq_gain_db, pp.eq_cutoff_hz)
+
+    wav_np = adjust_speaking_rate(wav_np, pp.speaking_rate)
+
     try:
-        tail_fractions = 0.25 if tail_fraction_val is None else float(tail_fraction_val)
-    except Exception:
-        tail_fractions = 0.25
-    low_hz = params.get('tail_suppress_low_hz', 2000)
-    high_hz = params.get('tail_suppress_high_hz', 4000)
-    strength = params.get('tail_suppress_strength', 0.6)
-    wav_np = suppress_tail_artifacts(wav_np, sr, tail_fraction=tail_fractions, low_hz=low_hz, high_hz=high_hz, strength=strength)
-    onset_thresh = params.get('tail_onset_threshold', 0.3)
-    wav_np = reverse_tail_suppress(wav_np, sr, tail_sec=0.2, onset_threshold=onset_thresh)
-
-    notch_gain = params.get('notch_gain_db', 0)
-    notch_low = params.get('notch_low_hz', 8000)
-    notch_high = params.get('notch_high_hz', 11000)
-    if notch_gain < 0:
-        wav_np = apply_notch(wav_np, sr, notch_low, notch_high, notch_gain)
-
-    eq_gain_db = params.get('eq_gain_db', 0.0)
-    eq_cutoff = params.get('eq_cutoff_hz', 3000)
-    if eq_gain_db != 0.0:
-        wav_np = apply_eq(wav_np, sr, eq_gain_db, eq_cutoff)
-
-    rate = params.get('speaking_rate', 1.0)
-    if abs(rate - 1.0) > 0.05:
-        wav_np = adjust_speaking_rate(wav_np, rate)
-
-    fade_ms = params.get('fade_ms', None)
-    try:
-        wav_np = apply_fade(wav_np, sr, fade_ms)
+        wav_np = apply_fade(wav_np, sr, pp.fade_ms)
     except Exception as e:
         logger.debug(f"Fade failed/skipped: {e}")
 
-    gain_max_limit = params.get('gain_max_limit', None)
-    if isinstance(gain_max_limit, (int, float)) and gain_max_limit is not None and gain_max_limit > 0:
+    if pp.gain_max_limit is not None and pp.gain_max_limit > 0:
         peak = float(np.max(np.abs(wav_np))) if wav_np.size > 0 else 0.0
-        if peak > 0 and peak > gain_max_limit:
-            scale = gain_max_limit / peak
+        if peak > 0 and peak > pp.gain_max_limit:
+            scale = pp.gain_max_limit / peak
             wav_np = wav_np * scale
-            logger.debug(f"Applied limiter scale {scale:.3f} to enforce peak≤{gain_max_limit:.3f}")
-        ceiling = min(1.0, float(gain_max_limit))
+            logger.debug(f"Limiter scale {scale:.3f} to enforce peak≤{pp.gain_max_limit:.3f}")
+        ceiling = min(1.0, float(pp.gain_max_limit))
         wav_np = np.clip(wav_np, -ceiling, ceiling)
     else:
         wav_np = np.clip(wav_np, -1.0, 1.0)

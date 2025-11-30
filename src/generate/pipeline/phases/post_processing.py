@@ -10,13 +10,18 @@ import torchaudio
 from scipy.signal import sosfilt, butter
 from loguru import logger
 
-from src.audio import is_artifact_laden
+from src.audio import is_artifact_laden, is_artifact_laden_array
 from src.generate.pipeline.phases.base import BaseGenerationPhase
 from src.generate.pipeline.context import AudioGenerationContext
 from src.audio import (
     apply_post_processing as _np_apply_post,
     short_padding_trim_head as _ap_short_head,
     short_trim_padding as _ap_short_trim,
+)
+from src.audio import (
+    PostParams,
+    normalize_post_params,
+    build_params_from_preset,
 )
 
 
@@ -627,57 +632,26 @@ class PostProcessingPhase(BaseGenerationPhase):
                 if after != before:
                     logger.debug(f"Short-repeat trim_to_last applied: {before/context.sr:.2f}s → {after/context.sr:.2f}s")
 
-            # Auto-detect artifacts using audio_utils.is_artifact_laden (expects a file path)
-            effective_params = dict(voice_params) if isinstance(voice_params, dict) else {}
+            # Build preset-driven params with None-as-noop semantics
+            preset_name = None
+            if isinstance(voice_params, dict):
+                preset_name = voice_params.get('post_preset') or voice_params.get('postprocessing_preset')
+            effective_params = build_params_from_preset(preset_name, voice_params)
             auto_enabled = False
             try:
-                # Save to a temporary wav for analysis
-                with tempfile.NamedTemporaryFile(delete=False, suffix=f"_{context.sr}.wav") as tmp:
-                    tmp_path = tmp.name
-                # Ensure 1-channel [C, N] for save
-                wav_to_save = wav.unsqueeze(0) if wav.dim() == 1 else wav
-                torchaudio.save(tmp_path, wav_to_save.detach().cpu().float(), context.sr)
-                try:
-                    if is_artifact_laden(tmp_path):
-                        # Enable post-processing with safe, simple defaults that mitigate leading/trailing garble
-                        auto_enabled = True
-                        defaults = {
-                            'enable_post_processing': True,
-                            'trailing_silence_db': -45.0,
-                            'gate_threshold': 0.05,
-                            'tail_suppress_sec': 0.2,
-                            'tail_suppress_low_hz': 2000,
-                            'tail_suppress_high_hz': 4000,
-                            'tail_suppress_strength': 0.6,
-                            'tail_onset_threshold': 0.3,
-                            'fade_ms': 15.0,            # light fade to hide clicks
-                            'gain_max_limit': 0.9,      # gentle peak limiter
-                            'min_post_duration_sec': 0.4
-                        }
-                        # Merge: do not overwrite non-default user overrides if present, but force enable_post_processing
-                        for k, v in defaults.items():
-                            if k == 'enable_post_processing':
-                                effective_params[k] = True
-                            else:
-                                if k not in effective_params or effective_params.get(k) in (None, 0, 0.0, False):
-                                    effective_params[k] = v
-                    else:
-                        # No artifacts: keep original params
-                        effective_params = voice_params
-                finally:
-                    try:
-                        os.unlink(tmp_path)
-                    except Exception:
-                        pass
+                if is_artifact_laden_array(wav_np, context.sr):
+                    auto_enabled = True
+                    # Choose a safe preset and merge with overrides
+                    effective_params = build_params_from_preset('light_tail_cleanup', voice_params)
+                    # Ensure enabled
+                    effective_params.enable_post_processing = True
             except Exception as det_e:
-                # If detection fails, proceed with original params
                 logger.debug(f"Artifact detection skipped/failed: {det_e}")
-                effective_params = voice_params
 
             if auto_enabled:
                 logger.info("Artifact-laden audio detected – auto-enabling post-processing with safe defaults")
 
-            # Hook: apply numpy-based post processing with enabled defaults if artifacts detected
+            # Apply numpy-based post processing (None-as-noop params supported)
             processed_np = _np_apply_post(wav_np, context.sr, effective_params, text)
             if processed_np is not None and isinstance(processed_np, np.ndarray) and processed_np.size > 0:
                 wav = torch.from_numpy(processed_np).to(device=device, dtype=dtype)
