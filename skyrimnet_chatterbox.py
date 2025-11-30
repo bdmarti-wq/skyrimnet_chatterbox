@@ -10,7 +10,7 @@ from loguru import logger
 
 # Core application imports (danger: circular risk; we'll be careful)
 from src.config import get_config
-from src.audio_utils import set_torchaudio_backend
+from src.audio import set_torchaudio_backend
 from src.generate.pipeline import AudioGenerationContext
 from src.tts_model import ModelManager, GEN_ACTIVE_LOCK
 from src.ui import create_ui
