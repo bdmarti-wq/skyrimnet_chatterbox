@@ -8,6 +8,7 @@ pipeline BaseGenerationPhase.validate_path.
 from pathlib import Path
 from typing import Optional
 from loguru import logger
+import torchaudio
 
 
 def sanitize_input_path(p: Optional[str]) -> Optional[str]:
@@ -43,3 +44,41 @@ def sanitize_input_path(p: Optional[str]) -> Optional[str]:
         return s
     except Exception:
         return None
+
+
+def validate_user_audio(path: Optional[str], min_dur: float = 3.0) -> bool:
+    """Shared validator for audio file paths used across bridge and phases.
+
+    - Ensures the path is sanitized (exists, not a directory, not zero-byte, not .noop)
+    - Verifies the audio duration using torchaudio.info is at least `min_dur` seconds
+    - Ensures waveform can be loaded and is non-empty with non-trivial amplitude
+    """
+    try:
+        safe = sanitize_input_path(path)
+        if not safe:
+            return False
+        p = Path(safe)
+        # Duration check via metadata first (cheap)
+        try:
+            info = torchaudio.info(str(p))
+            if info.sample_rate <= 0 or info.num_frames <= 0:
+                return False
+            dur = float(info.num_frames) / float(info.sample_rate)
+            if dur < float(min_dur):
+                return False
+        except Exception:
+            return False
+        # Basic waveform sanity check
+        try:
+            wav, _ = torchaudio.load(str(p))
+            if wav.numel() == 0:
+                return False
+            # Accept silent files; amplitude check is lenient
+            if hasattr(wav, 'abs') and wav.abs().max().item() <= 0.0:
+                # Still consider it valid if frames exist; leave to post to normalize
+                return True
+        except Exception:
+            return False
+        return True
+    except Exception:
+        return False

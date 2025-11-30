@@ -9,6 +9,7 @@ from typing import Dict, Any, Optional, Tuple, NamedTuple
 from loguru import logger
 
 from src.config import get_config, get_config_value  # For defaults from config
+from src.audio_paths import validate_user_audio
 from src.audio_utils import is_artifact_laden  # Assume exists; warn if missing
 import torchaudio
 import torch
@@ -366,9 +367,10 @@ class VoiceReferenceCache:
                 logger.error(f"Save failed: {e}")
 
     def validate_voice_prompt(self, audio_path: str, stem: str = None) -> Tuple[bool, str]:
-        """Validate prompt."""
-        if not os.path.exists(audio_path):
-            return False, f"Missing: {audio_path}"
+        """Validate prompt using shared audio validator."""
+        min_duration = get_config_value('globals.min_ref_duration', 3.0)
+        if not validate_user_audio(audio_path, min_dur=min_duration):
+            return False, f"Invalid or too-short: {audio_path}"
 
         if stem is None:
             from src.normalize_stem import normalize_stem

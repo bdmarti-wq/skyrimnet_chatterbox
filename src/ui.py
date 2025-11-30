@@ -31,6 +31,8 @@ warnings.filterwarnings("ignore", message="torchaudio._backend.utils.info has be
 
 # Required for proper config handling
 from src.config.models import AppConfig
+from src.voices import list_available_voice_wavs
+from src.config.service import save_voice_overrides as save_voice_overrides_service
 
 """Consolidated Gradio preprocessing patch: import installs patch via side-effects."""
 try:
@@ -50,33 +52,8 @@ def create_ui(
     config = config or get_config()
 
     def list_voice_wavs() -> list:
-        """Collect available voice reference wavs.
-        Looks in voices_cache_dir and its 'resampled' subfolder.
-        """
-        try:
-            voices_dir = config.app_config.globals.voices_cache_dir
-            if not voices_dir:
-                return []
-            paths = []
-            vdir = Path(voices_dir)
-            # Top-level wavs
-            for p in vdir.glob('*.wav'):
-                try:
-                    paths.append(str(p))
-                except Exception:
-                    continue
-            # Resampled subfolder wavs
-            resampled_dir = vdir / 'resampled'
-            if resampled_dir.exists():
-                for p in resampled_dir.glob('*.wav'):
-                    try:
-                        paths.append(str(p))
-                    except Exception:
-                        continue
-            return sorted(paths)
-        except Exception as e:
-            logger.warning(f"Failed listing voice wavs: {e}")
-            return []
+        voices_dir = config.app_config.globals.voices_cache_dir if hasattr(config, 'app_config') else None
+        return list_available_voice_wavs(voices_dir)
 
     def get_default_params():
         # UI defaults should mirror a normal generate_audio_ui call defaults
@@ -215,12 +192,18 @@ def create_ui(
                 }
 
                 # Build pre-processing overrides (voice-specific) to be applied in-memory for this run
-                pre_overrides = {
-                    'enable_text_padding': bool(text_pad_enable_v),
-                    'text_ellipses_count': int(text_ellipses_cnt_v),
-                    'short_padding_threshold': int(short_padding_thresh_v or 0),
-                    'short_padding_token': str(short_padding_token_v or ""),
-                }
+                # UI override hygiene: include only when deviating from defaults
+                pre_overrides = {}
+                if bool(text_pad_enable_v) is not True:
+                    pre_overrides['enable_text_padding'] = bool(text_pad_enable_v)
+                if int(text_ellipses_cnt_v) != 2:
+                    pre_overrides['text_ellipses_count'] = int(text_ellipses_cnt_v)
+                thresh_val = int(short_padding_thresh_v or 0)
+                if thresh_val > 0:
+                    pre_overrides['short_padding_threshold'] = thresh_val
+                token_val = str(short_padding_token_v or "")
+                if token_val != "":
+                    pre_overrides['short_padding_token'] = token_val
 
                 # Merge pre + post for this request; UI overrides should take precedence for current run
                 vp_overrides = {**pre_overrides, **pp_overrides}
@@ -270,44 +253,17 @@ def create_ui(
                 if not audio_path:
                     return "Cannot save: select or upload a voice .wav to derive voice name."
                 voice_name = normalize_stem(audio_path) or 'default'
-
-                # Write only per-voice overrides
-                to_set = {
-                    'temperature': temp,
-                    'cfg_weight': cfg,
-                    'min_p': minpv,
-                    'top_p': toppv,
-                    'repetition_penalty': rep,
-                    'exaggeration': exagg,
-                }
-                for k, v in to_set.items():
-                    config.set_value(k, v, voice=voice_name)
-
-                # Also allow language override if provided
-                if lang:
-                    config.set_value('language_id', lang, voice=voice_name)
-
-                # Post-processing defaults (no-op)
-                pp_defaults = {
-                    'enable_post_processing': False,
-                    'trailing_silence_db': -45.0,
-                    'gate_threshold': 0.05,
-                    'tail_suppress_sec': 0.2,
-                    'tail_suppress_low_hz': 2000,
-                    'tail_suppress_high_hz': 4000,
-                    'tail_suppress_strength': 0.6,
-                    'tail_onset_threshold': 0.3,
-                    'notch_gain_db': 0.0,
-                    'notch_low_hz': 8000,
-                    'notch_high_hz': 11000,
-                    'eq_gain_db': 0.0,
-                    'eq_cutoff_hz': 3000,
-                    'speaking_rate': 1.0,
-                    'min_post_duration_sec': 0.5,
-                    'fade_ms': 0.0,
-                    'gain_max_limit': 0.0,
-                }
-                pp_current = {
+                # Build overrides dict (service will diff against effective values)
+                overrides = {
+                    'temperature': float(temp),
+                    'cfg_weight': float(cfg),
+                    'min_p': float(minpv),
+                    'top_p': float(toppv),
+                    'repetition_penalty': float(rep),
+                    'exaggeration': float(exagg),
+                    # Optional language override
+                    **({'language_id': str(lang)} if lang else {}),
+                    # Post-processing
                     'enable_post_processing': bool(pp_enable_v),
                     'trailing_silence_db': float(trailing_db_v),
                     'gate_threshold': float(gate_thr_v),
@@ -326,37 +282,21 @@ def create_ui(
                     'fade_ms': float(fade_ms_v) if fade_ms_v is not None else 0.0,
                     'gain_max_limit': float(gain_limit_v) if gain_limit_v is not None else 0.0,
                 }
-                # Persist only values that differ from defaults
-                for k, v in pp_current.items():
-                    if pp_defaults.get(k) != v:
-                        config.set_value(k, v, voice=voice_name)
+                # Pre-processing overrides only if deviating from defaults
+                if bool(text_pad_enable_v) is not True:
+                    overrides['enable_text_padding'] = bool(text_pad_enable_v)
+                if int(text_ellipses_cnt_v) != 2:
+                    overrides['text_ellipses_count'] = int(text_ellipses_cnt_v)
+                thv = int(short_padding_thresh_v or 0)
+                if thv > 0:
+                    overrides['short_padding_threshold'] = thv
+                tok = str(short_padding_token_v or "")
+                if tok != "":
+                    overrides['short_padding_token'] = tok
 
-                # Pre-processing (text) defaults and persistence (only if different)
-                pre_defaults = {
-                    'enable_text_padding': True,
-                    'text_ellipses_count': 2,
-                    'short_padding_threshold': 0,
-                    'short_padding_token': "",
-                }
-                pre_current = {
-                    'enable_text_padding': bool(text_pad_enable_v),
-                    'text_ellipses_count': int(text_ellipses_cnt_v),
-                    'short_padding_threshold': int(short_padding_thresh_v or 0),
-                    'short_padding_token': str(short_padding_token_v or ""),
-                }
-                for k, v in pre_current.items():
-                    if pre_defaults.get(k) != v:
-                        config.set_value(k, v, voice=voice_name)
-
-                # Timestamped backup then save
-                cfg_path = Path('config.json')
-                backups_dir = Path('config_backups')
-                backups_dir.mkdir(parents=True, exist_ok=True)
-                ts = datetime.now().strftime('%Y%m%d_%H%M%S')
-                if cfg_path.exists():
-                    shutil.copy2(cfg_path, backups_dir / f"config_{ts}.json")
-                config.save_config(create_backup=False, filename=str(cfg_path))
-                return f"Saved overrides for voice '{voice_name}'. Backup created at config_backups/config_{ts}.json"
+                # Persist via config service (with backup+save)
+                msg = save_voice_overrides_service(voice_name, overrides, config=config, create_backup=True)
+                return msg
             except Exception as e:
                 logger.exception("Save overrides failed")
                 return f"Save failed: {e}"

@@ -8,6 +8,7 @@ from pathlib import Path
 import time
 
 from loguru import logger
+from src.cache_keys import generate_audio_cache_key as _gen_cache_key
 from src.config import get_config_value, get_config
 
 from .audio_cache import AudioCache
@@ -16,6 +17,7 @@ from .fuzzy_cache import FuzzyAudioCache
 from .voice_reference import VoiceReferenceCache, VoiceReferenceEntry
 from ..pipeline import AudioGenerationContext
 from ...audio_utils import is_artifact_laden
+from ...audio_paths import validate_user_audio
 from ...normalize_stem import normalize_stem
 
 
@@ -72,18 +74,11 @@ class CacheManager:
                                exaggeration: float,
                                cache_uuid: int,
                                stem_only: bool = False) -> str:
-        """
-        Generate consistent cache key across all cache systems.
-        Key format: {voice_stem}_{text_hash}_{exaggeration:.2f}_{uuid_hex}
-        """
-        text_hash = hashlib.md5(text.encode('utf-8')).hexdigest()[:8] if text else "empty"
-        uuid_hex = hex(cache_uuid)[2:][:8] if isinstance(cache_uuid, int) else str(cache_uuid)[:8]
-
-        if stem_only:
-            return voice_stem
-
-        logger.debug(f"The cache_generated_cache_key is: {voice_stem}_{text_hash}_{exaggeration:.2f}_{uuid_hex}")
-        return f"{voice_stem}_{text_hash}_{exaggeration:.2f}_{uuid_hex}"
+        """Delegate to shared cache key generator (single source of truth)."""
+        key = _gen_cache_key(voice_stem, text, exaggeration, cache_uuid, stem_only=stem_only)
+        if not stem_only:
+            logger.debug(f"The cache_generated_cache_key is: {key}")
+        return key
 
     def get_voice_stem(self, audio_path: Optional[str]) -> str:
         """Get normalized voice stem from path or fallback. Uses centralized utility for consistency."""
@@ -117,8 +112,8 @@ class CacheManager:
 
     def validate_voice_prompt(self, audio_path: str, voice_stem: str = "default") -> Tuple[bool, str]:
         """Validate a voice prompt against audio requirements. FIXED: Safe globals access (no kwargs to voice_reference)."""
-        if not audio_path or not os.path.exists(audio_path):
-            return False, "Path does not exist"
+        if not validate_user_audio(audio_path, min_dur=get_config_value('globals.min_ref_duration', 1.5)):
+            return False, "Invalid or too-short path"
 
         # Rate-limited remote file validation
         if audio_path.startswith("http://") or audio_path.startswith("https://"):

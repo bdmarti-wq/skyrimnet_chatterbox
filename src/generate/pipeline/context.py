@@ -5,6 +5,7 @@ from typing import Optional, Dict, Any
 import torch
 import hashlib
 from src.config.models import AppConfig
+from src.cache_keys import generate_audio_cache_key as _gen_cache_key
 from src.tts_model import get_model  # For fallback if needed
 from src.normalize_stem import normalize_stem  # For derive_stem
 import logging
@@ -138,21 +139,17 @@ class AudioGenerationContext:
             self._audio_duration = value
 
     def generate_cache_key(self, voice_stem: str = "", text: str = "", exaggeration: float = 0.0, cache_uuid: int = 0) -> str:
-        """Generate a cache key using cache_manager if available, or fallback hash."""
-        if self.cache_manager and hasattr(self.cache_manager, 'generate_audio_cache_key'):
-            try:
-                return self.cache_manager.generate_audio_cache_key(
-                    voice_stem=voice_stem or self.voice_stem,
-                    text=text or self.text,
-                    exaggeration=exaggeration or self.exaggeration,
-                    cache_uuid=cache_uuid or self.cache_uuid
-                )
-            except Exception as e:
-                logger.warning(f"Cache manager key gen failed: {e}; using fallback")
-
-        # Fallback hash-based key (REFACTORED: Use existing text/voice_stem if not passed)
-        hash_str = f"{voice_stem or self.voice_stem}_{hash(text or self.text)}_{exaggeration or self.exaggeration}_{cache_uuid or self.cache_uuid}"
-        return hashlib.md5(hash_str.encode()).hexdigest()[:16]
+        """Generate a cache key using the shared generator (single source of truth)."""
+        vs = voice_stem or self.voice_stem
+        tx = text or self.text
+        ex = exaggeration or self.exaggeration
+        cu = cache_uuid or self.cache_uuid
+        try:
+            return _gen_cache_key(vs, tx, ex, cu)
+        except Exception:
+            # Very defensive fallback
+            raw = f"{vs}_{tx[:16]}_{ex}_{cu}"
+            return hashlib.md5(raw.encode()).hexdigest()[:16]
 
 
     def __post_init__(self):
@@ -186,7 +183,19 @@ class AudioGenerationContext:
             if globals_dict:
                 self.sr = globals_dict.get('sr', 24000)
                 self.device = torch.device(globals_dict.get('device', 'cpu'))
-                self.dtype = globals_dict.get('dtype', torch.bfloat16)
+                # Standardize dtype/device (dtype may be a string in config.json)
+                dtype_val = globals_dict.get('dtype', torch.bfloat16)
+                if isinstance(dtype_val, str):
+                    try:
+                        dtype_val = getattr(torch, dtype_val)
+                    except Exception:
+                        dtype_val = torch.bfloat16
+                self.dtype = dtype_val
+                dev_val = globals_dict.get('device', 'cpu')
+                try:
+                    self.device = torch.device(dev_val)
+                except Exception:
+                    self.device = torch.device('cpu')
                 self.multilingual = globals_dict.get('multilingual', False)
                 logger.debug(f"Context derived from config: sr={self.sr}, device={self.device}, dtype={self.dtype}")
 

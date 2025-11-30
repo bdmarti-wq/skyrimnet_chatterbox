@@ -97,32 +97,8 @@
       "short_padding_threshold": 10,
       "short_padding_token": "help.  "
     },
-    "femaleneivavoice": {
-      "eq_gain_db": 1.6,
-      "eq_cutoff_hz": 2600.0,
-      "notch_gain_db": -14.0,
-      "notch_low_hz": 7200.0,
-      "notch_high_hz": 10500.0,
-      "fade_ms": 45.0,
-      "speaking_rate": 1.1,
-      "normalize_method": "rms",
-      "gain_max_limit": 0.95,
-      "trailing_silence_db": -55.0,
-      "ebu_post_gain_db": -17.5,
-      "enable_fuzzy_cache": true
-    },
+
     "nwsjennavoice": {
-      "eq_gain_db": 0.2,
-      "eq_cutoff_hz": 3000.0,
-      "notch_gain_db": 0.0,
-      "notch_low_hz": 8000.0,
-      "notch_high_hz": 11000.0,
-      "fade_ms": 21.0,
-      "speaking_rate": 1.0,
-      "normalize_method": "peak",
-      "gain_max_limit": 1.0,
-      "trailing_silence_db": -47.25,
-      "ebu_post_gain_db": -18.0,
       "enable_fuzzy_cache": true
     }
   }

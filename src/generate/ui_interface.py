@@ -26,7 +26,7 @@ from src.generate.pipeline.context import AudioGenerationContext
 from src.generate.cache.cache_manager import CacheManager, get_cache_manager
 from src.seeding import cpp_uuid_to_seed, resolve_seed
 from src.audio_paths import sanitize_input_path
-from src.audio_fallbacks import get_fallback_wav
+from src.output_utils import format_output
 
 # Cache for hot reloads (loaded model/config)
 PIPELINE_CACHE = None
@@ -38,27 +38,9 @@ def _sanitize_audio_path(p: Optional[str]) -> Optional[str]:
     return sanitize_input_path(p)
 
 def _ensure_valid_return(result: Any, error_msg: Optional[str] = None) -> list:
-    """Ensure return value matches Gradio's expected output structure."""
+    """Format UI return via shared output utility."""
     status_text = f"Error: {error_msg[:100]}" if error_msg else "Audio generated successfully"
-
-    # Format valid result
-    if isinstance(result, (list, tuple)) and len(result) >= 2:
-        return [str(result[0]), status_text]
-    elif isinstance(result, str) and Path(result).exists():
-        return [result, status_text]
-
-    # Fallback: use shared util for a reusable silence wav
-    try:
-        sr = get_config().app_config.globals.sr  # Prefer config SR
-    except Exception:
-        sr = 24000
-    try:
-        fallback_path = get_fallback_wav(sr)
-        return [fallback_path, status_text]
-    except Exception:
-        # Absolute last resort temporary file
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-            return [tmp.name, f"Critical fallback: {error_msg}" if error_msg else "Status"]
+    return format_output(result, status_text)
 
 async def generate_audio_ui(
     model_choice=None,

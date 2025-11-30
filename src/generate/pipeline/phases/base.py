@@ -6,7 +6,7 @@ from src.generate.pipeline.context import AudioGenerationContext
 import torch
 from pathlib import Path
 import torchaudio
-from src.gradio_patch import _is_dirlike_path
+from src.audio_paths import validate_user_audio
 
 class BaseGenerationPhase:
     """Base class for all audio generation pipeline phases. FIXED: _is_nonempty_conds allows dummy (structure OK)."""
@@ -98,23 +98,12 @@ class BaseGenerationPhase:
 
     @classmethod
     def validate_path(cls, path: str, min_dur: float = 3.0) -> bool:
-        if not path or not os.path.exists(path):
-            return False
-        # Reject directories early (prevents noisy preprocess errors)
-        try:
-            if _is_dirlike_path(path):
-                return False
-        except Exception:
-            # Be conservative on diagnostics errors
-            pass
-        try:
-            info = torchaudio.info(path)
-            if info.num_frames / info.sample_rate < min_dur:
-                return False
-            waveform, _ = torchaudio.load(path)
-            return waveform.numel() > 0 and waveform.abs().max() > 1e-6
-        except Exception:
-            return False
+        """Shared audio path validator wrapper.
+
+        Delegates to src.audio_paths.validate_user_audio for consistent behavior
+        across UI bridge, caches, and phases.
+        """
+        return validate_user_audio(path, min_dur=min_dur)
 
     @classmethod
     def _is_nonempty_conds(cls, conds: Any) -> bool:
