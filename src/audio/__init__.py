@@ -1,9 +1,6 @@
 """
 src.audio: Centralized audio utilities and transforms.
 
-This package consolidates audio helpers previously scattered across
-audio_post/, audio_paths.py, audio_fallbacks.py, and audio_utils.py.
-
 Re-exports the common entry points so callers can simply import from
 `src.audio`.
 """

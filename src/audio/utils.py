@@ -1,8 +1,7 @@
 """
 Centralized audio utility functions.
 
-This module contains general-purpose audio helpers that were previously
-located in `src/audio_utils.py`. Import from `src.audio` (re-exported) or
+This module contains general-purpose audio helpers
 directly from `src.audio.utils`.
 """
 from __future__ import annotations

@@ -1,7 +1,6 @@
 """
 Shared audio fallback utilities.
 
-Moved from src/audio_fallbacks.py to src/audio/fallbacks.py
 """
 from pathlib import Path
 import tempfile

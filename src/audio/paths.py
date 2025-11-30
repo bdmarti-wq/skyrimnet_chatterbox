@@ -1,7 +1,6 @@
 """
 Shared audio path sanitation/validation utilities.
 
-Moved from src/audio_paths.py to src/audio/paths.py
 """
 from pathlib import Path
 from typing import Optional
