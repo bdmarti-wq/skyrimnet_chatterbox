@@ -9,6 +9,10 @@ from pathlib import Path
 import torch
 from src.config import get_config
 from loguru import logger
+from src.generate.cache.conditionals_utils import (
+    is_valid_conditionals as _is_valid_conds,
+    is_mock_conditionals as _is_mock_conds,
+)
 
 # Move this to the very top to ensure proper imports
 T3_AVAILABLE = False
@@ -340,8 +344,12 @@ class ConditionalsCache:
                 file_path.unlink()
                 logger.debug(f"Deleted conds file: {file_path}")
 
-            # FIXED: Increment miss (for stats) and log at debug to reduce noise
-            self.stats["misses"] += 1
+            # Increment dedicated purges metric (do not skew miss rate)
+            try:
+                self.stats.setdefault("purges", 0)
+                self.stats["purges"] += 1
+            except Exception:
+                pass
             logger.debug(f"Purged conds key: {key[:12]}...")
         except Exception as del_e:
             logger.warning(f"Delete failed for {key}: {del_e};")
@@ -377,6 +385,16 @@ class ConditionalsCache:
                 "device": str(device),
                 "dtype": str(dtype)
             }
+
+    # Shared conditionals validators (thin wrappers over shared utils)
+    @staticmethod
+    def _is_mock_conditionals(conds: Any) -> bool:
+        return _is_mock_conds(conds)
+
+    @staticmethod
+    def _is_empty_conditionals(conds: Any) -> bool:
+        # Empty/invalid if not valid
+        return not _is_valid_conds(conds)
 
     # FIXED: IMPLEMENTED: Full _save_to_disk method
     def _save_to_disk(self, cache_key: str, save_data: Any) -> bool:

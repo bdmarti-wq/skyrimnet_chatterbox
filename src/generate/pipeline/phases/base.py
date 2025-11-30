@@ -7,6 +7,7 @@ import torch
 from pathlib import Path
 import torchaudio
 from src.audio_paths import validate_user_audio
+from src.generate.cache.conditionals_utils import is_valid_conditionals
 
 class BaseGenerationPhase:
     """Base class for all audio generation pipeline phases. FIXED: _is_nonempty_conds allows dummy (structure OK)."""
@@ -107,18 +108,7 @@ class BaseGenerationPhase:
 
     @classmethod
     def _is_nonempty_conds(cls, conds: Any) -> bool:
-        """FIXED: Allow dummy (numel>0/structure; zero emb OK for fallback). Matches original (emb present but zero)."""
-        if conds is None:
-            return False
-        if isinstance(conds, torch.Tensor):
-            return conds.numel() > 0  # Allow all-zero dummy
-        if hasattr(conds, 't3') and hasattr(conds.t3, 'speaker_emb') and conds.t3.speaker_emb is not None:
-            emb = conds.t3.speaker_emb
-            return emb.numel() > 0  # Structure; zero OK
-        if hasattr(conds, '__len__'):
-            return len(conds) > 0
-        if isinstance(conds, dict):
-            return any(v is not None for v in conds.values())
-        return True
+        """Delegate to shared conditionals validator (single source of truth)."""
+        return is_valid_conditionals(conds)
 
     # Removed unused conditionals preparation helpers; conds are handled via caches/voice phase.
