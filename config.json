@@ -56,7 +56,7 @@
       "max_cache_entries": 1000,
       "max_cache_size_mb": 1024,
       "short_padding_threshold": 5,
-      "short_padding_token": "help.  "
+      "short_padding_token": "Fuck!  "
     },
     "fuzzy": {
       "enable_fuzzy_cache": true,

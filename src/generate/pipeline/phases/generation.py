@@ -20,14 +20,13 @@ class GenerationPhase(BaseGenerationPhase):
         else:
             # Fallback stub if no conds (e.g., error)
             logger.warning("No conds in context; skipping gen (empty WAV)")
-            # Use shared silence helper for consistency
+            # Use shared silence helper for consistency – force CPU to avoid CUDA usage in fallback
             globals_dict = context.get_globals()
             sr = globals_dict['sr']
-            device = torch.device(globals_dict['device'])
             dtype = globals_dict['dtype']
-            context.processed_wav = self.create_silence(sr, 2.0, device, dtype)
-            # For fallback, set generated_wav as empty too for post-consistency
-            context.generated_wav = torch.zeros(0, dtype=torch.float32, device=context.device)  # Empty trigger
+            context.processed_wav = self.create_silence(sr, 2.0, torch.device('cpu'), dtype)
+            # For fallback, set generated_wav as empty too for post-consistency (CPU to avoid CUDA during failures)
+            context.generated_wav = torch.zeros(0, dtype=torch.float32, device=torch.device('cpu'))  # Empty trigger
             return context
 
         # Log the exact text used for generation (helps debug padding/repeat logic)
@@ -72,13 +71,17 @@ class GenerationPhase(BaseGenerationPhase):
             else:
                 raise ValueError("Computed duration <=0 despite valid WAV")
 
+            # Previously: capture worker status when using external TTS worker process.
+            # Rolled back: no external worker, so no worker status to capture.
+
         except Exception as gen_e:
             logger.error(f"Core gen failed: {gen_e}")
             gen_args['text'] = gen_args['text'][:30] + '...' if len(gen_args['text']) > 30 else gen_args['text']
             msg = f"Gen error on '{gen_args['text']}' (exag={gen_args['exaggeration']}): {gen_e}"
+            # Rolled back: no external worker status to capture on failure.
             # FIXED: Set both for consistency in fallback
-            context.generated_wav = torch.zeros(0, dtype=torch.float32,
-                                                device=context.device)  # Empty trigger for post
+            # Ensure CPU to avoid touching CUDA in error paths
+            context.generated_wav = torch.zeros(0, dtype=torch.float32, device=torch.device('cpu'))  # Empty trigger for post
             return self.handle_error(context, ValueError(msg))
 
         logger.debug("Gen complete")
@@ -110,6 +113,9 @@ class GenerationPhase(BaseGenerationPhase):
             generate_args['audio_prompt_path'] = prompt_path
             logger.debug(f"Added audio_prompt_path to args")
 
+        # Rolled back: do not attach conds_key (no external worker uses it),
+        # and avoid passing unknown kwargs to model.generate().
+        
         return generate_args
 
     # Updated _generate_core (simplified: primary + clear + helpers; pass sr from _execute_core if needed)
@@ -128,6 +134,7 @@ class GenerationPhase(BaseGenerationPhase):
             if 't3_params' not in gen_args:
                 gen_args['t3_params'] = t3_params
             logger.debug("Calling model.generate...")
+            # Rolled back: call model.generate directly (no external worker routing)
             output = model.generate(**gen_args)
             # UPDATED: Pass text_len to validation
             if self._validate_output(output, sr, text_len):
@@ -153,8 +160,14 @@ class GenerationPhase(BaseGenerationPhase):
                 except ImportError:
                     pass
                 if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                    torch.cuda.synchronize()
+                    try:
+                        torch.cuda.empty_cache()
+                        # Avoid synchronize during capture
+                        if hasattr(torch.cuda, "is_current_stream_capturing") and not torch.cuda.is_current_stream_capturing():
+                            torch.cuda.synchronize()
+                    except Exception:
+                        # Ignore sync errors; we are recovering from a graph failure
+                        pass
 
                 # Tier 2: Eager helper
                 eager_result = self._retry_eager(model, gen_args, t3_params, sr, orig_params,
@@ -174,12 +187,26 @@ class GenerationPhase(BaseGenerationPhase):
             else:
                 raise  # Non-graph error
         except Exception as e:
-            logger.exception(f"Core gen failed: {e}")
+            # Enhanced logging: include type and repr for empty-string exceptions
+            try:
+                etype = type(e).__name__
+                logger.exception(f"Core gen failed [{etype}]: {repr(e)}")
+            except Exception:
+                logger.exception("Core gen failed (unprintable error)")
             return None
         finally:
+            # Avoid CUDA maintenance calls while a stream is capturing
             if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-                torch.cuda.synchronize()
+                try:
+                    if hasattr(torch.cuda, "is_current_stream_capturing"):
+                        if not torch.cuda.is_current_stream_capturing():
+                            torch.cuda.empty_cache()
+                            torch.cuda.synchronize()
+                    else:
+                        # Older builds: best-effort empty cache only
+                        torch.cuda.empty_cache()
+                except Exception:
+                    pass
             logger.debug(f"Gen complete: {time.time() - gen_start:.2f}s")
 
     def _validate_output(self, output: Optional[torch.Tensor], sr: int, text_len: int = 0) -> bool:

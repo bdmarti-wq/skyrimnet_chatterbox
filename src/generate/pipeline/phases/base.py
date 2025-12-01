@@ -73,9 +73,9 @@ class BaseGenerationPhase:
     def _fallback_silence(self, context: AudioGenerationContext, error_msg: str) -> AudioGenerationContext:
         globals_dict = context.get_globals()
         sr = globals_dict['sr']
-        device = torch.device(globals_dict['device'])
+        # Force CPU silence in error paths to avoid touching CUDA after failures
         dtype = globals_dict['dtype']
-        silence = self.create_silence(sr, 2.0, device, dtype)
+        silence = self.create_silence(sr, 2.0, torch.device('cpu'), dtype)
         if hasattr(context, 'generated_wav'):
             context.generated_wav = silence
         if hasattr(context, 'processed_wav'):

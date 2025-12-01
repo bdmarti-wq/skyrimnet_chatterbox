@@ -585,8 +585,12 @@ class PostProcessingPhase(BaseGenerationPhase):
             if wav.dim() == 2 and wav.size(0) == 1:
                 wav = wav.squeeze(0)
 
-            peak = torch.max(torch.abs(wav))
-            logger.debug(f"Norm: peak={peak:.3f}")
+            # SAFE: Extract scalar on CPU for logging to avoid CUDA .item() during capture
+            try:
+                peak_val = float(torch.max(torch.abs(wav)).detach().float().cpu().item())
+            except Exception:
+                peak_val = float('nan')
+            logger.debug(f"Norm: peak={peak_val:.3f}")
 
             # FIXED: Use guarded dict
             post_gain = voice_params.get('post_gain', 0.0)
@@ -597,12 +601,14 @@ class PostProcessingPhase(BaseGenerationPhase):
 
             target_sr = 24000
             if sr != target_sr:
+                # Perform resample on CPU to avoid CUDA activity in post-processing
                 from torchaudio.transforms import Resample
                 resampler = Resample(sr, target_sr)
                 context.sr = target_sr
                 input_wav = wav.unsqueeze(0) if wav.dim() == 1 else wav
-                resampled = resampler(input_wav)
-                wav = resampled.squeeze(0)
+                input_wav_cpu = input_wav.detach().to('cpu')
+                resampled = resampler(input_wav_cpu)
+                wav = resampled.squeeze(0)  # keep CPU
 
             # Optional pre-check: detect artifacts on current waveform to auto-enable post-processing
             device = wav.device
@@ -654,7 +660,8 @@ class PostProcessingPhase(BaseGenerationPhase):
             # Apply numpy-based post processing (None-as-noop params supported)
             processed_np = _np_apply_post(wav_np, context.sr, effective_params, text)
             if processed_np is not None and isinstance(processed_np, np.ndarray) and processed_np.size > 0:
-                wav = torch.from_numpy(processed_np).to(device=device, dtype=dtype)
+                # Keep post-processing results on CPU to avoid touching CUDA
+                wav = torch.from_numpy(processed_np).to(device='cpu', dtype=dtype)
             else:
                 logger.debug("Post-processing returned empty/invalid – using original wav")
 
@@ -703,6 +710,9 @@ class PostProcessingPhase(BaseGenerationPhase):
 
         if wav.dim() == 2 and wav.size(0) == 1:
             wav = wav.squeeze(0)
+
+        # Always operate on CPU in error/fallback paths to avoid touching CUDA after errors
+        wav = wav.detach().to('cpu')
 
         max_abs = torch.max(torch.abs(wav))
         if max_abs > 0:

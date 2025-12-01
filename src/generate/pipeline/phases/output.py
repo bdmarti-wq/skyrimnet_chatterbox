@@ -83,6 +83,27 @@ class OutputPhase(BaseGenerationPhase):
             size_kb = output_path.stat().st_size / 1024
             logger.info(f"Saved WAV: {context.output_path}, size={size_kb:.1f}KB")
 
+            # Determine if this result should be cached/indexed
+            try:
+                peak = float(torch.max(torch.abs(wav_cpu))) if wav_cpu.numel() > 0 else 0.0
+                rms = float(torch.sqrt(torch.mean(wav_cpu ** 2))) if wav_cpu.numel() > 0 else 0.0
+            except Exception:
+                peak, rms = 0.0, 0.0
+
+            worker_status = getattr(context, 'worker_status', '') or ''
+            bad_status = worker_status in {"timeout", "gen_err", "enqueue_err", "protocol_err"}
+            near_silence = (peak <= 1e-6) or (rms <= 1e-4)
+
+            if bad_status or near_silence:
+                reason = f"worker_status={worker_status}" if bad_status else f"near_silence peak={peak:.2e} rms={rms:.2e}"
+                logger.info(f"Skip caching/indexing due to {reason}")
+                # Mark as error_fallback for coordinator summary
+                try:
+                    context.cache_hit_type = 'error_fallback'
+                except Exception:
+                    pass
+                return context
+
             # FIXED: Always attempt exact cache set (post-save, sync) – generate full key using CacheManager
             is_hit = getattr(context, 'is_cached', False)  # From earlier pipeline stages
             if self.cache_manager:  # Ensure available
