@@ -280,52 +280,14 @@ def check_exaggeration_update_needed(
     Returns:
         Tuple of (needs_update, new_emotion_tensor)
     """
-    # Avoid mid-graph fresh CUDA allocations like torch.ones(..., device='cuda').
-    # Use scalar comparison (broadcast) to decide, then create a tensor using full_like
-    # which reuses allocator pools and matches current tensor's device/dtype/shape.
-    # IMPORTANT: Avoid torch.allclose(tensor, float) which raises TypeError on some builds,
-    # and avoid host sync (e.g., .item()) while a CUDA graph is capturing.
-    # If we are inside a capture, conservatively mark as needing update and build the tensor
-    # without forcing a CPU sync.
-    in_capture = False
-    try:
-        in_capture = (
-            torch.cuda.is_available()
-            and hasattr(torch.cuda, "is_current_stream_capturing")
-            and torch.cuda.is_current_stream_capturing()
-        )
-    except Exception:
-        in_capture = False
+    new_emotion_tensor = new_exaggeration * torch.ones(
+        1, 1, 1,
+        device=device,
+        dtype=current_emotion_adv.dtype
+    )
 
-    if in_capture:
-        needs_update = True
-    else:
-        # Safe path: do a cheap CPU-side comparison using the mean value as a proxy
-        try:
-            cur_val = float(current_emotion_adv.detach().float().mean().cpu().item())
-            needs_update = abs(cur_val - float(new_exaggeration)) > float(atol)
-        except Exception:
-            # As a last resort, do a tensor-vs-tensor allclose on the same device
-            try:
-                scalar_t = torch.tensor(
-                    float(new_exaggeration),
-                    dtype=current_emotion_adv.dtype,
-                    device=current_emotion_adv.device,
-                )
-                needs_update = not torch.allclose(current_emotion_adv, scalar_t, atol=atol)
-            except Exception:
-                needs_update = True
-
-    # Create target tensor using full_like to minimize allocator churn
-    try:
-        # Prefer in-place style construction to minimize allocator churn
-        new_emotion_tensor = current_emotion_adv.clone()
-        new_emotion_tensor.fill_(float(new_exaggeration))
-    except Exception:
-        # Fallback to allocating a new tensor if clone/fill fails
-        new_emotion_tensor = torch.full_like(current_emotion_adv, fill_value=float(new_exaggeration))
-
-    return bool(needs_update), new_emotion_tensor
+    needs_update = not torch.allclose(current_emotion_adv, new_emotion_tensor, atol=atol)
+    return needs_update, new_emotion_tensor
 
 
 def validate_text_input(text: str) -> str:
