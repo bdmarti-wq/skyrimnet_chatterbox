@@ -68,7 +68,7 @@
         "ooh",
         "gasp"
       ],
-      "fuzzy_force_skip_words": ["Odin","Kelsa", "Lydia", "Jenna", "Misty", "Anja", "Katana", "Sofia", "Frea", "Feris", "Laci", "Lyris"],
+      "fuzzy_force_skip_words": ["odin","kelsa", "lydia", "jenna", "misty", "anja", "katana", "sofia", "frea", "feris", "laci", "lyris", "vayne"],
       "fuzzy_index_size": 5000,
       "fuzzy_artifact_threshold_hz": 12000.0
     },
