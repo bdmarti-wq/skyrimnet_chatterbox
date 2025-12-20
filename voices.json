@@ -1,0 +1,47 @@
+{
+  "dlc1seranavoice": {
+    "enable_denoising": true,
+    "enable_denoise_normalize": true,
+    "notch_gain_db": -12.0,
+    "noise_floor_db": -50.0,
+    "trim_threshold_db": -28.0,
+    "eq_gain_db": -3.0,
+    "eq_cutoff_hz": 4000,
+    "gain_max_limit": 0.707,
+    "notch_low_hz": 8000,
+    "notch_high_hz": 11000,
+    "fade_ms": 20,
+    "speaking_rate": 1.05,
+    "normalize_method": "peak"
+  },
+  "femaleuniquelydia": {
+    "enable_denoising": false,
+    "enable_denoise_normalize": false,
+    "fade_ms": 20,
+    "trim_threshold_db": -32.0,
+    "noise_floor_db": -45.0,
+    "normalize_method": "peak",
+    "peak_target": 0.9,
+    "eq_gain_db": 0.0,
+    "eq_cutoff_hz": 8000,
+    "notch_gain_db": 0.0,
+    "notch_low_hz": 10000,
+    "notch_high_hz": 20000,
+    "speaking_rate": 1.0,
+    "enable_post_resample": false,
+    "gain_max_limit": 1.0,
+    "highpass_cutoff_hz": 50,
+    "post_pad_sec": 0.0,
+    "min_post_duration_sec": 0.1,
+    "n_fft_denoise": 1024,
+    "denoise_median_ksize": 5,
+    "enable_audio_padding": false,
+    "tiny_audio_pad_multiplier": 1.0,
+    "enable_text_padding": false,
+    "text_ellipses_count": 0,
+    "max_short_word_len": 3,
+    "vocalise_patterns": [],
+    "trailing_silence_db": -50.0
+  }
+
+}

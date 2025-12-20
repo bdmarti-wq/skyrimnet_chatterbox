@@ -1,37 +1,105 @@
 {
-  "model": {
-    "text_use_gpu": true,
-    "text_use_small": true,
-    "coarse_use_gpu": true,
-    "coarse_use_small": true,
-    "fine_use_gpu": true,
-    "fine_use_small": true,
-    "codec_use_gpu": true
+  "globals": {
+    "tts": {
+      "temperature": 0.7,
+      "min_p": 0.07,
+      "top_p": 1.0,
+      "repetition_penalty": 2.0,
+      "cfg_weight": 0.45,
+      "exaggeration": 0.7,
+      "max_new_tokens": 1499,
+      "min_new_tokens": 224,
+      "max_cache_len": 4096,
+      "stride_length": 8,
+      "compile_t3": true,
+      "generate_token_backend": "cudagraphs-manual",
+      "warmup_t3": true,
+      "re_optimize_on_reload": false
+    },
+    "audio": {
+      "enable_post_processing": false,
+      "enable_post_resample": false,
+      "enable_post_jit_gain": true,
+      "enable_post_voice_processing": true,
+      "enable_pre_adjustment": true,
+      "eq_gain_db": 0.0,
+      "eq_cutoff_hz": 3000.0,
+      "notch_gain_db": 0.0,
+      "notch_low_hz": 8000.0,
+      "notch_high_hz": 11000.0,
+      "fade_ms": 0.0,
+      "speaking_rate": 1.0,
+      "normalize_method": "peak",
+      "gain_max_limit": 1.0,
+      "noise_floor_db": -60.0,
+      "trim_threshold_db": -100.0,
+      "enable_denoise_normalize": false,
+      "enable_denoising": false,
+      "enable_audio_padding": false,
+      "base_audio_pad_sec": 0.15,
+      "tiny_audio_pad_multiplier": 2.0,
+      "tiny_threshold_sec": 0.5,
+      "n_fft": 2048,
+      "hop_length": 256,
+      "highpass_cutoff_hz": 50.0,
+      "n_fft_denoise": 1024,
+      "denoise_median_ksize": 3,
+      "denoise_target_band_low": 5000.0,
+      "denoise_target_band_high": 12000.0,
+      "trailing_silence_db": -45.0,
+      "gain_target_max": 1.0,
+      "max_gain": 2.0,
+      "n_mels": 80,
+      "ebu_post_gain_db": 0.0,
+      "ebu_true_peak": 0.0,
+      "max_short_word_len": 5,
+      "max_cache_entries": 1000,
+      "max_cache_size_mb": 1024,
+      "short_padding_threshold": 5,
+      "short_padding_token": "Fuck!  "
+    },
+    "fuzzy": {
+      "enable_fuzzy_cache": true,
+      "fuzzy_threshold": 0.7,
+      "fuzzy_boost_amount": 0.1,
+      "fuzzy_boost_words": [
+        "ahh",
+        "mmm",
+        "ooh",
+        "gasp"
+      ],
+      "fuzzy_force_skip_words": ["odin","kelsa", "lydia", "jenna", "misty", "anja", "katana", "sofia", "frea", "feris", "laci", "lyris", "vayne"],
+      "fuzzy_index_size": 5000,
+      "fuzzy_artifact_threshold_hz": 12000.0
+    },
+    "dtype": "bfloat16",
+    "logging_level": "INFO",
+    "compress_pt_saves": true,
+    "compress_level": 6,
+    "enable_deferred_cleanup": true,
+    "tts_name": "Chatterbox",
+    "device": "cuda",
+    "multilingual": false,
+    "sr": 24000,
+    "root": "C:\\Users\\bdmar\\skyrimnet_chatterbox",
+    "cache_dir": "C:\\Users\\bdmar\\skyrimnet_chatterbox\\cache",
+    "audio_cache_dir": "C:\\Users\\bdmar\\skyrimnet_chatterbox\\cache\\audio",
+    "voices_cache_dir": "C:\\Users\\bdmar\\skyrimnet_chatterbox\\cache\\audio\\voices",
+    "output_cache_dir": "C:\\Users\\bdmar\\skyrimnet_chatterbox\\cache\\audio\\output",
+    "conditionals_cache_dir": "C:\\Users\\bdmar\\skyrimnet_chatterbox\\cache\\conditionals",
+    "fallbacks_dir": "C:\\Users\\bdmar\\skyrimnet_chatterbox\\cache\\fallbacks"
   },
-  "gradio_interface_options": {
-    "inline": false,
-    "inbrowser": true,
-    "share": false,
-    "debug": false,
-    "max_threads": 40,
-    "auth": null,
-    "auth_message": null,
-    "prevent_thread_lock": false,
-    "show_error": false,
-    "server_name": "127.0.0.1",
-    "server_port": 7770,
-    "height": 500,
-    "width": "100%",
-    "favicon_path": null,
-    "ssl_keyfile": null,
-    "ssl_certfile": null,
-    "ssl_keyfile_password": null,
-    "ssl_verify": true,
-    "quiet": true,
-    "show_api": true,
-    "_frontend": true
-  },
-  "extensions": {
-    "disabled": []
+  "voices": {
+    "femaleuniquelydia": {
+      "temperature": 0.9,
+      "speaking_rate": 1.0,
+      "enable_fuzzy_cache": true,
+      "short_padding_threshold": 10,
+      "short_padding_token": "help.  "
+    },
+
+    "nwsjennavoice": {
+      "enable_fuzzy_cache": true
+    }
   }
 }
