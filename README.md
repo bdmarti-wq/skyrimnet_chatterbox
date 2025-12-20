@@ -1,12 +1,13 @@
 
 
 
-Windows setup meant for use with SkyrimNet either locally (or local secondary PC) install of Zonos 
-- should support Blackwell cards but not Ampere or below
-- cache files in `cache` folder
-- output files saved in `output_temp` folder under process timestamp folders
+Windows setup meant for use with SkyrimNet either locally (or on a local secondary PC) install of Zonos.
+- Supports NVIDIA Blackwell GPUs; Ampere or below are currently not supported.
+- Cache files are stored in the `cache` folder.
+- Output files are saved in `output_temp` under timestamped subfolders.
 
-Assumes that [Python 3.12]([https://www.python.org/ftp/python/3.12.10/python-3.12.10-amd64.exe) is already installed. 
+Assumes that Python 3.12 is already installed:
+https://www.python.org/ftp/python/3.12.10/python-3.12.10-amd64.exe
 
 To install other needed files:
 
@@ -18,7 +19,7 @@ To run:
 
 This should start in a high priority process window.
 
-`2_Start_ML.bat` will start a multilingual version of Chaterbox.
+`2_Start_ML.bat` will start a multilingual version of Chatterbox.
 
 Be sure to set the Language section in the SkyrimNet Zonos tab to match the language you want.
 
@@ -48,7 +49,7 @@ SUPPORTED_LANGUAGES = {
   "zh": "Chinese",
 }
 
-# Note on values used for voice generation:
+# Note on values used for voice generation
 
 Currently these values are hardcoded.
 
@@ -61,10 +62,10 @@ Currently these values are hardcoded.
 
 Edit `skyrimnet_config.txt` if you would like to use the controls from the SkyrimNet UI.
 
-Be sure to change the values in SkyrimNet UI before loading your save, errors will occur with some values.
+Be sure to change the values in SkyrimNet UI before loading your save; some value combinations may cause errors.
 Randomize Seed should usually be Disabled.
 
-All other Audio fields are ignored.
+All other SkyrimNet Audio fields are ignored by this integration.
 
 
 - MIN_P: Modern way to control speech quality (newer method)  
@@ -85,6 +86,19 @@ All other Audio fields are ignored.
 
 
 ---
+# New features
+
+- Offline voice testing page
+  - Test any loaded voice outside the game, adjust generation and post-processing parameters, and save results directly into the audio cache for instant in-game reuse. This is the fastest way to dial in a voice without reloading a save.
+
+- Fuzzy cache for text similarity
+  - Reuses cached audio for similar text to avoid regeneration. Example: a cached "Yes sir." can satisfy inputs like "Yes." or "Yes, indeed" when above the fuzzy threshold. This can be 200x+ faster than fresh generation. Sensitivity is configurable and you can exclude specific words (e.g., names) to prevent mismatched returns such as "Yes Bob" for "Yes Fred".
+
+- Built-in post-processing
+  - Clean up TTS output with optional EQ, notch filtering, denoising, normalization, gating of trailing artifacts, fades, speaking rate changes, and more. Use this to reduce hiss or ringing, tame harshness, smooth word endings, or match loudness across lines.
+
+- Robust fixes for ghost voices and trailing artifacts
+  - Short-text padding mechanism greatly reduces leading/trailing ghost audio common with some voices. Configure a minimum word length threshold and a padding token; the system generates extra text including the token, then trims away the token’s audio. This slightly increases generation time for very short lines, but the aggressive short-line caching offsets it in practice.
 
 
 <img width="1200" height="600" alt="Chatterbox-Multilingual" src="https://www.resemble.ai/wp-content/uploads/2025/09/Chatterbox-Multilingual-1.png" />
@@ -128,86 +142,19 @@ Arabic (ar) • Danish (da) • German (de) • Greek (el) • English (en) • 
   - Higher `exaggeration` tends to speed up speech; reducing `cfg_weight` helps compensate with slower, more deliberate pacing.
 
 
-# Installation
-```shell
-pip install chatterbox-tts
-```
 
-Alternatively, you can install from source:
-```shell
-# conda create -yn chatterbox python=3.11
-# conda activate chatterbox
-
-git clone https://github.com/resemble-ai/chatterbox.git
-cd chatterbox
-pip install -e .
-```
-We developed and tested Chatterbox on Python 3.11 on Debian 11 OS; the versions of the dependencies are pinned in `pyproject.toml` to ensure consistency. You can modify the code or dependencies in this installation mode.
-
-# Usage
-```python
-import torchaudio as ta
-from chatterbox.tts import ChatterboxTTS
-from chatterbox.mtl_tts import ChatterboxMultilingualTTS
-
-# English example
-model = ChatterboxTTS.from_pretrained(device="cuda")
-
-text = "Ezreal and Jinx teamed up with Ahri, Yasuo, and Teemo to take down the enemy's Nexus in an epic late-game pentakill."
-wav = model.generate(text)
-ta.save("test-english.wav", wav, model.sr)
-
-# Multilingual examples
-multilingual_model = ChatterboxMultilingualTTS.from_pretrained(device=device)
-
-french_text = "Bonjour, comment ça va? Ceci est le modèle de synthèse vocale multilingue Chatterbox, il prend en charge 23 langues."
-wav_french = multilingual_model.generate(spanish_text, language_id="fr")
-ta.save("test-french.wav", wav_french, model.sr)
-
-chinese_text = "你好，今天天气真不错，希望你有一个愉快的周末。"
-wav_chinese = multilingual_model.generate(chinese_text, language_id="zh")
-ta.save("test-chinese.wav", wav_chinese, model.sr)
-
-# If you want to synthesize with a different voice, specify the audio prompt
-AUDIO_PROMPT_PATH = "YOUR_FILE.wav"
-wav = model.generate(text, audio_prompt_path=AUDIO_PROMPT_PATH)
-ta.save("test-2.wav", wav, model.sr)
-```
-See `example_tts.py` and `example_vc.py` for more examples.
 
 # Acknowledgements
+- [Chatterbox for Skyrimnet](https://github.com/langfod/chatterbox)
 - [Cosyvoice](https://github.com/FunAudioLLM/CosyVoice)
 - [Real-Time-Voice-Cloning](https://github.com/CorentinJ/Real-Time-Voice-Cloning)
 - [HiFT-GAN](https://github.com/yl4579/HiFTNet)
 - [Llama 3](https://github.com/meta-llama/llama3)
 - [S3Tokenizer](https://github.com/xingchensong/S3Tokenizer)
 
-# Built-in PerTh Watermarking for Responsible AI
+# Notes on watermarking
 
-Every audio file generated by Chatterbox includes [Resemble AI's Perth (Perceptual Threshold) Watermarker](https://github.com/resemble-ai/perth) - imperceptible neural watermarks that survive MP3 compression, audio editing, and common manipulations while maintaining nearly 100% detection accuracy.
-
-
-## Watermark extraction
-
-You can look for the watermark using the following script.
-
-```python
-import perth
-import librosa
-
-AUDIO_PATH = "YOUR_FILE.wav"
-
-# Load the watermarked audio
-watermarked_audio, sr = librosa.load(AUDIO_PATH, sr=None)
-
-# Initialize watermarker (same as used for embedding)
-watermarker = perth.PerthImplicitWatermarker()
-
-# Extract watermark
-watermark = watermarker.get_watermark(watermarked_audio, sample_rate=sr)
-print(f"Extracted watermark: {watermark}")
-# Output: 0.0 (no watermark) or 1.0 (watermarked)
-```
+Some upstream Chatterbox distributions may include neural watermarking (e.g., Perth). This fork does not require any external watermarking packages and does not embed code that depends on them. If you wish to experiment with watermarking, refer to the upstream project for details.
 
 
 # Official Discord
@@ -259,7 +206,75 @@ This project now centralizes several cross-cutting concerns into small focused u
   - Stateless numpy-based transforms in `transforms.py` (trim, gate, filters, rate, fade).
   - Pipeline phase delegates to these helpers to stay thin and testable.
 
-Other notable changes:
-- Removed legacy `cfgw` field; canonical internal name is `cfg_weight`.
-- Fuzzy indexing happens after successful generation in the Output phase; a simple in-process idempotency guard avoids duplicate indexing of the same key.
-- Conditionals cache now tracks `purges` separately from `misses` for accurate metrics.
+
+
+---
+
+# Audio pipeline overview and where settings apply
+
+The generation pipeline runs in phases (see `src/generate/pipeline/coordinator.py`):
+
+1. Inputs Validation: basic checks of text, language, and selected voice.
+2. Cache Check: tries full audio cache first; if miss, can consult the fuzzy cache for similar text re-use.
+3. Voice Processing: loads/merges voice parameters and conditionals; applies any pre-adjustment.
+4. TTS Generation: produces raw waveform from the model using your TTS settings (temperature, cfg_weight, etc.).
+5. Post-Processing: optional audio clean-up and formatting (filters, gating, normalization, fades, speaking-rate changes).
+6. Output: writes audio to disk, updates caches, and returns the path.
+
+Post-processing runs only if enabled and uses the parameters described below. The Voice Testing page exposes these controls so you can hear changes instantly and then save per-voice overrides.
+
+---
+
+# Per-voice adjustable settings (what they do and why)
+
+You can define global defaults in `config.json` and override them per voice under the `voices` section. The UI Voice Testing page lets you experiment and save overrides. Below is a concise guide to the most important knobs.
+
+TTS generation (globals.tts)
+- temperature: Increases randomness and expressiveness as it rises. Lower for consistency; higher for variety or emotional delivery.
+- min_p: Modern nucleus-like threshold; filters out very low-probability tokens. Raise slightly to reduce mumbling artifacts; lower to allow more nuanced outputs.
+- top_p: Classic nucleus sampling cap. Keep at 1.0 to disable; reduce to limit vocab diversity for steadier delivery.
+- repetition_penalty: Discourages repeating words/phrases. Increase if you hear loops; too high can make speech stilted.
+- cfg_weight: Guidance strength that also affects pacing. Lower values often slow speech and increase deliberation; higher can make it brisk and more on-prompt.
+- exaggeration: Scales expressivity/emotion. Raise for dramatic reads; lower for neutral, broadcast-style delivery.
+- max_new_tokens / min_new_tokens: Hard bounds on generation length. Increase max for very long lines; tune min to avoid premature cutoffs.
+- max_cache_len / stride_length / generate_token_backend / compile_t3 / warmup_t3 / re_optimize_on_reload: Advanced performance controls for expert users; leave defaults unless optimizing throughput/latency.
+
+Audio post-processing (globals.audio)
+- enable_post_processing: Master switch. Turn on to apply the rest of the post-processing chain.
+- enable_post_resample: If enabled, resamples output to your target sample rate. Leave off if your downstream expects model SR.
+- enable_post_jit_gain: Enables an inline gain/normalization pass optimized for speed.
+- enable_post_voice_processing: Allows per-voice post adjustments to take effect.
+- enable_pre_adjustment: Apply small pre-normalization before other steps to improve filter behavior.
+- eq_gain_db / eq_cutoff_hz: Gentle shelving EQ to tame harshness or brighten dull voices. Positive gain brightens above cutoff; negative softens.
+- notch_gain_db / notch_low_hz / notch_high_hz: Band cut to remove ringing/whine between low/high. Use small negative gains (e.g., -6 to -12 dB) to reduce metallic artifacts.
+- highpass_cutoff_hz: Removes low hum/rumble. Set around 50–80 Hz for cleaner speech without thinning the voice.
+- fade_ms: Applies short fade-in/out to avoid clicks at boundaries. 10–30 ms is typical.
+- speaking_rate: Time-stretch without pitch shift. <1.0 slows for gravitas; >1.0 speeds responses for snappiness.
+- normalize_method: Peak (default) is fast and transparent; loudness-based options (if enabled) aim for consistent perceived volume.
+- gain_max_limit / gain_target_max / max_gain: Prevents over-amplification. Raise cautiously if outputs are too quiet after trimming.
+- noise_floor_db / trim_threshold_db: Controls silence detection and trimming. Lower thresholds keep more tails; higher trims more aggressively.
+- enable_denoising / enable_denoise_normalize / n_fft_denoise / denoise_median_ksize / denoise_target_band_low/high: Spectral denoise for hiss/whistle bands. Target only the noisy band to avoid lisping.
+- enable_audio_padding / base_audio_pad_sec / tiny_audio_pad_multiplier / tiny_threshold_sec: Adds programmable silence padding; tiny clips can get extra padding for better UX.
+- trailing_silence_db: Threshold to classify trailing audio as silence when trimming. Adjust if you still hear breath/ghost tails.
+- n_fft / hop_length / n_mels: Analysis parameters; keep defaults unless you know what you’re doing.
+- ebu_post_gain_db / ebu_true_peak: Optional loudness alignment helpers if using EBU-style pipelines.
+- max_short_word_len: Defines what “short” means for padding heuristics and caching.
+- max_cache_entries / max_cache_size_mb: Limits for audio cache size and count.
+- short_padding_threshold / short_padding_token: If the input text has fewer than this many words, the system appends the token to stabilize synthesis, then trims it away. Use a harmless, easily trimmable token.
+
+Fuzzy cache (globals.fuzzy)
+- enable_fuzzy_cache: Enables similarity-based reuse of audio.
+- fuzzy_threshold: Similarity needed (0–1). Raise for safer matches; lower to increase hit rate.
+- fuzzy_boost_amount / fuzzy_boost_words: Extra weight for filler/vocalized pauses (e.g., “ahh”, “mmm”) to better match short interjections.
+- fuzzy_force_skip_words: Words to ignore when matching (e.g., character names) to prevent wrong-person matches.
+- fuzzy_index_size: Limit on the fuzzy index entries. Increase for larger corpora; watch memory usage.
+- fuzzy_artifact_threshold_hz: Helps detect/avoid returning clips with high-frequency artifact energy.
+
+Per-voice overrides
+- Any of the above can be set per voice under `voices.{voice_name}`. Example:
+  - Increase `speaking_rate` for a brisk delivery on one character.
+  - Enable a narrow `notch_gain_db` cut only for a voice that rings.
+  - Raise `short_padding_threshold` and set a custom `short_padding_token` for a ghost-prone voice.
+
+UI Voice Testing page
+- The test page lets you pick a voice, type lines, toggle post-processing, tweak thresholds, speed, EQ/notch, and padding. When satisfied, click save to persist overrides back to `config.json` with a timestamped backup.
