@@ -18,6 +18,7 @@ from src.generate.pipeline.phases.generation import GenerationPhase as TTSGenera
 from src.generate.pipeline.phases.post_processing import PostProcessingPhase
 from src.generate.pipeline.phases.output import OutputPhase
 from src.generate.pipeline.context import AudioGenerationContext
+from src.generate.pipeline.cuda_lock import acquire_cuda_active_lock, release_cuda_active_lock
 
 
 class GenerationCoordinator:
@@ -52,6 +53,7 @@ class GenerationCoordinator:
 
         phase_times = {}
 
+        lock_held = False
         for i, phase in enumerate(self.phases):
             phase_name = phase.__class__.__name__
             phase_start = time.perf_counter()
@@ -66,8 +68,23 @@ class GenerationCoordinator:
                     context.output_path = context.cached_path
                 continue
 
-            context = phase.execute(context)
+            # Acquire CUDA-active lock for sections that may touch CUDA (VoiceProcessing and Generation)
+            try:
+                if i == 2 and not lock_held:  # VoiceProcessingPhase
+                    acquire_cuda_active_lock()
+                    lock_held = True
+
+                context = phase.execute(context)
+            finally:
+                # Release immediately after GenerationPhase so PostProcessing can run concurrently on CPU
+                if i == 3 and lock_held:  # GenerationPhase just finished
+                    release_cuda_active_lock()
+                    lock_held = False
             phase_times[phase_name] = time.perf_counter() - phase_start
+
+        # Safety: ensure lock is not left held even if phases changed or early returns occur
+        if lock_held:
+            release_cuda_active_lock()
 
         total_time = time.perf_counter() - start_total
         self._log_pipeline_results(total_time, phase_times, context)
