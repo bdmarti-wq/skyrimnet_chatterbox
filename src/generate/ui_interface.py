@@ -154,9 +154,9 @@ async def generate_audio_ui(
 
         # Execute the pipeline within concurrency control
         start_time = time.time()
-        with GEN_ACTIVE_LOCK:
-            # Run sync pipeline in threadpool (non-blocking for async UI)
-            result = await asyncio.to_thread(pipeline.run, context)
+        # Run sync pipeline in threadpool (non-blocking for async UI)
+        # Note: coordinator.run now handles GEN_ACTIVE_LOCK internally for model-touching phases
+        result = await asyncio.to_thread(pipeline.run, context)
 
         # Process result
         if result and result.output_path and Path(result.output_path).exists():

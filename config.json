@@ -70,6 +70,7 @@
       ],
       "fuzzy_force_skip_words": ["odin","kelsa", "lydia", "jenna", "misty", "anja", "katana", "sofia", "frea", "feris", "laci", "lyris", "vayne"],
       "fuzzy_index_size": 5000,
+      "fuzzy_max_entries_per_stem": 1000,
       "fuzzy_artifact_threshold_hz": 12000.0
     },
     "dtype": "bfloat16",

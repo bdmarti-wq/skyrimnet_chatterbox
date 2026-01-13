@@ -139,16 +139,33 @@ class CacheCheckPhase(BaseGenerationPhase):
 
         # 2. Fuzzy match (if exact miss) if enabled (and not force-skipped)
         if effective_fuzzy_enabled:
-            fuzzy_path = self.cache_manager.get_fuzzy_audio_cache(audio_prompt, text, voice_stem, threshold=0.70)
+            # OPTIMIZATION: get_fuzzy_audio_cache now returns abs path; we need to see if we can get duration too
+            # We'll use the cache_manager's fuzzy_cache directly to avoid double lookups if possible
+            fuzzy_cache = self.cache_manager.fuzzy_cache
+            fuzzy_path = fuzzy_cache.try_fuzzy_audio_cache(audio_prompt, text, voice_stem, threshold=0.70)
+            
             if fuzzy_path and os.path.exists(fuzzy_path):
+                # Retrieve cached duration if available to skip torchaudio.info
+                cached_duration = 0.0
+                with fuzzy_cache.cache_lock:
+                    norm_key = fuzzy_cache.normalize_text(text)
+                    entry = fuzzy_cache.cache_data.get(voice_stem, {}).get(norm_key)
+                    if entry:
+                        cached_duration = entry.get('duration', 0.0)
+
                 if self._validate_cached_audio(fuzzy_path, voice_stem):
-                    # Optimization: avoid full waveform load on fuzzy HIT
-                    try:
-                        info = torchaudio.info(fuzzy_path)
-                        context.audio_duration = float(info.num_frames) / float(info.sample_rate)
-                    except Exception as meta_e:
-                        logger.debug(f"Failed to read audio metadata for {fuzzy_path}: {meta_e}")
-                        context.audio_duration = 0.0
+                    if cached_duration > 0:
+                        context.audio_duration = cached_duration
+                        logger.debug(f"Using cached duration for fuzzy HIT: {cached_duration:.2f}s")
+                    else:
+                        # Optimization: avoid full waveform load on fuzzy HIT
+                        try:
+                            info = torchaudio.info(fuzzy_path)
+                            context.audio_duration = float(info.num_frames) / float(info.sample_rate)
+                        except Exception as meta_e:
+                            logger.debug(f"Failed to read audio metadata for {fuzzy_path}: {meta_e}")
+                            context.audio_duration = 0.0
+                    
                     logger.info(f"AUDIO FUZZY HIT≥0.70: '{(text or '')[:30]}…' → {fuzzy_path}")
                     context.cached_path = fuzzy_path
                     context.is_cached = True
@@ -229,21 +246,41 @@ class CacheCheckPhase(BaseGenerationPhase):
 
             # Artifact check (skip for refs; align with voice cache)
             try:
-                # Use config threshold if available (via cache_manager if present)
-                if hasattr(self.cache_manager, 'config') and hasattr(self.cache_manager.config.app_config, 'globals'):
-                    globals_config = self.cache_manager.config.app_config.globals
-                    if hasattr(globals_config, 'fuzzy') and hasattr(globals_config.fuzzy, 'artifact_threshold_hz'):
-                        threshold = globals_config.fuzzy.artifact_threshold_hz
-                    else:
-                        threshold = sr // 3  # Dynamic from SR
+                # OPTIMIZATION: Check if fuzzy cache already validated this file
+                fuzzy_cache = self.cache_manager.fuzzy_cache
+                is_artifact_free = None
+                with fuzzy_cache.cache_lock:
+                    # Find any entry that uses this path
+                    for s_entries in fuzzy_cache.cache_data.values():
+                        for entry in s_entries.values():
+                            if entry.get('wav_path') == str(Path(path).resolve().absolute()):
+                                is_artifact_free = entry.get('is_artifact_free')
+                                if is_artifact_free is not None:
+                                    break
+                        if is_artifact_free is not None:
+                            break
+                
+                if is_artifact_free is True:
+                    logger.debug(f"Skipping artifact check (cached free): {path}")
+                elif is_artifact_free is False:
+                    logger.debug(f"Rejecting cached artifact: {path}")
+                    return False
                 else:
-                    threshold = sr // 3  # Fallback
-                is_voice_ref = ('voices' in str(path).lower() or
-                                any(s in Path(path).stem for s in ['_fixed_new', '_padded', '_resampled', '_24kHz']))
-                if not is_voice_ref and threshold > 0:
-                    if is_artifact_laden(path, threshold_hz=threshold):
-                        return False, f"Artifacts in {stem}"
-                logger.trace(f"Artifact passed (or skipped) for {path}")
+                    # Use config threshold if available (via cache_manager if present)
+                    if hasattr(self.cache_manager, 'config') and hasattr(self.cache_manager.config.app_config, 'globals'):
+                        globals_config = self.cache_manager.config.app_config.globals
+                        if hasattr(globals_config, 'fuzzy') and hasattr(globals_config.fuzzy, 'artifact_threshold_hz'):
+                            threshold = globals_config.fuzzy.artifact_threshold_hz
+                        else:
+                            threshold = sr // 3  # Dynamic from SR
+                    else:
+                        threshold = sr // 3  # Fallback
+                    is_voice_ref = ('voices' in str(path).lower() or
+                                    any(s in Path(path).stem for s in ['_fixed_new', '_padded', '_resampled', '_24kHz']))
+                    if not is_voice_ref and threshold > 0:
+                        if is_artifact_laden(path, threshold_hz=threshold):
+                            return False, f"Artifacts in {stem}"
+                    logger.trace(f"Artifact passed (or skipped) for {path}")
             except ImportError:
                 logger.warning("Artifact check skipped (missing func)")
             except Exception as a_e:

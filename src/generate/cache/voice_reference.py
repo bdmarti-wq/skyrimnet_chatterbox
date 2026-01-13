@@ -35,6 +35,7 @@ class VoiceReferenceEntry(NamedTuple):
     duration: Optional[float] = None  # Quick match
     cleanup_metadata: Optional[Dict[str, Any]] = None  # Future: Trim/noise; None now
     last_processed: Optional[float] = None  # Timestamp; None for legacy
+    mtime: Optional[float] = None  # NEW: For quick metadata match
 
 class VoiceReferenceCache:
     """Manages voice reference files and their metadata for cloning."""
@@ -183,8 +184,21 @@ class VoiceReferenceCache:
                 return False
 
             incoming_size = os.path.getsize(incoming_path)
+            incoming_mtime = os.path.getmtime(incoming_path)
+            
             if cached_entry.file_size is not None and incoming_size != cached_entry.file_size:
                 logger.trace(f"Size mismatch: {incoming_size} != {cached_entry.file_size}")
+                return False
+
+            # NEW: Check mtime if available in cleanup_metadata or as a direct field
+            cached_mtime = None
+            if hasattr(cached_entry, 'mtime'):
+                cached_mtime = cached_entry.mtime
+            elif isinstance(cached_entry.cleanup_metadata, dict):
+                cached_mtime = cached_entry.cleanup_metadata.get('mtime')
+            
+            if cached_mtime is not None and abs(incoming_mtime - cached_mtime) > 0.1:
+                logger.trace(f"Mtime mismatch: {incoming_mtime} != {cached_mtime}")
                 return False
 
             incoming_info = self._get_audio_info(incoming_path)
@@ -193,10 +207,14 @@ class VoiceReferenceCache:
                 if cached_entry.duration is not None and abs(incoming_dur - cached_entry.duration) > 0.1:
                     logger.trace(f"Dur mismatch: {incoming_dur:.2f}s != {cached_entry.duration:.2f}s")
                     return False
-                if cached_entry.file_size is None:
-                    cached_entry.file_size = incoming_size  # Update cache
-                if cached_entry.duration is None:
-                    cached_entry.duration = incoming_dur  # Update cache
+                
+                # Update cache fields
+                cached_entry.file_size = incoming_size
+                cached_entry.duration = incoming_dur
+                if isinstance(cached_entry.cleanup_metadata, dict):
+                    cached_entry.cleanup_metadata['mtime'] = incoming_mtime
+                else:
+                    cached_entry.cleanup_metadata = {'mtime': incoming_mtime}
             else:
                 return False
 
@@ -296,6 +314,7 @@ class VoiceReferenceCache:
 
                             cleanup_meta = entry_data.get('cleanup_metadata', None)
                             last_proc = entry_data.get('last_processed')
+                            mtime = entry_data.get('mtime')
 
                             # SIMPLIFIED: Load under existing stem (no remap); forward uses norm_stem only
                             self.voice_cache[stem] = VoiceReferenceEntry(
@@ -304,7 +323,8 @@ class VoiceReferenceCache:
                                 conditionals_key=cond_key, last_updated=last_updated,
                                 voice_config=voice_config, custom_path=custom_path,
                                 file_size=file_size, duration=duration,
-                                cleanup_metadata=cleanup_meta, last_processed=last_proc
+                                cleanup_metadata=cleanup_meta, last_processed=last_proc,
+                                mtime=mtime
                             )
                         except Exception as e:
                             logger.warning(f"Skipping corrupt {stem}: {e}")
@@ -353,7 +373,8 @@ class VoiceReferenceCache:
                             "file_size": entry.file_size,
                             "duration": entry.duration,
                             "cleanup_metadata": entry.cleanup_metadata,
-                            "last_processed": entry.last_processed
+                            "last_processed": entry.last_processed,
+                            "mtime": entry.mtime
                         }
                     except Exception as e:
                         logger.warning(f"Serialize failed for {stem}: {e}")
@@ -549,6 +570,7 @@ class VoiceReferenceCache:
                 info = torchaudio.info(resampled_path)
                 file_size = os.path.getsize(resampled_path)
                 dur = info.num_frames / info.sample_rate
+                mtime = os.path.getmtime(final_path)  # Track mtime of original
                 entry = VoiceReferenceEntry(
                     stem=voice_stem,
                     reference_path=final_path,
@@ -562,11 +584,13 @@ class VoiceReferenceCache:
                     file_size=file_size,
                     duration=dur,
                     cleanup_metadata=cleanup_meta,
-                    last_processed=last_processed
+                    last_processed=last_processed,
+                    mtime=mtime
                 )
                 self.voice_cache[voice_stem] = entry  # FIXED: Override to stable norm
             except Exception as me:
                 logger.warning(f"Metadata error {voice_stem}: {me}")
+                mtime = os.path.getmtime(final_path) if os.path.exists(final_path) else None
                 entry = VoiceReferenceEntry(
                     stem=voice_stem,
                     reference_path=final_path,
@@ -580,7 +604,8 @@ class VoiceReferenceCache:
                     file_size=None,
                     duration=None,
                     cleanup_metadata=None,
-                    last_processed=None
+                    last_processed=None,
+                    mtime=mtime
                 )
                 self.voice_cache[voice_stem] = entry
             self.save_cache()

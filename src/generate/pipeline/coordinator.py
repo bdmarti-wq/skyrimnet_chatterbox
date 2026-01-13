@@ -9,7 +9,7 @@ from typing import Dict, Any, Optional
 
 from src.config import get_config
 from src.generate.cache.cache_manager import get_cache_manager
-from src.tts_model import get_model  # Warmup global in tts_model
+from src.tts_model import get_model, GEN_ACTIVE_LOCK  # Warmup global in tts_model
 from src.generate.cache import CacheManager
 from src.generate.pipeline.phases.inputs_validation import InputsValidationPhase
 from src.generate.pipeline.phases.check_cache import CacheCheckPhase
@@ -18,7 +18,11 @@ from src.generate.pipeline.phases.generation import GenerationPhase as TTSGenera
 from src.generate.pipeline.phases.post_processing import PostProcessingPhase
 from src.generate.pipeline.phases.output import OutputPhase
 from src.generate.pipeline.context import AudioGenerationContext
-from src.generate.pipeline.cuda_lock import acquire_cuda_active_lock, release_cuda_active_lock
+from src.generate.pipeline.cuda_lock import (
+    acquire_cuda_active_lock,
+    release_cuda_active_lock,
+    get_cuda_active_lock,
+)
 
 
 class GenerationCoordinator:
@@ -45,7 +49,9 @@ class GenerationCoordinator:
         logger.info("[PIPE] Coordinator initialized")
 
     def run(self, context: AudioGenerationContext) -> AudioGenerationContext:
-        """Inject once; check skip_pipeline after CacheCheck (bypass Voice/Gen/Post on audio HIT)."""
+        """Inject once; check skip_pipeline after CacheCheck (bypass Voice/Gen/Post on audio HIT).
+        SERIALIZED: Wrapped in GEN_ACTIVE_LOCK for model-touching phases only.
+        """
         start_total = time.perf_counter()
         context.model = self.model
         context.cache_manager = self.cache_manager
@@ -71,10 +77,33 @@ class GenerationCoordinator:
             # Acquire CUDA-active lock for sections that may touch CUDA (VoiceProcessing and Generation)
             try:
                 if i == 2 and not lock_held:  # VoiceProcessingPhase
-                    acquire_cuda_active_lock()
-                    lock_held = True
+                    # Non-blocking probe to log/record wait if the lock is busy
+                    probe_t0 = time.perf_counter()
+                    lock = get_cuda_active_lock()
+                    if lock.acquire(blocking=False):
+                        # Acquired immediately – no wait
+                        lock_held = True
+                        context.timing["cuda_gate_wait_start"] = probe_t0
+                        context.timing["cuda_gate_wait_end"] = probe_t0
+                        context.timing["cuda_gate_wait_s"] = 0.0
+                        logger.debug("[CUDA-LOCK] free – proceeding without wait")
+                    else:
+                        # Busy – record wait start, then block until available
+                        logger.info("[CUDA-LOCK] busy – queuing at VoiceProcessingPhase")
+                        context.timing["cuda_gate_wait_start"] = probe_t0
+                        acquire_cuda_active_lock()  # blocking until free
+                        wait_end = time.perf_counter()
+                        context.timing["cuda_gate_wait_end"] = wait_end
+                        context.timing["cuda_gate_wait_s"] = wait_end - probe_t0
+                        lock_held = True
 
-                context = phase.execute(context)
+                # Wrap the core generation phases in the global GEN_ACTIVE_LOCK to serialize model access
+                if i in (2, 3):  # VoiceProcessingPhase and GenerationPhase
+                    with GEN_ACTIVE_LOCK:
+                        context = phase.execute(context)
+                else:
+                    context = phase.execute(context)
+
             finally:
                 # Release immediately after GenerationPhase so PostProcessing can run concurrently on CPU
                 if i == 3 and lock_held:  # GenerationPhase just finished
@@ -108,7 +137,7 @@ class GenerationCoordinator:
         sr = globals_dict['sr']
         audio_dur = context.audio_duration
         rtf_total = audio_dur / total_time if total_time > 0 else float('inf')
-        cache_type = getattr(context, 'cache_hit_type', 'miss')
+        cache_type = getattr(context, 'cache_hit_type', 'miss') or 'miss'
         # Phase timing keys use the concrete class name. The generation phase class is named
         # 'GenerationPhase' (imported as TTSGenerationPhase). Previously this looked up
         # 'TTSGenerationPhase', which returned 0 and caused an infinite RTF. Check both to be safe.

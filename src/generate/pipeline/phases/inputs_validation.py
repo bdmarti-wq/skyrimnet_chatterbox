@@ -44,7 +44,8 @@ class InputsValidationPhase(BaseGenerationPhase):
 
                 # Build: <token> + '...' + <original text>
                 ellipsis = '...'
-                new_text = f"{token} {base_stripped}"
+                # FIXED: Ensure effective padding by including the token and ellipsis to stabilize prosody
+                new_text = f"{token} {ellipsis} {base_stripped}"
 
                 # Persist metadata for post-generation trimming
                 setattr(context, 'meta', getattr(context, 'meta', {}))

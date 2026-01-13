@@ -228,6 +228,7 @@ class FuzzyConfig(BaseModel):
     fuzzy_boost_amount: float = Field(default=0.15, ge=CAPS['FUZZY_BOOST_AMOUNT_MIN'], le=CAPS['FUZZY_BOOST_AMOUNT_MAX'])
     fuzzy_boost_words: List[str] = Field(default_factory=lambda: CAPS['FUZZY_BOOST_WORDS'])  # List from CAPS
     fuzzy_index_size: int = Field(default=1000, ge=CAPS['FUZZY_CACHE_LIMIT_MIN'], le=CAPS['FUZZY_CACHE_LIMIT_MAX'])
+    fuzzy_max_entries_per_stem: int = Field(default=1000, ge=1, le=5000)
     fuzzy_artifact_threshold_hz: float = Field(default=12000.0, ge=CAPS['FUZZY_ARTIFACT_THRESHOLD_HZ_MIN'], le=CAPS['FUZZY_ARTIFACT_THRESHOLD_HZ_MAX'])
     # New: words that force skipping fuzzy cache when present in the text
     fuzzy_force_skip_words: List[str] = Field(default_factory=list)

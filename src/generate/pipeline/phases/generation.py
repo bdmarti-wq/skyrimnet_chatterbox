@@ -218,10 +218,11 @@ class GenerationPhase(BaseGenerationPhase):
             logger.debug("Output has NaN/Inf")
             return False
         samples = output.shape[-1]
+        # RELAXED: Lower floor for very short strings to avoid "Output too short" on exclamations
         if text_len <= 2:
-            min_samples = max(int(sr * 0.20), text_len * 80)  # 0.20s floor for very short texts
+            min_samples = max(int(sr * 0.10), text_len * 40)  # 0.10s floor (was 0.20s)
         else:
-            min_samples = max(int(sr * 0.50), text_len * 80)
+            min_samples = max(int(sr * 0.25), text_len * 40)  # 0.25s floor (was 0.50s)
         if samples < min_samples:
             logger.debug(
                 f"Output too short: samples={samples}, min={min_samples} (text_len={text_len}, shape={output.shape})")

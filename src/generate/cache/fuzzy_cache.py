@@ -61,6 +61,7 @@ class FuzzyAudioCache:
         self.min_length = self._get_nested_config('fuzzy', 'fuzzy_min_length', default=3)
         self.max_index_size = self._get_nested_config('fuzzy', 'fuzzy_index_size', default=1000)
         self.enable_fuzzy = self._get_nested_config('fuzzy', 'enable_fuzzy_cache', default=True)
+        self.max_entries_per_stem = self._get_nested_config('fuzzy', 'fuzzy_max_entries_per_stem', default=1000)
         self.enable_artifact_purge = self._get_nested_config('fuzzy', 'fuzzy_artifact_purge_enable', default=True)
         self.artifact_threshold_hz = self._get_nested_config('fuzzy', 'fuzzy_artifact_threshold_hz', default=12000.0)
         self.boost_words = self._get_nested_config('fuzzy', 'fuzzy_boost_words', default=['ahh', 'mmm', 'ooh', 'gasp', 'oh', 'fuck', 'yes', 'aah', 'gods'])
@@ -103,6 +104,7 @@ class FuzzyAudioCache:
             "enabled": self.enable_fuzzy,
             "artifact_purge": self.enable_artifact_purge,
             "artifact_threshold_hz": self.artifact_threshold_hz,
+            "max_entries_per_stem": self.max_entries_per_stem,
             "index_size_limit": self.max_index_size,
             "instance_id": hex(id(self))  # Hex ID to track singleton
         }
@@ -160,7 +162,15 @@ class FuzzyAudioCache:
 
         # Queue for background processing (use abs path)
         try:
-            self.fuzzy_queue.put((text, wav_path_abs, voice_stem, sim_boost), block=False)
+            import torchaudio
+            duration = 0.0
+            try:
+                info = torchaudio.info(wav_path_abs)
+                duration = float(info.num_frames) / float(info.sample_rate)
+            except Exception as e:
+                logger.debug(f"Failed to get duration for fuzzy index: {e}")
+
+            self.fuzzy_queue.put((text, wav_path_abs, voice_stem, sim_boost, duration), block=False)
             logger.trace(f"Queued fuzzy index: {norm_key[:30]} for {voice_stem}")
         except Exception as e:
             logger.warning(f"Failed to queue fuzzy index: {str(e)}")
@@ -228,10 +238,20 @@ class FuzzyAudioCache:
             if not os.path.exists(best_path_abs):
                 logger.trace(f"Fuzzy MISS: Best candidate '{best_path_abs}' doesn't exist")
                 return None
+            
+            # Use cached validation if available
+            norm_key = self.normalize_text(best_match)
+            entry = stem_entries.get(norm_key)
+            
+            is_artifact_free = entry.get('is_artifact_free') if entry else None
+            
+            if is_artifact_free is False:
+                logger.debug(f"Fuzzy HIT rejected (cached artifact): {best_path_abs}")
+                return None
+
             if not Path(best_path_abs).is_relative_to(self.base_dir):
                 logger.warning(f"Fuzzy HIT invalid subpath for {best_path_abs} – purging entry")
                 with self.cache_lock:
-                    norm_key = self.normalize_text(best_match)
                     if stem in self.cache_data and norm_key in self.cache_data[stem]:
                         del self.cache_data[stem][norm_key]
                         if not self.cache_data[stem]:
@@ -239,19 +259,23 @@ class FuzzyAudioCache:
                 self._save_cache(save_all=True)  # Force save after purge
                 return None
 
-            # Validate for artifacts if enabled
-            if self.enable_artifact_purge and is_artifact_laden(best_path_abs, threshold_hz=self.artifact_threshold_hz):
-                logger.warning(
-                    f"Fuzzy HIT invalid: Artifacts in {best_path_abs} (centroid >{self.artifact_threshold_hz}Hz) – purging entry"
-                )
-                with self.cache_lock:
-                    norm_key = self.normalize_text(best_match)
-                    if stem in self.cache_data and norm_key in self.cache_data[stem]:
-                        del self.cache_data[stem][norm_key]
-                        if not self.cache_data[stem]:
-                            del self.cache_data[stem]
-                self._save_cache(save_all=True)  # Force save after purge
-                return None
+            # Validate for artifacts if enabled and not already known to be free
+            if is_artifact_free is None and self.enable_artifact_purge:
+                if is_artifact_laden(best_path_abs, threshold_hz=self.artifact_threshold_hz):
+                    logger.warning(
+                        f"Fuzzy HIT invalid: Artifacts in {best_path_abs} (centroid >{self.artifact_threshold_hz}Hz) – purging entry"
+                    )
+                    with self.cache_lock:
+                        if stem in self.cache_data and norm_key in self.cache_data[stem]:
+                            del self.cache_data[stem][norm_key]
+                            if not self.cache_data[stem]:
+                                del self.cache_data[stem]
+                    self._save_cache(save_all=True)  # Force save after purge
+                    return None
+                else:
+                    # Cache the successful result
+                    if entry:
+                        entry['is_artifact_free'] = True
 
             logger.info(
                 f"Fuzzy cache HIT: '{text_input[:30]}...' ≈ '{best_match[:30]}...' "
@@ -279,7 +303,7 @@ class FuzzyAudioCache:
         def worker():
             while True:
                 try:
-                    text, wav_path, voice_stem, sim_boost = self.fuzzy_queue.get(timeout=1)
+                    text, wav_path, voice_stem, sim_boost, duration = self.fuzzy_queue.get(timeout=1)
                     orig_text = text
 
                     # FIXED: Validate wav_path subpath early (skip if not under base_dir – fixes "not in subpath")
@@ -340,18 +364,39 @@ class FuzzyAudioCache:
                                 'orig_text': orig_text,
                                 'stem': voice_stem,
                                 'sim_boost': sim_boost,
+                                'duration': duration,
+                                'is_artifact_free': True, # It passed pre-filter if it got here
                                 'time_indexed': time.time()
                             }
+                        
+                        # Apply global size limit check if needed
+                        total_entries = sum(len(entries) for entries in self.cache_data.values())
+                        if total_entries > self.max_index_size:
+                            # Global eviction (LRU across all stems)
+                            all_entries = []
+                            for s, entries in self.cache_data.items():
+                                for k, e in entries.items():
+                                    all_entries.append((s, k, e.get('time_indexed', 0)))
+                            
+                            if all_entries:
+                                # Sort by time_indexed
+                                all_entries.sort(key=lambda x: x[2])
+                                # Evict until under limit
+                                to_evict = total_entries - self.max_index_size
+                                for i in range(min(len(all_entries), to_evict)):
+                                    s, k, _ = all_entries[i]
+                                    del self.cache_data[s][k]
+                                    if not self.cache_data[s]:
+                                        del self.cache_data[s]
+                                logger.info(f"Global fuzzy eviction: {to_evict} entries deleted (limit={self.max_index_size})")
 
-                        # Handle save throttling (kept minimal)
-                        self.save_counter += 1
-                        time_since_last = time.time() - self.last_save_time
-
-                        # Save conditions: Every 10 indexes OR when queue >20 OR idle >30s
-                        if (self.save_counter >= 10 or
-                            self.fuzzy_queue.qsize() > 20 or
-                            time_since_last > 30):
-                            self._save_cache(save_all=False)
+                        # Save conditions: Every 25 indexes OR idle >60s
+                        if (self.save_counter >= 25 or
+                            time_since_last > 60):
+                            # Start saving in a background thread to avoid blocking the worker
+                            # which might be needed for other tasks (though it's a dedicated worker)
+                            # More importantly, it keeps the worker loop responsive.
+                            threading.Thread(target=self._save_cache, args=(False,), daemon=True).start()
                             self.save_counter = 0
 
                     self.fuzzy_queue.task_done()
@@ -359,8 +404,9 @@ class FuzzyAudioCache:
                 except Empty:
                     # Check for idle save condition
                     time_since_last = time.time() - self.last_save_time
-                    if time_since_last > 30 and self.cache_data:
-                        self._save_cache(save_all=True)
+                    if time_since_last > 60 and self.save_counter > 0:
+                        threading.Thread(target=self._save_cache, args=(True,), daemon=True).start()
+                        self.save_counter = 0
                     continue
 
                 except Exception as e:
