@@ -68,7 +68,7 @@
         "ooh",
         "gasp"
       ],
-      "fuzzy_force_skip_words": ["odin","kelsa", "lydia", "jenna", "misty", "anja", "katana", "sofia", "frea", "feris", "laci", "lyris", "vayne"],
+      "fuzzy_force_skip_words": ["odin","kelsa", "lydia", "jenna", "misty", "anja", "katana", "sofia", "frea", "feris", "laci", "lyris", "vayne", "nyri", "vermillion", "maria"],
       "fuzzy_index_size": 5000,
       "fuzzy_max_entries_per_stem": 1000,
       "fuzzy_artifact_threshold_hz": 12000.0
@@ -82,6 +82,8 @@
     "device": "cuda",
     "multilingual": false,
     "sr": 24000,
+    "default_voice_path": "cache/audio/voices/resampled/malebrute_24000Hz.wav",
+    "default_conditionals_path": "cache/conditionals/conds_v2_malebrute_ref_06e.pt",
     "root": "C:\\Users\\bdmar\\skyrimnet_chatterbox",
     "cache_dir": "C:\\Users\\bdmar\\skyrimnet_chatterbox\\cache",
     "audio_cache_dir": "C:\\Users\\bdmar\\skyrimnet_chatterbox\\cache\\audio",

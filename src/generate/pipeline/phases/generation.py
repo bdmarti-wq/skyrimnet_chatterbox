@@ -12,22 +12,33 @@ from ...pipeline.context import AudioGenerationContext
 
 class GenerationPhase(BaseGenerationPhase):
     def _execute_core(self, context: AudioGenerationContext) -> AudioGenerationContext:
-        """Core TTS generation with conds. FIXED: Set generated_wav for PostProcessing; defer processed_wav."""
+        """Core TTS generation with conds. FIXED: Handle neutral conds via dummy gen if possible."""
         # Restore conds from cache if present (voice phase sets)
         if hasattr(context, 'conds') and context.conds is not None:
             context.model.conds = context.conds
             logger.debug("Restored conds from context")
         else:
-            # Fallback stub if no conds (e.g., error)
-            logger.warning("No conds in context; skipping gen (empty WAV)")
-            # Use shared silence helper for consistency – force CPU to avoid CUDA usage in fallback
-            globals_dict = context.get_globals()
-            sr = globals_dict['sr']
-            dtype = globals_dict['dtype']
-            context.processed_wav = self.create_silence(sr, 2.0, torch.device('cpu'), dtype)
-            # For fallback, set generated_wav as empty too for post-consistency (CPU to avoid CUDA during failures)
-            context.generated_wav = torch.zeros(0, dtype=torch.float32, device=torch.device('cpu'))  # Empty trigger
-            return context
+            # Check if model has neutral conditionals already set or can generate without them
+            if hasattr(context.model, 'conds') and context.model.conds is not None:
+                logger.debug("Using model's existing conds (likely neutral)")
+            else:
+                # Fallback stub if no conds
+                logger.warning("No conds in context or model; attempting neutral generation or fallback")
+                # Try to create dummy conds to avoid empty WAV
+                try:
+                    from src.tts_model import create_dummy_conds
+                    globals_dict = context.get_globals()
+                    context.conds = create_dummy_conds(context.model, globals_dict['device'], globals_dict['dtype'], reason="neutral_fallback")
+                    context.model.conds = context.conds
+                except Exception as e:
+                    logger.error(f"Failed to create dummy conds: {e}")
+                    # Absolute fallback to silence if even dummy fails
+                    globals_dict = context.get_globals()
+                    sr = globals_dict['sr']
+                    dtype = globals_dict['dtype']
+                    context.processed_wav = self.create_silence(sr, 2.0, torch.device('cpu'), dtype)
+                    context.generated_wav = torch.zeros(0, dtype=torch.float32, device=torch.device('cpu'))
+                    return context
 
         # Log the exact text used for generation (helps debug padding/repeat logic)
         safe_text = context.text or ""

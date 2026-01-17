@@ -452,13 +452,15 @@ class ConditionalsCache:
                 logger.info("Cleared entire conds cache")
 
     def get_stats(self) -> Dict[str, Any]:
-        """Get cache statistics (added hits/misses). FIXED: Include mock purges in stats if needed."""
+        """Get cache statistics (added hits/misses). FIXED: Include 'entries' for main logger."""
         with self.cache_lock:
-            disk_size = sum(cache_file.stat().st_size for cache_file in self.cache_dir.glob("*.pt") if
+            disk_files = list(self.cache_dir.glob("*.pt"))
+            disk_size = sum(cache_file.stat().st_size for cache_file in disk_files if
                             (disk_size := cache_file.stat().st_size or 0))
             return {
+                "entries": len(disk_files),  # Total entries on disk
                 "memory_entries": len(self.memory_cache),
-                "disk_entries": len(list(self.cache_dir.glob("*.pt"))),
+                "disk_entries": len(disk_files),
                 "disk_size": disk_size,
                 "max_memory": self.max_memory_entries,
                 "stats": self.stats  # Include hits/misses

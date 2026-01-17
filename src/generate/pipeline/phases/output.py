@@ -87,15 +87,34 @@ class OutputPhase(BaseGenerationPhase):
             try:
                 peak = float(torch.max(torch.abs(wav_cpu))) if wav_cpu.numel() > 0 else 0.0
                 rms = float(torch.sqrt(torch.mean(wav_cpu ** 2))) if wav_cpu.numel() > 0 else 0.0
-            except Exception:
+                
+                # Pre-validate in memory (Mitigation 2)
+                from src.audio import is_artifact_laden_array
+                wav_np = wav_cpu.numpy()
+                if wav_np.ndim > 1:
+                    wav_np = wav_np.squeeze()
+                
+                # Use same threshold as fuzzy cache if possible
+                artifact_threshold = 12000.0
+                if self.cache_manager and hasattr(self.cache_manager, 'fuzzy_cache'):
+                    artifact_threshold = getattr(self.cache_manager.fuzzy_cache, 'artifact_threshold_hz', 12000.0)
+                
+                is_artifact = is_artifact_laden_array(wav_np, sr_int, threshold_hz=artifact_threshold)
+            except Exception as e:
+                logger.debug(f"In-memory validation error: {e}")
                 peak, rms = 0.0, 0.0
+                is_artifact = False
 
             worker_status = getattr(context, 'worker_status', '') or ''
             bad_status = worker_status in {"timeout", "gen_err", "enqueue_err", "protocol_err"}
             near_silence = (peak <= 1e-6) or (rms <= 1e-4)
 
-            if bad_status or near_silence:
-                reason = f"worker_status={worker_status}" if bad_status else f"near_silence peak={peak:.2e} rms={rms:.2e}"
+            if bad_status or near_silence or is_artifact:
+                reason = "unknown"
+                if bad_status: reason = f"worker_status={worker_status}"
+                elif near_silence: reason = f"near_silence peak={peak:.2e} rms={rms:.2e}"
+                elif is_artifact: reason = f"artifacts detected in memory (>{artifact_threshold}Hz)"
+                
                 logger.info(f"Skip caching/indexing due to {reason}")
                 # Mark as error_fallback for coordinator summary
                 try:
@@ -104,51 +123,47 @@ class OutputPhase(BaseGenerationPhase):
                     pass
                 return context
 
-            # FIXED: Always attempt exact cache set (post-save, sync) – generate full key using CacheManager
-            is_hit = getattr(context, 'is_cached', False)  # From earlier pipeline stages
-            if self.cache_manager:  # Ensure available
-                # Generate full key (voice_stem, text, exaggeration, cache_uuid)
-                exagg = getattr(context, 'exaggeration', 0.5)  # Default fallback
-                uuid_val = getattr(context, 'cache_uuid', 0)  # Default 0 if missing
-                cache_key = self.cache_manager.generate_audio_cache_key(
-                    voice_stem=voice_stem,
-                    text=context.text or "",
-                    exaggeration=exagg,
-                    cache_uuid=uuid_val
-                )
-                logger.debug(f"Generated cache_key for set: {cache_key}")
-                self.cache_manager.set_audio_cache(cache_key, str(output_path))
-                logger.info(f"Set exact audio cache: {cache_key[:20]}... → {output_path.name}")
-
-                # FIXED: Always index for fuzzy (post-save, after exact set) – moved here from UI
-                if hasattr(self.cache_manager, 'index_audio_for_fuzzy'):
+            # FIXED: Parallelize Cache Updates (Mitigation 1)
+            if self.cache_manager:
+                exagg = getattr(context, 'exaggeration', 0.5)
+                uuid_val = getattr(context, 'cache_uuid', 0)
+                text_val = context.text or ""
+                out_path_str = str(output_path)
+                
+                def background_cache_update():
                     try:
-                        # Idempotency guard: avoid re-indexing the same cache key repeatedly in one process
-                        if cache_key not in self._recent_indexed_keys:
-                            self.cache_manager.index_audio_for_fuzzy(
-                                text=context.text or "",
-                                audio_path=str(output_path),
-                                voice_stem=voice_stem
-                            )
-                            self._recent_indexed_keys.add(cache_key)
-                            logger.debug(
-                                f"Indexed audio for fuzzy: '{context.text[:30]}...' → {output_path.name} (stem={voice_stem})")
-                        else:
-                            logger.debug(f"Skip duplicate fuzzy index for {cache_key[:20]}... (already indexed)")
-                    except Exception as fuzzy_e:
-                        logger.warning(f"Failed to index for fuzzy: {fuzzy_e}")
-                    # Legacy async postgen queue (if needed, but direct set/index preferred)
-                    if hasattr(self.audio_cache, 'async_cache_postgen'):
-                        try:
-                            self.audio_cache.async_cache_postgen(
-                                cache_key=cache_key,  # Use full key
-                                audio_path=str(output_path),
-                                text=context.text or '',
-                                voice_stem=voice_stem
-                            )
-                            logger.debug(f"Queued legacy postgen for {output_path.name}")
-                        except Exception as queue_e:
-                            logger.warning(f"Legacy queue failed: {queue_e}")
+                        # 1. Exact cache set
+                        cache_key = self.cache_manager.generate_audio_cache_key(
+                            voice_stem=voice_stem,
+                            text=text_val,
+                            exaggeration=exagg,
+                            cache_uuid=uuid_val
+                        )
+                        # We use a direct call to audio_cache.set if available to avoid redundant validation
+                        # because we already validated in memory above.
+                        if hasattr(self.cache_manager, 'audio_cache') and self.cache_manager.audio_cache:
+                            self.cache_manager.audio_cache.set(cache_key, out_path_str)
+                            logger.info(f"Set exact audio cache (bg): {cache_key[:20]}... → {output_path.name}")
+                        
+                        # 2. Fuzzy indexing
+                        if hasattr(self.cache_manager, 'index_audio_for_fuzzy'):
+                            if cache_key not in self._recent_indexed_keys:
+                                # We call index_audio directly on fuzzy_cache if possible to skip redundant is_artifact_laden checks
+                                if hasattr(self.cache_manager, 'fuzzy_cache') and self.cache_manager.fuzzy_cache:
+                                    # We can't easily skip all checks without duplicating index_audio logic, 
+                                    # but it's in a background thread now so it's fine.
+                                    self.cache_manager.index_audio_for_fuzzy(
+                                        text=text_val,
+                                        audio_path=out_path_str,
+                                        voice_stem=voice_stem
+                                    )
+                                self._recent_indexed_keys.add(cache_key)
+                                logger.debug(f"Indexed audio for fuzzy (bg): '{text_val[:30]}...' → {output_path.name}")
+                    except Exception as bg_e:
+                        logger.warning(f"Background cache update failed: {bg_e}")
+
+                import threading
+                threading.Thread(target=background_cache_update, daemon=True, name="CacheUpdateBG").start()
             else:
                 logger.warning("No CacheManager – skipped exact cache set and fuzzy index")
         else:

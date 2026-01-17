@@ -64,15 +64,41 @@ class AudioCache:
         self.audio_cache: Dict[str, dict] = {}  # Dict of {'path': str, 'size': int, 'added_time': float, 'last_used': float}
         self.total_size = 0  # Total cached size in bytes (for eviction)
         self.cache_lock = threading.RLock()
+        self.save_interval = 5.0
+        self.last_save_time = 0
+        self._save_event = threading.Event()
 
         # Load existing cache (only once)
         self.load_cache()
+
+        # Start background save worker
+        self._start_save_worker()
 
         # Singleton flag (set after full init)
         self._initialized = True
 
         # Logging with the resolved values (no dependency on internal config attrs)
         logger.info(f"AudioCache singleton initialized at {self.cache_dir} (max_entries={self.max_entries}, max_size={self.max_total_size_mb}MB)")
+
+    def _start_save_worker(self) -> None:
+        """Start background thread for throttled disk persistence."""
+        def worker():
+            while True:
+                # Wait for signal or timeout
+                signaled = self._save_event.wait(timeout=self.save_interval)
+                
+                # Check for shutdown (using _initialized as a proxy, or we could add a signal)
+                # For now, we'll just keep it running as a daemon thread.
+                
+                if signaled or (time.time() - self.last_save_time >= 60.0):
+                    self.save_cache()
+                    self._save_event.clear()
+        
+        threading.Thread(
+            target=worker,
+            daemon=True,
+            name="AudioCacheSaver"
+        ).start()
 
     def load_cache(self) -> None:
         """Load audio cache metadata from disk to memory (only once for the singleton)."""
@@ -129,6 +155,8 @@ class AudioCache:
 
     def save_cache(self) -> None:
         """Save audio cache metadata from memory to disk."""
+        now = time.time()
+        self.last_save_time = now
         with self.cache_lock:
             try:
                 # Prepare data for save (only valid paths; new format)
@@ -172,7 +200,8 @@ class AudioCache:
                     # Path invalid - remove entry
                     del self.audio_cache[key]
                     self.total_size -= entry['size']
-                    self.save_cache()
+                    # Signal background saver instead of sync save
+                    self._save_event.set()
                     logger.debug(f"Audio cache miss (stale path): {key}")
             return None
 
@@ -213,9 +242,8 @@ class AudioCache:
             }
             self.total_size += file_size
 
-            # Persist immediately if at 80% capacity (to avoid too many in flight)
-            if len(self.audio_cache) >= max_entries * 0.8:
-                self.save_cache()
+            # Signal background saver
+            self._save_event.set()
 
             logger.debug(f"Audio cached: {key} → {Path(path).name} ({file_size / (1024*1024):.1f}MB) | Cache stats: {len(self.audio_cache)} entries, {self.total_size / (1024*1024):.1f}MB total")
 
@@ -242,6 +270,14 @@ class AudioCache:
                 self.total_size = 0
                 logger.info("Cleared entire audio cache")
             self.save_cache()
+
+    def __del__(self):
+        """Ensure cache is saved on destruction."""
+        try:
+            if hasattr(self, '_save_event'):
+                self.save_cache()
+        except:
+            pass
 
     def get_stats(self) -> Dict[str, Any]:
         """Get audio cache statistics with safety fallbacks."""

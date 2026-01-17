@@ -286,6 +286,8 @@ class Globals(BaseModel):
     device: str = Field(default='cuda')
     multilingual: bool = Field(default=False)
     sr: int = Field(default=24000)
+    default_voice_path: str = Field(default='cache/audio/voices/resampled/malebrute_24000Hz.wav')
+    default_conditionals_path: str = Field(default='cache/conditionals/conds_v2_malebrute_ref_06e.pt')
 
     # directories
     root: Optional[Path] = Field(default=None, description="Project root directory")

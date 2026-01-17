@@ -66,6 +66,7 @@ class FuzzyAudioCache:
         self.artifact_threshold_hz = self._get_nested_config('fuzzy', 'fuzzy_artifact_threshold_hz', default=12000.0)
         self.boost_words = self._get_nested_config('fuzzy', 'fuzzy_boost_words', default=['ahh', 'mmm', 'ooh', 'gasp', 'oh', 'fuck', 'yes', 'aah', 'gods'])
         self.boost_amount = self._get_nested_config('fuzzy', 'fuzzy_boost_amount', default=0.15)
+        self.skip_words = self._get_nested_config('fuzzy', 'fuzzy_force_skip_words', default=[])
 
         self.cache_dir = cache_dir
         self.cache_dir.mkdir(parents=True, exist_ok=True)
@@ -77,7 +78,9 @@ class FuzzyAudioCache:
         self.save_interval = 5.0
         self.fuzzy_queue = Queue(maxsize=0)  # Non-blocking
         self.last_save_time = 0
+        self.last_cleanup_time = 0
         self.save_counter = 0
+        self._save_event = threading.Event()  # NEW: Save signal for background worker
 
         # FIXED: Base dir...
         self.base_dir = self.cache_dir.parent  # "cache" – ensures all paths relative to root
@@ -118,7 +121,7 @@ class FuzzyAudioCache:
             else:
                 self.cache_data.clear()
                 logger.info("Cleared entire fuzzy cache")
-            self._save_cache(save_all=True)
+            self._save_cache(save_all=True, background_cleanup=True)
 
     def index_audio(self, text: str, wav_path: str, voice_stem: str) -> None:
         """Add audio to fuzzy cache for future matching. FIXED: Ensure absolute path when queuing (subpath safe)."""
@@ -140,6 +143,18 @@ class FuzzyAudioCache:
         if len(text.strip()) < self.min_length:
             logger.trace(f"Skipped indexing short text (<{self.min_length}): {text[:10] if text else 'N/A'}")
             return
+
+        # Normalize text for index
+        norm_key = self.normalize_text(text)
+        clean_text = re.sub(r'[^\w\s]', '', text.lower()).strip()
+        words = set(clean_text.split())
+
+        # Skip if any force skip words are detected
+        if self.skip_words:
+            for skip_word in self.skip_words:
+                if skip_word.lower() in words:
+                    logger.info(f"Fuzzy index SKIP: force skip word '{skip_word}' detected in text '{text[:30]}...'")
+                    return
 
         # Skip artifacts
         if self.enable_artifact_purge and is_artifact_laden(wav_path_abs, threshold_hz=self.artifact_threshold_hz):
@@ -195,15 +210,18 @@ class FuzzyAudioCache:
 
         # Validate text length
         clean_text = re.sub(r'[^\w\s]', '', text_input.lower()).strip()
+        words = set(clean_text.split())
+
+        # Immediate rejection for force skip words
+        if self.skip_words:
+            for skip_word in self.skip_words:
+                if skip_word.lower() in words:
+                    logger.debug(f"Fuzzy HIT rejected: force skip word '{skip_word}' detected in input")
+                    return None
+
         if len(clean_text.split()) < self.min_length // 2:  # Word-based too (e.g., "aah..." → short)
             logger.trace(f"Fuzzy MISS early: Normalized text too short ('{clean_text}')")
             return None
-
-        # Derive stem from audio path if not provided
-        if not stem:
-            stem = normalize_stem(audio_path)
-        if not stem or len(stem) < 3:
-            stem = 'global'  # Fallback to global cache
 
         # Early exit if no entries for stem
         with self.cache_lock:
@@ -212,24 +230,46 @@ class FuzzyAudioCache:
                 logger.trace(f"Fuzzy MISS: No entries for stem '{stem}'")
                 return None
 
-            # Convert to list for iteration
-            candidates = list(stem_entries.values())
-
-        # Find best match
-        best_match, best_path, best_sim = None, None, 0.0
-
-        for entry in candidates:
-            clean_entry = re.sub(r'[^\w\s]', '', entry['orig_text'].lower()).strip()
-            raw_ratio = SequenceMatcher(None, clean_text, clean_entry).ratio()
-
-            # Apply boost logic
-            sim_boost = entry.get('sim_boost', 0.0)
-            adjusted_sim = min(1.0, raw_ratio + sim_boost)
-
-            if adjusted_sim > best_sim:
-                best_sim = adjusted_sim
+            # Optimization: If we have an exact text match, return immediately (fast path)
+            norm_key = self.normalize_text(text_input)
+            if norm_key in stem_entries:
+                entry = stem_entries[norm_key]
                 best_match = entry['orig_text']
                 best_path = entry['wav_path']
+                best_sim = 1.0
+                candidates = [] # Skip loop
+            else:
+                # Convert to list for iteration
+                candidates = list(stem_entries.values())
+
+        # Find best match (if not found in fast path)
+        if norm_key in stem_entries:
+            # We already have best_match, best_path, best_sim from fast path above
+            pass
+        elif not candidates:
+             return None
+        else:
+            best_match, best_path, best_sim = None, None, 0.0
+            for entry in candidates:
+                clean_entry = re.sub(r'[^\w\s]', '', entry['orig_text'].lower()).strip()
+                # Fast similarity pre-check: if length difference is too large, it can't be a hit
+                len_diff = abs(len(clean_text) - len(clean_entry))
+                max_len = max(len(clean_text), len(clean_entry))
+                if max_len > 0 and (1.0 - (len_diff / max_len)) < (threshold - 0.2):
+                    continue
+
+                raw_ratio = SequenceMatcher(None, clean_text, clean_entry).ratio()
+
+                # Apply boost logic
+                sim_boost = entry.get('sim_boost', 0.0)
+                adjusted_sim = min(1.0, raw_ratio + sim_boost)
+
+                if adjusted_sim > best_sim:
+                    best_sim = adjusted_sim
+                    best_match = entry['orig_text']
+                    best_path = entry['wav_path']
+                    if best_sim >= 0.98: # Good enough for early exit
+                        break
 
         # Check if we have a hit
         if best_sim >= threshold and best_path:
@@ -256,7 +296,8 @@ class FuzzyAudioCache:
                         del self.cache_data[stem][norm_key]
                         if not self.cache_data[stem]:
                             del self.cache_data[stem]
-                self._save_cache(save_all=True)  # Force save after purge
+                # Start background saving to avoid blocking the pipeline
+                self._save_event.set()
                 return None
 
             # Validate for artifacts if enabled and not already known to be free
@@ -270,7 +311,8 @@ class FuzzyAudioCache:
                             del self.cache_data[stem][norm_key]
                             if not self.cache_data[stem]:
                                 del self.cache_data[stem]
-                    self._save_cache(save_all=True)  # Force save after purge
+                    # Start background saving with cleanup to avoid blocking the pipeline
+                    self._save_event.set()
                     return None
                 else:
                     # Cache the successful result
@@ -301,9 +343,14 @@ class FuzzyAudioCache:
     def _start_index_worker(self) -> None:
         """Start background thread for async index processing. FIXED: Path subpath validation in worker (skip invalid)."""
         def worker():
+            self.last_cleanup_time = time.time()
             while True:
                 try:
-                    text, wav_path, voice_stem, sim_boost, duration = self.fuzzy_queue.get(timeout=1)
+                    queue_item = self.fuzzy_queue.get(timeout=1)
+                    if queue_item is None: # Shutdown signal
+                        break
+                    
+                    text, wav_path, voice_stem, sim_boost, duration = queue_item
                     orig_text = text
 
                     # FIXED: Validate wav_path subpath early (skip if not under base_dir – fixes "not in subpath")
@@ -324,6 +371,20 @@ class FuzzyAudioCache:
                         logger.trace(f"Skipped indexing short text (<{min_length}): {orig_text[:10]}...")
                         self.fuzzy_queue.task_done()
                         continue
+
+                    # Skip if force skip words detected in worker
+                    clean_worker_text = re.sub(r'[^\w\s]', '', orig_text.lower()).strip()
+                    worker_words = set(clean_worker_text.split())
+                    if self.skip_words:
+                        skip_detected = False
+                        for skip_word in self.skip_words:
+                            if skip_word.lower() in worker_words:
+                                logger.debug(f"Fuzzy worker skip: force skip word '{skip_word}' in '{orig_text[:20]}...'")
+                                skip_detected = True
+                                break
+                        if skip_detected:
+                            self.fuzzy_queue.task_done()
+                            continue
 
                     # Skip artifacts (shouldn't happen after pre-filter but double checking)
                     if self.enable_artifact_purge and is_artifact_laden(str(wav_path_p), threshold_hz=self.artifact_threshold_hz):
@@ -391,22 +452,34 @@ class FuzzyAudioCache:
                                 logger.info(f"Global fuzzy eviction: {to_evict} entries deleted (limit={self.max_index_size})")
 
                         # Save conditions: Every 25 indexes OR idle >60s
+                        time_since_last = time.time() - self.last_save_time
+                        time_since_last_cleanup = time.time() - getattr(self, 'last_cleanup_time', 0)
                         if (self.save_counter >= 25 or
-                            time_since_last > 60):
-                            # Start saving in a background thread to avoid blocking the worker
-                            # which might be needed for other tasks (though it's a dedicated worker)
-                            # More importantly, it keeps the worker loop responsive.
-                            threading.Thread(target=self._save_cache, args=(False,), daemon=True).start()
+                            time_since_last > 60 or
+                            self._save_event.is_set()):
+                            # Signal worker to save synchronously within its own thread
+                            # Perform background cleanup periodically or on explicit save event
+                            do_cleanup = (self.save_counter >= 25 or self._save_event.is_set() or time_since_last_cleanup > 300)
+                            self._save_cache(save_all=False, background_cleanup=do_cleanup)
+                            if do_cleanup:
+                                self.last_cleanup_time = time.time()
                             self.save_counter = 0
+                            self._save_event.clear()
 
                     self.fuzzy_queue.task_done()
 
                 except Empty:
-                    # Check for idle save condition
+                    # Check for idle save condition or signaled save
                     time_since_last = time.time() - self.last_save_time
-                    if time_since_last > 60 and self.save_counter > 0:
-                        threading.Thread(target=self._save_cache, args=(True,), daemon=True).start()
+                    time_since_last_cleanup = time.time() - getattr(self, 'last_cleanup_time', 0)
+                    if (time_since_last > 60 and self.save_counter > 0) or self._save_event.is_set():
+                        # Idle save: often good to do a cleanup too if it's been a while
+                        do_cleanup = self._save_event.is_set() or time_since_last_cleanup > 300
+                        self._save_cache(save_all=True, background_cleanup=do_cleanup)
+                        if do_cleanup:
+                            self.last_cleanup_time = time.time()
                         self.save_counter = 0
+                        self._save_event.clear()
                     continue
 
                 except Exception as e:
@@ -494,7 +567,7 @@ class FuzzyAudioCache:
             logger.warning(f"Load fuzzy cache failed: {str(e)}")
             self.cache_data = {}
 
-    def _save_cache(self, save_all: bool = False) -> None:
+    def _save_cache(self, save_all: bool = False, background_cleanup: bool = False) -> None:
         """Save fuzzy cache to disk with throttling. FIXED: Ensure valid relatives on save (subpath safe)."""
         now = time.time()
         if not save_all and (now - self.last_save_time) < self.save_interval:
@@ -510,35 +583,54 @@ class FuzzyAudioCache:
 
             # Pre-save validation and purging
             purged_count = 0
-            if self.enable_artifact_purge:
-                for stem in list(self.cache_data.keys()):
-                    for norm_key in list(self.cache_data[stem].keys()):
-                        entry = self.cache_data[stem][norm_key]
-                        wav_path = entry.get('wav_path', '')
+            if background_cleanup:
+                if self.enable_artifact_purge:
+                    for stem in list(self.cache_data.keys()):
+                        for norm_key in list(self.cache_data[stem].keys()):
+                            entry = self.cache_data[stem][norm_key]
+                            wav_path = entry.get('wav_path', '')
 
-                        # Remove entries with missing files
-                        if not wav_path or not os.path.exists(wav_path):
-                            del self.cache_data[stem][norm_key]
-                            purged_count += 1
-                            continue
+                            # Remove entries with missing files
+                            if not wav_path or not os.path.exists(wav_path):
+                                del self.cache_data[stem][norm_key]
+                                purged_count += 1
+                                continue
 
-                        # FIXED: Subpath validation on save (purge if invalid)
-                        wav_path_p = Path(wav_path).resolve()
-                        if not wav_path_p.is_relative_to(self.base_dir):
-                            logger.trace(f"Save-time purge: Path not in subpath of {self.base_dir}: {wav_path} – deleting entry")
-                            del self.cache_data[stem][norm_key]
-                            purged_count += 1
-                            continue
+                            # FIXED: Subpath validation on save (purge if invalid)
+                            wav_path_p = Path(wav_path).resolve()
+                            if not wav_path_p.is_relative_to(self.base_dir):
+                                logger.trace(f"Save-time purge: Path not in subpath of {self.base_dir}: {wav_path} – deleting entry")
+                                del self.cache_data[stem][norm_key]
+                                purged_count += 1
+                                continue
 
-                        # Remove entries with artifacts
-                        if is_artifact_laden(wav_path, threshold_hz=self.artifact_threshold_hz):
-                            logger.trace(f"Save-time purge: Artifacts in {wav_path} for {stem} – deleting entry")
-                            del self.cache_data[stem][norm_key]
-                            purged_count += 1
+                            # Remove entries with artifacts
+                            if is_artifact_laden(wav_path, threshold_hz=self.artifact_threshold_hz):
+                                logger.trace(f"Save-time purge: Artifacts in {wav_path} for {stem} – deleting entry")
+                                del self.cache_data[stem][norm_key]
+                                purged_count += 1
 
-                    # Clean up empty stems
-                    if not self.cache_data[stem]:
-                        del self.cache_data[stem]
+                        # Clean up empty stems
+                        if not self.cache_data[stem]:
+                            del self.cache_data[stem]
+
+                # Purge force skip words
+                if self.skip_words:
+                    for stem in list(self.cache_data.keys()):
+                        for norm_key in list(self.cache_data[stem].keys()):
+                            entry = self.cache_data[stem][norm_key]
+                            orig_text = entry.get('orig_text', '')
+                            if orig_text:
+                                clean_entry_text = re.sub(r'[^\w\s]', '', orig_text.lower()).strip()
+                                entry_words = set(clean_entry_text.split())
+                                for skip_word in self.skip_words:
+                                    if skip_word.lower() in entry_words:
+                                        logger.info(f"Purging fuzzy entry due to skip word '{skip_word}': {orig_text[:30]}...")
+                                        del self.cache_data[stem][norm_key]
+                                        purged_count += 1
+                                        break
+                        if not self.cache_data[stem]:
+                            del self.cache_data[stem]
 
             # Convert to save format (relative paths)
             save_data = {}
@@ -579,6 +671,10 @@ class FuzzyAudioCache:
         """Ensure queue is properly drained on destruction."""
         try:
             if hasattr(self, 'fuzzy_queue'):
+                # Signal worker to stop
+                self.fuzzy_queue.put(None)
+                
+                # Drain the queue
                 while not self.fuzzy_queue.empty():
                     try:
                         self.fuzzy_queue.get_nowait()
@@ -586,6 +682,6 @@ class FuzzyAudioCache:
                     except:
                         break
                 # Force save on shutdown
-                self._save_cache(save_all=True)
+                self._save_cache(save_all=True, background_cleanup=True)
         except:
             pass

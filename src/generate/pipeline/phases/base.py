@@ -21,8 +21,9 @@ class BaseGenerationPhase:
 
         context.ensure_attrs()
 
-        if context.audio_prompt_path and not self.validate_path(context.audio_prompt_path, min_dur=1.0):
-            return f"Invalid audio_prompt_path: {context.audio_prompt_path}"
+        # REMOVED: Strict path validation here to allow CacheCheck/VoiceProcessing to handle fallbacks
+        # if context.audio_prompt_path and not self.validate_path(context.audio_prompt_path, min_dur=1.0):
+        #    return f"Invalid audio_prompt_path: {context.audio_prompt_path}"
 
         if context.processed_voice_path and context.processed_voice_path != "" and not self.validate_path(context.processed_voice_path, min_dur=3.0):
             return f"Invalid processed_voice_path: {context.processed_voice_path}"

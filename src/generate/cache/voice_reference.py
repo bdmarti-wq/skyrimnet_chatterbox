@@ -175,51 +175,47 @@ class VoiceReferenceCache:
 
 
     def quick_metadata_match(self, incoming_path: str, cached_entry: VoiceReferenceEntry) -> bool:
-        """Cheap match for reuse. OPTIMIZED: Use cached info where possible."""
+        """Cheap match for reuse. OPTIMIZED: Prioritize size/mtime; handle Gradio temp paths."""
         try:
-            incoming_name = Path(incoming_path).name
-            cached_name = cached_entry.original_filename
-            if incoming_name != cached_name:
-                logger.trace(f"Filename mismatch: '{incoming_name}' != '{cached_name}'")
-                return False
+            # Metadata match priority:
+            # 1. File size (very reliable)
+            # 2. Modification time (reliable, but Gradio can change it)
+            # 3. Filename (least reliable for uploads but good for static)
 
             incoming_size = os.path.getsize(incoming_path)
-            incoming_mtime = os.path.getmtime(incoming_path)
-            
             if cached_entry.file_size is not None and incoming_size != cached_entry.file_size:
                 logger.trace(f"Size mismatch: {incoming_size} != {cached_entry.file_size}")
                 return False
 
-            # NEW: Check mtime if available in cleanup_metadata or as a direct field
-            cached_mtime = None
-            if hasattr(cached_entry, 'mtime'):
-                cached_mtime = cached_entry.mtime
-            elif isinstance(cached_entry.cleanup_metadata, dict):
+            incoming_mtime = os.path.getmtime(incoming_path)
+            cached_mtime = getattr(cached_entry, 'mtime', None)
+            if cached_mtime is None and isinstance(cached_entry.cleanup_metadata, dict):
                 cached_mtime = cached_entry.cleanup_metadata.get('mtime')
-            
-            if cached_mtime is not None and abs(incoming_mtime - cached_mtime) > 0.1:
-                logger.trace(f"Mtime mismatch: {incoming_mtime} != {cached_mtime}")
-                return False
 
+            # Check if it's an upload path (often transient)
+            is_upload = "Temp" in incoming_path or "gradio" in incoming_path or "tmp" in incoming_path
+
+            # If size matches and it's NOT an upload, mtime is a strong match
+            if not is_upload and cached_mtime is not None and abs(incoming_mtime - cached_mtime) < 0.1:
+                logger.trace(f"Quick match: size + mtime (non-upload)")
+                return True
+
+            # For uploads, Gradio might change names or timestamps even if content is identical.
+            # If size matches, we do a quick check on duration/sample rate metadata as a second tier.
             incoming_info = self._get_audio_info(incoming_path)
             if incoming_info:
-                incoming_frames, _, incoming_dur = incoming_info
-                if cached_entry.duration is not None and abs(incoming_dur - cached_entry.duration) > 0.1:
-                    logger.trace(f"Dur mismatch: {incoming_dur:.2f}s != {cached_entry.duration:.2f}s")
-                    return False
-                
-                # Update cache fields
-                cached_entry.file_size = incoming_size
-                cached_entry.duration = incoming_dur
-                if isinstance(cached_entry.cleanup_metadata, dict):
-                    cached_entry.cleanup_metadata['mtime'] = incoming_mtime
-                else:
-                    cached_entry.cleanup_metadata = {'mtime': incoming_mtime}
-            else:
-                return False
-
-            logger.trace(f"Quick match: filename + size/dur")
-            return True
+                _, incoming_sr, incoming_dur = incoming_info
+                if cached_entry.duration is not None and abs(incoming_dur - cached_entry.duration) < 0.01:
+                    # Size + Duration + SR is a very strong metadata signal even if mtime/name changed
+                    logger.trace(f"Quick match: size + duration + sr")
+                    
+                    # Update mtime in cache to latest seen for this stable content
+                    if is_upload:
+                        # Return True but caller might want to update the entry later
+                        pass
+                    return True
+            
+            return False
         except Exception as me:
             logger.warning(f"Metadata match failed: {me}")
             return False

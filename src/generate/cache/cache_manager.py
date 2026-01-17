@@ -131,8 +131,11 @@ class CacheManager:
     def process_voice_reference(self, context: AudioGenerationContext, force: bool = False) -> Tuple[
         bool, str, str, Dict[str, Any], Optional[VoiceReferenceEntry]]:
         """
-        SIMPLIFIED: Takes only context (extracts audio_path/voice_stem internally); call process_new_reference; return (success, path, conds_key, params, entry).
-        FIXED: Bool-first return (success) for unpack align; path=str if success (resampled for new); drop useless second ''.
+        Takes context (audio_path/voice_stem); performs multi-stage fallback on invalid path.
+        Fallback steps:
+        1. Try Configured default voice path.
+        2. Search voices directory for any valid .wav.
+        3. Fall back to neutral if all fails.
         """
         if context is None:
             logger.warning("process_voice_reference called without context; fallback to defaults")
@@ -142,13 +145,46 @@ class CacheManager:
         audio_path = getattr(context, 'audio_prompt_path', None)
         voice_stem = getattr(context, 'voice_stem', 'default')
 
+        # Multi-stage path fallback if primary is invalid/missing
         if not audio_path or not os.path.exists(audio_path):
             logger.warning(f"Invalid voice path from context: {audio_path}")
-            # Prefer bridge-injected params if available; else use config shim
-            injected = getattr(context, 'voice_params', None)
-            voice_params = injected if isinstance(injected, dict) and injected else self.config.get_voice_params(voice_stem, {'exaggeration': 1.0})
-            context.audio_prompt_path = ""  # Reset in context
-            return False, "", 'fallback_key', voice_params, None
+            
+            # Step 1: Configured default
+            default_voice = get_config_value('globals.default_voice_path', 'cache/audio/voices/resampled/malebrute_24000Hz.wav')
+            root = get_config_value('globals.root', '')
+            if root:
+                default_voice_abs = os.path.join(root, default_voice)
+                if os.path.exists(default_voice_abs):
+                    logger.info(f"Using configured default voice fallback: {default_voice_abs}")
+                    audio_path = default_voice_abs
+                elif os.path.exists(default_voice):
+                    logger.info(f"Using configured default voice fallback (rel): {default_voice}")
+                    audio_path = default_voice
+            
+            # Step 2: Directory search if default missing
+            if not audio_path or not os.path.exists(audio_path):
+                voices_dir = get_config_value('globals.voices_cache_dir')
+                if voices_dir and os.path.exists(voices_dir):
+                    logger.debug(f"Searching {voices_dir} for any valid fallback voice")
+                    for root_dir, _, files in os.walk(voices_dir):
+                        for f in files:
+                            if f.lower().endswith('.wav'):
+                                candidate = os.path.join(root_dir, f)
+                                if os.path.exists(candidate):
+                                    logger.info(f"Found directory-search voice fallback: {candidate}")
+                                    audio_path = candidate
+                                    break
+                        if audio_path: break
+
+            if not audio_path or not os.path.exists(audio_path):
+                logger.error("All voice fallbacks failed; using neutral conditionals")
+                injected = getattr(context, 'voice_params', None)
+                voice_params = injected if isinstance(injected, dict) and injected else self.config.get_voice_params(voice_stem, {'exaggeration': 1.0})
+                context.audio_prompt_path = ""
+                return False, "", 'fallback_key', voice_params, None
+            
+            # Update context with fallback path
+            context.audio_prompt_path = audio_path
 
         # Always derive norm_stem (stable)
         norm_stem = self.get_voice_stem(audio_path)
