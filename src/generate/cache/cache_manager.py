@@ -59,7 +59,8 @@ class CacheManager:
         )
         self.voice_reference = VoiceReferenceCache(
             cache_dir=self.cache_config.voices_cache_dir,
-            content_hash_threshold=self.cache_config.fuzzy.fuzzy_artifact_threshold_hz
+            content_hash_threshold=self.cache_config.fuzzy.fuzzy_artifact_threshold_hz,
+            max_entries=getattr(self.cache_config.audio, 'max_voice_entries', 200)
         )
 
         # Initialize validation times (anti-ratelimit)

@@ -44,7 +44,7 @@ class VoiceReferenceCache:
     _voice_params_cache: Dict[str, Dict] = {}
     _cache_lock = threading.RLock()
 
-    def __init__(self, cache_dir: Path = None, content_hash_threshold: float = 11000.0):
+    def __init__(self, cache_dir: Path = None, content_hash_threshold: float = 11000.0, max_entries: int = 200):
         """Initialize the voice reference cache system. OPTIMIZED: Cache voice_params per stem."""
         global VOICE_CACHE_INSTANCE
         VOICE_CACHE_INSTANCE = self
@@ -55,7 +55,8 @@ class VoiceReferenceCache:
             content_hash_threshold = get_config_value('globals.fuzzy_artifact_threshold_hz', 9000.0)
 
         self.content_hash_threshold = content_hash_threshold
-        logger.info(f"Voice cache initialized with artifact threshold={self.content_hash_threshold}Hz")
+        self.max_entries = max_entries
+        logger.info(f"Voice cache initialized with artifact threshold={self.content_hash_threshold}Hz, max_entries={self.max_entries}")
 
         if cache_dir is None:
             cache_dir = get_config().app_config.globals.cache_dir if hasattr(config, 'app_config') else Path('./cache')
@@ -75,6 +76,57 @@ class VoiceReferenceCache:
         self._voice_params_cache.clear()  # Clear on init
 
         self.load_cache()
+
+    def _update_last_used(self, stem: str):
+        """Update last_used timestamp for an entry and save cache."""
+        with self.lock:
+            if stem in self.voice_cache:
+                entry = self.voice_cache[stem]
+                # VoiceReferenceEntry is a NamedTuple, so we need to create a new one to "update" it
+                new_entry = entry._replace(last_processed=time.time())
+                self.voice_cache[stem] = new_entry
+                # Signal background saver if it existed, but here we just have sync save_cache
+                # For efficiency, we only save if it's been a while, or just don't save on hits.
+                # Since voice hits are infrequent, sync save is acceptable but maybe overkill.
+                self.save_cache()
+
+    def _purge_cache(self):
+        """Evict oldest entries if max_entries is exceeded."""
+        with self.lock:
+            if len(self.voice_cache) <= self.max_entries:
+                return
+
+            # Sort by last_processed (which we use as last_used)
+            # Handle None by using a very old timestamp
+            sorted_entries = sorted(
+                self.voice_cache.items(),
+                key=lambda x: x[1].last_processed or 0.0
+            )
+
+            num_to_purge = len(self.voice_cache) - self.max_entries
+            purged_count = 0
+
+            for i in range(num_to_purge):
+                stem, entry = sorted_entries[i]
+                
+                # Do not purge the 'default' voice
+                if stem == 'default':
+                    continue
+
+                # Delete resampled file if it exists
+                if entry.resampled_path and os.path.exists(entry.resampled_path):
+                    try:
+                        os.remove(entry.resampled_path)
+                        logger.debug(f"Deleted resampled file for evicted voice '{stem}': {entry.resampled_path}")
+                    except Exception as e:
+                        logger.warning(f"Failed to delete resampled file for '{stem}': {e}")
+
+                del self.voice_cache[stem]
+                purged_count += 1
+                logger.info(f"Evicted oldest voice reference entry: {stem} (last used: {entry.last_processed})")
+
+            if purged_count > 0:
+                self.save_cache()
 
     def apply_voice_params_to_context(self, voice_config: Dict[str, Any], context: Optional[Any] = None):
         """Utility: Apply voice params to context attributes (if context provided). For cache hits."""
@@ -436,6 +488,7 @@ class VoiceReferenceCache:
         """
         Process voice; SIMPLIFIED: Probe/load by norm_stem (stable); store under norm_stem (overrides legacy if same); no temp _upload; hit_entry on reuse.
         FIXED: Accept context; apply params on hit using utility method. For cache hit, return cached entry for consistency.
+        REFACTORED: LRU cleanup and hash memoization.
         """
         # FIXED: Normalize early (stable for probe/store)
         norm_stem = self.normalize_stem(new_path)
@@ -448,6 +501,9 @@ class VoiceReferenceCache:
         # FIXED: Fetch voice_params once; apply any bridge-injected overrides for this request (do not cache overrides)
         injected_overrides = getattr(context, 'voice_params', None) if context is not None else None
         voice_config = self._get_voice_params(norm_stem, overrides=injected_overrides)
+
+        # Memoize hash for the entire flow
+        new_hash = None
 
         # Probe by norm_stem for stable HIT (ignores legacy non-norm keys)
         hit_entry = None
@@ -462,10 +518,12 @@ class VoiceReferenceCache:
                     hit_entry = entry
                     # FIXED: Apply cached params to context on hit
                     self.apply_voice_params_to_context(entry.voice_config, context)
+                    self._update_last_used(norm_stem)
                     return True, resampled_path, cond_key, voice_config, hit_entry
 
             # Tiers if quick miss
-            should_update, current_hash, new_hash, entry_from_tiers = self.should_update_reference(norm_stem, new_path)
+            should_update, current_hash, updated_hash, entry_from_tiers = self.should_update_reference(norm_stem, new_path)
+            new_hash = updated_hash # Store for later use
             if not should_update and entry_from_tiers:
                 resampled_path = entry_from_tiers.resampled_path
                 if resampled_path and os.path.exists(resampled_path):
@@ -474,6 +532,7 @@ class VoiceReferenceCache:
                     hit_entry = entry_from_tiers
                     # FIXED: Apply cached params to context on tier hit
                     self.apply_voice_params_to_context(entry_from_tiers.voice_config, context)
+                    self._update_last_used(norm_stem)
                     return True, resampled_path, cond_key, voice_config, hit_entry
 
         # FIXED: Store under norm_stem always (stable; overrides legacy if norm matches old unique)
@@ -487,8 +546,10 @@ class VoiceReferenceCache:
             logger.error(f"Validation failed for {voice_stem}: {msg}")
             return False, new_path, "", voice_config, None
 
-        # Tiers for update (under norm_stem)
-        should_update, current_hash, new_hash, _ = self.should_update_reference(voice_stem, new_path)
+        # Tiers for update (under norm_stem) - pass memoized hash
+        should_update, current_hash, updated_hash, _ = self.should_update_reference(voice_stem, new_path, precalculated_hash=new_hash)
+        new_hash = updated_hash or new_hash
+        
         if not should_update:
             entry = self.voice_cache[voice_stem]
             resampled_path = entry.resampled_path
@@ -498,6 +559,7 @@ class VoiceReferenceCache:
                 hit_entry = entry
                 # FIXED: Apply cached params to context on update
                 self.apply_voice_params_to_context(entry.voice_config, context)
+                self._update_last_used(voice_stem)
                 return True, resampled_path, cond_key, voice_config, hit_entry
 
         # Force for uploads
@@ -526,16 +588,19 @@ class VoiceReferenceCache:
             final_path = new_path
             use_config_path = False
 
-        # Same path/hash check
+        # Same path/hash check - pass memoized hash
         if voice_stem in self.voice_cache and not force_update and not is_upload:
             current_entry = self.voice_cache[voice_stem]
             if current_entry.reference_path == final_path:
                 if use_config_path:
+                    self._update_last_used(voice_stem)
                     return True, final_path, current_entry.conditionals_key, voice_params, current_entry
 
-                if current_entry.content_hash == self.calculate_content_hash(final_path, full=True):
+                calculated_hash = new_hash or self.calculate_content_hash(final_path, full=True)
+                if current_entry.content_hash == calculated_hash:
                     logger.debug(f"No change for {voice_stem}; reuse")
                     hit_entry = current_entry
+                    self._update_last_used(voice_stem)
                     return True, final_path, current_entry.conditionals_key, voice_params, hit_entry
 
         # Resample/conds (store under norm)
@@ -544,8 +609,8 @@ class VoiceReferenceCache:
             logger.error(f"Resample failed {voice_stem}; fallback to {final_path}")
             resampled_path = final_path
 
-        new_hash = self.calculate_content_hash(resampled_path, full=True)
-        cond_key = self._generate_conditionals_key(voice_stem, resampled_path, voice_params)
+        # Generate key (stable for norm_stem) - pass memoized hash
+        cond_key = self._generate_conditionals_key(voice_stem, final_path, voice_params, precalculated_hash=new_hash)
 
         # Cleanup (future, disabled)
         cleanup_meta = None
@@ -558,15 +623,30 @@ class VoiceReferenceCache:
             if resampled_path != final_path:
                 last_processed = time.time()
 
-        logger.info(f"{voice_stem}: New conds (hash {new_hash[:8]}, resampled {resampled_path})")
+        logger.info(f"{voice_stem}: New conds (hash {(new_hash or 'None')[:8]}, resampled {resampled_path})")
 
         # Update cache under norm_stem (override if legacy)
         with self.lock:
             try:
-                info = torchaudio.info(resampled_path)
-                file_size = os.path.getsize(resampled_path)
-                dur = info.num_frames / info.sample_rate
-                mtime = os.path.getmtime(final_path)  # Track mtime of original
+                # REVISED: Enhanced metadata extraction (consistent with quick_match)
+                try:
+                    import torchaudio
+                    info = torchaudio.info(resampled_path)
+                    duration = info.num_frames / info.sample_rate
+                    file_size = os.path.getsize(resampled_path)
+                    mtime = os.path.getmtime(final_path)
+                except Exception:
+                    duration = None
+                    file_size = None
+                    mtime = time.time()
+
+                cleanup_meta = None
+                last_processed = time.time()
+
+                # Calculate hash if still missing
+                if not new_hash:
+                    new_hash = self.calculate_content_hash(final_path, full=True)
+
                 entry = VoiceReferenceEntry(
                     stem=voice_stem,
                     reference_path=final_path,
@@ -578,15 +658,22 @@ class VoiceReferenceCache:
                     voice_config=voice_params,
                     custom_path=config_path if config_path else None,
                     file_size=file_size,
-                    duration=dur,
+                    duration=duration,
                     cleanup_metadata=cleanup_meta,
                     last_processed=last_processed,
                     mtime=mtime
                 )
                 self.voice_cache[voice_stem] = entry  # FIXED: Override to stable norm
+                
+                # Check for LRU purge if this is a new entry or update
+                self._purge_cache()
             except Exception as me:
                 logger.warning(f"Metadata error {voice_stem}: {me}")
                 mtime = os.path.getmtime(final_path) if os.path.exists(final_path) else None
+                
+                if not new_hash:
+                    new_hash = self.calculate_content_hash(final_path, full=True)
+
                 entry = VoiceReferenceEntry(
                     stem=voice_stem,
                     reference_path=final_path,
@@ -600,39 +687,46 @@ class VoiceReferenceCache:
                     file_size=None,
                     duration=None,
                     cleanup_metadata=None,
-                    last_processed=None,
+                    last_processed=time.time(),
                     mtime=mtime
                 )
                 self.voice_cache[voice_stem] = entry
+                self._purge_cache()
+
             self.save_cache()
 
         logger.debug(f"Voice processed: '{voice_stem}' (norm), final={final_path}, resampled={resampled_path}, conds={cond_key}")
 
-        return True, resampled_path, cond_key, voice_params, None  # MISS/new
+        return True, resampled_path, cond_key, voice_params, entry  # Return entry instead of None for consistency
 
-    def should_update_reference(self, voice_stem: str, new_path: str) -> Tuple[
+    def should_update_reference(self, voice_stem: str, new_path: str, precalculated_hash: Optional[str] = None) -> Tuple[
         bool, Optional[str], Optional[str], Optional[VoiceReferenceEntry]]:
-        """Tiered check."""
+        """Tiered check. Accepts optional precalculated_hash to avoid redundant I/O."""
         if voice_stem not in self.voice_cache:
-            full_new = self.calculate_content_hash(new_path, full=True)
+            full_new = precalculated_hash or self.calculate_content_hash(new_path, full=True)
             return True, None, full_new, None
 
         entry = self.voice_cache[voice_stem]
         current_hash = entry.content_hash
 
         if not entry.resampled_path or not os.path.exists(entry.resampled_path):
-            return True, current_hash, None, None
+            return True, current_hash, precalculated_hash, None
 
         if self.quick_metadata_match(new_path, entry):
             logger.debug(f"Quick match {voice_stem}")
-            return False, current_hash, None, entry
+            return False, current_hash, precalculated_hash or current_hash, entry
 
-        partial_new = self.calculate_content_hash(new_path, full=False)
-        if partial_new == current_hash[:len(partial_new)]:
-            logger.debug(f"Partial match {voice_stem}")
-            return False, current_hash, partial_new, entry
+        # Use precalculated_hash if provided, otherwise check partial match first
+        if precalculated_hash:
+            full_new = precalculated_hash
+        else:
+            partial_new = self.calculate_content_hash(new_path, full=False)
+            if partial_new == current_hash[:len(partial_new)]:
+                logger.debug(f"Partial match {voice_stem}")
+                return False, current_hash, partial_new, entry
+            
+            full_new = self.calculate_content_hash(new_path, full=True)
 
-        full_new = self.calculate_content_hash(new_path, full=True)
         logger.debug(f"Full check {voice_stem}: {full_new[:8]} vs {current_hash[:8]}")
         if current_hash == full_new:
             logger.info(f"Full match {voice_stem}")
@@ -698,9 +792,9 @@ class VoiceReferenceCache:
 
 
 
-    def _generate_conditionals_key(self, voice_stem: str, audio_path: str, voice_config: Dict[str, Any]) -> str:
-        """Generate conds key."""
-        content_hash = self.calculate_content_hash(audio_path, full=True)
+    def _generate_conditionals_key(self, voice_stem: str, audio_path: str, voice_config: Dict[str, Any], precalculated_hash: Optional[str] = None) -> str:
+        """Generate conds key. Accepts optional precalculated_hash to avoid redundant I/O."""
+        content_hash = precalculated_hash or self.calculate_content_hash(audio_path, full=True)
         exag = voice_config.get("exaggeration", 0.5)
         temperature = voice_config.get("temperature", 0.8)
         top_p = voice_config.get("top_p", 1.0)
